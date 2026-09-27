@@ -1,0 +1,28 @@
+[package]
+name = "switchboard-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AMQP connection/channel serving, TLS, heartbeats, transactions, publisher confirms"
+
+[dependencies]
+switchboard-wire = { workspace = true }
+switchboard-core = { workspace = true }
+switchboard-cluster = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+aws-lc-rs = { workspace = true }
+rustls-pemfile = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.13"

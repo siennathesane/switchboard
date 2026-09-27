@@ -1,0 +1,19 @@
+[package]
+name = "switchboard-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AMQ model: vhost/exchange/queue/binding state machines and broker semantics"
+
+[dependencies]
+switchboard-wire = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

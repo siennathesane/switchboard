@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+
+# Python harness virtualenv and bytecode caches
+/harness-venv
+__pycache__/
+*.py[cod]
+
+# Node harness client dependencies
+node_modules/
+
+# Harness run output (client test logs)
+/harness/out
+
+# macOS
+.DS_Store
+
+# Local tool state (points into a per-machine plugin cache)
+/.video_agent
+
+# Original 4+ GB data file, split into LFS-tracked chunks under
+# init.jsonl.parts/; reproducible via `cat init.jsonl.parts/part-* > init.jsonl`
+/init.jsonl
+
+# Third-party spec download; docs/ carries the tracked copies
+/amqp0-9-1.pdf

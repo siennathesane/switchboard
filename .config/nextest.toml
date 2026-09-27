@@ -1,0 +1,26 @@
+# Nextest configuration.
+#
+# Why bounded concurrency: every integration test runs multi-node raft
+# clusters in-process (one multi-thread tokio runtime + RocksDB per node).
+# Unbounded harness parallelism (= cpu count) starves raft timers, races
+# the free-port helper, and flaks STOMP/commit timing assertions — the
+# same reason RUST_TEST_THREADS is capped in .cargo/config.toml for
+# libtest runs. Four concurrent test processes keeps every cluster healthy
+# on a 10-core machine.
+#
+# Why the slow-timeout kill switch: a test that parks forever (e.g. an
+# await with no deadline) previously wedged the whole binary for good;
+# nextest turns that into a per-test failure instead.
+
+[profile.default]
+concurrency = 4
+retries = 1
+slow-timeout = { period = "120s", factor = "2.0" }
+# Fail fast on a wedged test process, keep going with the rest.
+lease-timeout = "240s"
+
+# Heavier parallelism for pure unit crates without raft clusters.
+[profile.unit]
+concurrency = 10
+retries = 0
+slow-timeout = { period = "60s", factor = "2.0" }

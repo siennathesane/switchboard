@@ -1,0 +1,9 @@
+# The integration suites run multi-node raft clusters in-process; unbounded
+# harness parallelism (one 14-thread tokio runtime per test) starves raft
+# timers and flaks the STOMP/commit timing assertions. Two harness threads
+# keep every binary's clusters healthy and the runs deterministic.
+[env]
+RUST_TEST_THREADS = "2"
+
+# Coverage runs exclude the process-entry bin: main() is CLI parsing +
+# spawn glue that cannot execute in-process under llvm-cov.
