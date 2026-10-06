@@ -1,0 +1,28 @@
+#!/bin/sh
+# Start a switchboard broker process. All configuration is passed explicitly
+# (sshd sessions do not inherit container environment variables):
+#
+#   sb-start NODE_ID ADVERTISE_HOST EXPECTED_NODES [--bootstrap | --seeds host:port]
+#
+# The data dir is NOT wiped here — Jepsen's db setup wipes it before the
+# first start, so kill/restart nemesis events preserve raft state.
+set -e
+node_id="$1"
+advertise="$2"
+expected="$3"
+shift 3
+
+mkdir -p /var/lib/switchboard /var/log/switchboard
+
+nohup /usr/local/bin/switchboard \
+  --node-id "$node_id" \
+  --listen 0.0.0.0:5672 \
+  --internal 0.0.0.0:5673 \
+  --advertise "$advertise:5673" \
+  --data /var/lib/switchboard \
+  --expected-nodes "$expected" \
+  "$@" \
+  </dev/null >>/var/log/switchboard/broker.log 2>&1 &
+
+echo $! > /var/run/switchboard.pid
+echo "started switchboard pid $(cat /var/run/switchboard.pid)"

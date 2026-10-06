@@ -7,6 +7,7 @@ license.workspace = true
 description = "Multi-raft cluster: shard groups, membership management, internal RPC, write forwarding"
 
 [dependencies]
+uuid = { workspace = true }
 switchboard-wire = { workspace = true }
 switchboard-core = { workspace = true }
 switchboard-store = { workspace = true }

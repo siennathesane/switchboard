@@ -95,6 +95,7 @@ async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     ClusterNode::start(cfg).await.unwrap()
 }
@@ -312,6 +313,7 @@ async fn unjoined_write_reports_unreachable() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
     let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode { node: 42, info: test_info() });
@@ -341,6 +343,7 @@ async fn deliver_and_cancel_cross_nodes() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
@@ -472,6 +475,7 @@ async fn pending_node_logs_and_write_times_out() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
 
@@ -614,6 +618,7 @@ async fn reconfigure_relay_maps_leader_reply_errors() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
@@ -701,6 +706,7 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
@@ -829,6 +835,7 @@ async fn follower_forwarded_write_is_transient() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
@@ -868,6 +875,7 @@ async fn reconfigure_relay_success_arm() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;

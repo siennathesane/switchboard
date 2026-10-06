@@ -366,6 +366,7 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
 
@@ -427,6 +428,7 @@ pub async fn start_broker_node(
         bootstrap,
         expected_nodes,
         peers,
+        timeouts: Default::default(),
     };
     init_tracing();
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();

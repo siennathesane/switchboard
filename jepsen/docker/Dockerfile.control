@@ -1,0 +1,26 @@
+# Control container: JDK 21 (jepsen 0.3.14 targets Java 21), Leiningen, the
+# test project, and the SSH key that authorizes control over the node
+# containers. The jepsen/ directory is the build context.
+FROM eclipse-temurin:21-jdk-noble
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl gnuplot-nox git openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV LEIN_ROOT=1
+RUN curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein \
+      -o /usr/local/bin/lein \
+ && chmod +x /usr/local/bin/lein \
+ && lein version
+
+WORKDIR /jepsen
+COPY project.clj /jepsen/
+RUN lein deps
+
+COPY src /jepsen/src
+COPY resources /jepsen/resources
+
+COPY docker/keys/id_ed25519 /root/.ssh/id_ed25519
+RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/id_ed25519
+
+CMD ["lein", "run", "--help"]

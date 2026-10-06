@@ -31,18 +31,27 @@ impl Channel {
         no_ack: bool,
         exclusive: bool,
     ) -> ChannelResult<String> {
-        let topo = node.topology();
-        let Some(qi) = topo
-            .vhosts
-            .get(&inner_vhost(self))
-            .and_then(|v| v.queues.get(queue))
-            .cloned()
-        else {
-            return Err(BrokerError::not_found(format!(
-                "no queue {queue:?} in vhost {:?}",
-                inner_vhost(self)
-            ))
-            .channel_level());
+        // The local topology snapshot can lag a just-replicated declare by
+        // up to the reconciliation interval; refresh once before giving up.
+        let resolve = |node: &Arc<ClusterNode>| {
+            node.topology()
+                .vhosts
+                .get(&inner_vhost(self))
+                .and_then(|v| v.queues.get(queue))
+                .cloned()
+        };
+        let qi = match resolve(node) {
+            Some(qi) => qi,
+            None => {
+                node.refresh_topology().await;
+                resolve(node).ok_or_else(|| {
+                    BrokerError::not_found(format!(
+                        "no queue {queue:?} in vhost {:?}",
+                        inner_vhost(self)
+                    ))
+                    .channel_level()
+                })?
+            }
         };
         let shard = qi.shard;
         let (prefetch, prefetch_size) = {

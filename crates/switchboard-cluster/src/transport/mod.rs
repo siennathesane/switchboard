@@ -55,6 +55,8 @@ impl Accepted {
 pub struct PeerChannel {
     connector: Option<TlsConnector>,
     pub server_name: String,
+    /// One RPC's reply wait. Configurable via `Timeouts`.
+    pub reply_budget: std::time::Duration,
     idle: tokio::sync::Mutex<std::collections::HashMap<String, Vec<PeerConn>>>,
 }
 
@@ -69,15 +71,29 @@ const IDLE_CAP: usize = 32;
 
 /// Bound one RPC's reply wait: a peer that accepts but never replies must
 /// not park the caller forever. Test tempo scales this like every other
-/// fixed delay.
-const REPLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// fixed delay. Default 5 s — a realtime budget; override through
+/// `Timeouts::rpc_reply_budget`.
+const REPLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl PeerChannel {
     pub fn new(connector: Option<TlsConnector>, server_name: String) -> Self {
         PeerChannel {
             connector,
             server_name,
+            reply_budget: REPLY_BUDGET,
             idle: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// `new`, with an explicit reply budget (from `Timeouts`).
+    pub fn with_reply_budget(
+        connector: Option<TlsConnector>,
+        server_name: String,
+        reply_budget: std::time::Duration,
+    ) -> Self {
+        PeerChannel {
+            reply_budget,
+            ..Self::new(connector, server_name)
         }
     }
 
@@ -110,7 +126,7 @@ impl PeerChannel {
             }
         };
         loop {
-            let budget = switchboard_core::tempo::scale(REPLY_BUDGET);
+            let budget = switchboard_core::tempo::scale(self.reply_budget);
             let outcome = async {
                 conn.send(req).await?;
                 match tokio::time::timeout(budget, conn.recv()).await {

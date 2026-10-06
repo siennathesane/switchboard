@@ -135,6 +135,7 @@ pub async fn start_gateway_tagged(
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+            timeouts: Default::default(),
     };
     let node: Arc<switchboard_cluster::ClusterNode> =
         switchboard_cluster::ClusterNode::start(cfg).await.unwrap();

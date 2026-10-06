@@ -61,6 +61,21 @@ pub struct MetaState {
     /// Retained MQTT messages, replicated through meta:
     /// (vhost, topic) → last retained message.
     pub retained: BTreeMap<(String, String), crate::model::StoredMessage>,
+    /// Fanout publishes accepted but not yet enqueued on all destination
+    /// shard groups, in meta-log order. The meta leader executes them
+    /// strictly FIFO (see the cluster crate), which makes every
+    /// destination group receive concurrent fanouts in one global order;
+    /// replication through meta makes that order survive leader failover.
+    pub pending_fanouts: Vec<PendingFanout>,
+}
+
+/// One accepted-but-unfinished fanout publish.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFanout {
+    pub id: uuid::Uuid,
+    pub vhost: String,
+    pub message: crate::model::StoredMessage,
+    pub queues: Vec<String>,
 }
 
 /// Bootstrap state for a fresh cluster: default vhost, mandatory exchanges,
@@ -148,6 +163,29 @@ impl MetaState {
                     effects.push(MetaEffect::QueueDeleted { queue: q.name.clone(), shard: q.shard });
                 }
                 Ok((MetaReply::Ok, effects))
+            }
+
+            MetaCmd::FanoutBegin { id, vhost, message, queues } => {
+                // Idempotent: a re-applied Begin (dedup missed across a
+                // snapshot boundary) must not enqueue the fanout twice.
+                if self.pending_fanouts.iter().any(|f| &f.id == id) {
+                    return Ok((MetaReply::FanoutBegun, vec![]));
+                }
+                self.pending_fanouts.push(PendingFanout {
+                    id: *id,
+                    vhost: vhost.clone(),
+                    message: message.clone(),
+                    queues: queues.clone(),
+                });
+                Ok((
+                    MetaReply::FanoutBegun,
+                    vec![MetaEffect::FanoutPending { id: *id }],
+                ))
+            }
+
+            MetaCmd::FanoutDone { id } => {
+                self.pending_fanouts.retain(|f| &f.id != id);
+                Ok((MetaReply::FanoutDone, vec![]))
             }
 
             MetaCmd::DeclareExchange { vhost, name, kind, passive, durable, auto_delete, internal, arguments } => {
@@ -464,6 +502,18 @@ pub enum MetaCmd {
     /// Node left the cluster (crash or shutdown). Cascades cleanup of the
     /// exclusive queues its connections owned.
     ForgetNode { node: u64 },
+    /// Accept a multi-destination publish into the pending-fanout queue
+    /// (total-order broadcast: the meta leader executes pending fanouts
+    /// strictly in this log's order).
+    FanoutBegin {
+        id: uuid::Uuid,
+        vhost: String,
+        message: crate::model::StoredMessage,
+        queues: Vec<String>,
+    },
+    /// Every destination of the fanout has been enqueued; drop it from the
+    /// pending queue.
+    FanoutDone { id: uuid::Uuid },
     DeclareExchange {
         vhost: String,
         name: String,
@@ -526,6 +576,8 @@ pub enum MetaCmd {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetaReply {
     Ok,
+    FanoutBegun,
+    FanoutDone,
     Authorized,
     ExchangeDeclared { existed: bool },
     QueueDeclared { name: String, shard: GroupId, created: bool },
@@ -538,6 +590,8 @@ pub enum MetaReply {
 pub enum MetaEffect {
     /// Drop the queue's message data in its shard group.
     QueueDeleted { queue: String, shard: GroupId },
+    /// A fanout is pending; the meta leader's executor should wake.
+    FanoutPending { id: uuid::Uuid },
 }
 
 /// Implement [`TopologyView`] over a vhost so publish routing works against

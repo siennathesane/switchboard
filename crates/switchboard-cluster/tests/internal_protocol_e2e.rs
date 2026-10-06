@@ -29,6 +29,7 @@ async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     ClusterNode::start(cfg).await.unwrap()
 }

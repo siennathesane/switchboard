@@ -127,6 +127,33 @@ impl Channel {
         // An enqueue error must surface: dropping the message silently is
         // only sanctioned for unroutable destinations, never internal
         // failures.
+        //
+        // A publish routed to several queues would otherwise be applied by
+        // several independent raft groups, whose logs can interleave two
+        // concurrent publishes differently — consumers of differently
+        // placed queues would observe different total orders. Multi-
+        // destination publishes therefore run through the cluster's
+        // serialized fanout executor on the meta leader, which gives every
+        // destination group the same order; single-destination publishes
+        // have nothing to disagree about and go direct.
+        if destinations.len() > 1 {
+            let multi: Vec<String> = destinations
+                .iter()
+                .filter(|q| vhost.queues.contains_key(*q))
+                .cloned()
+                .collect();
+            if multi.len() > 1 {
+                node.fanout_publish(
+                    inner_vhost(self).to_string(),
+                    message.clone(),
+                    multi,
+                )
+                .await
+                .map_err(crate::methods::ce)?;
+                self.confirm_fire(confirm_seq);
+                return Ok(());
+            }
+        }
         for q in &destinations {
             let Some(shard) = vhost.queues.get(q).map(|qi| qi.shard) else {
                 continue;

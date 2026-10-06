@@ -115,7 +115,12 @@ pub async fn run(
         tokio::select! {
             _ = shutdown.changed() => break,
             Some(peer) = mdns_rx.recv() => {
-                consider(&node, &mut tried, peer, switchboard_core::tempo::scale(Duration::from_secs(10)));
+                consider(
+                    &node,
+                    &mut tried,
+                    peer,
+                    switchboard_core::tempo::scale((cfg.interval / 3).max(Duration::from_secs(1))),
+                );
             }
             _ = tick.tick() => {}
         }
@@ -243,6 +248,7 @@ mod unit {
                 bootstrap: true,
                 expected_nodes: 1,
                 peers: vec![],
+            timeouts: Default::default(),
             };
             crate::ClusterNode::start(cfg).await.unwrap()
         });

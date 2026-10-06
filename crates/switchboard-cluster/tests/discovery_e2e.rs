@@ -54,6 +54,7 @@ async fn dns_seed_discovery_joins_a_pending_node() {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
     let port1: u16 = internal1.rsplit(':').next().unwrap().parse().unwrap();
@@ -70,6 +71,7 @@ async fn dns_seed_discovery_joins_a_pending_node() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -142,6 +144,7 @@ async fn mdns_discovery_assembles_two_nodes() {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
 
@@ -155,6 +158,7 @@ async fn mdns_discovery_assembles_two_nodes() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
 
@@ -207,6 +211,7 @@ async fn meta_voters_grow_to_first_three_nodes() {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
     wait_until(
@@ -225,6 +230,7 @@ async fn meta_voters_grow_to_first_three_nodes() {
             bootstrap: false,
             expected_nodes: 1,
             peers: vec![],
+        timeouts: Default::default(),
         };
         let node = ClusterNode::start(cfg).await.unwrap();
         let _ = node; // keep alive for the duration
@@ -276,6 +282,7 @@ async fn discovery_with_unreachable_seeds_keeps_node_pending() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
     let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -312,6 +319,7 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let started = std::time::Instant::now();
     let node = ClusterNode::start(cfg).await; // must NOT error: pending mode
@@ -345,6 +353,7 @@ async fn janitor_sweep_on_idle_node_is_harmless() {
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
+        timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
     // Bootstrap entities are applied as soon as the meta raft commits

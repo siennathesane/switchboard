@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 
 impl Channel {
         pub(crate) async fn get(&self, node: &Arc<ClusterNode>, queue: &str, no_ack: bool) -> ChannelResult<()> {
-        let shard = self.queue_shard(node, queue)?;
+        let shard = self.queue_shard(node, queue).await?;
         let get_id = self
             .sub_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -1,0 +1,6 @@
+# Keep the daemon-side build context small: sources + keys only.
+docker/broker-ctx/
+store/
+target/
+.lein-*
+*.log

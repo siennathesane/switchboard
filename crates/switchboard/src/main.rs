@@ -110,6 +110,64 @@ pub struct Cli {
     /// Discovery re-resolution interval in seconds.
     #[arg(long, env = "SWITCHBOARD_DISCOVERY_INTERVAL", default_value_t = 30)]
     pub discovery_interval: u64,
+
+    // ---- Timeouts: every wait in the broker, all configurable. Defaults
+    // bound any single operation's worst case to five seconds. ----
+    /// Retry budget for one logical write (elections, forwards): ms.
+    #[arg(long, env = "SWITCHBOARD_WRITE_BUDGET_MS", default_value_t = 5000)]
+    pub write_budget_ms: u64,
+
+    /// Retry budget for one fanout publish (leader resolution + legs): ms.
+    #[arg(long, env = "SWITCHBOARD_FANOUT_BUDGET_MS", default_value_t = 5000)]
+    pub fanout_budget_ms: u64,
+
+    /// One internal RPC's reply wait (raft, forwards, admin): ms.
+    #[arg(long, env = "SWITCHBOARD_RPC_REPLY_BUDGET_MS", default_value_t = 5000)]
+    pub rpc_reply_budget_ms: u64,
+
+    /// Retry budget for a membership reconfiguration: ms.
+    #[arg(long, env = "SWITCHBOARD_RECONFIGURE_BUDGET_MS", default_value_t = 5000)]
+    pub reconfigure_budget_ms: u64,
+
+    /// Retry budget for joining an existing cluster at startup: ms.
+    #[arg(long, env = "SWITCHBOARD_JOIN_BUDGET_MS", default_value_t = 5000)]
+    pub join_budget_ms: u64,
+
+    /// Raft heartbeat interval: ms.
+    #[arg(long, env = "SWITCHBOARD_RAFT_HEARTBEAT_MS", default_value_t = 100)]
+    pub raft_heartbeat_ms: u64,
+
+    /// Raft election timeout lower bound: ms (clamped to ≥ 2× heartbeat).
+    #[arg(long, env = "SWITCHBOARD_RAFT_ELECTION_MIN_MS", default_value_t = 300)]
+    pub raft_election_min_ms: u64,
+
+    /// Raft election timeout upper bound: ms (clamped to ≥ 2× min).
+    #[arg(long, env = "SWITCHBOARD_RAFT_ELECTION_MAX_MS", default_value_t = 600)]
+    pub raft_election_max_ms: u64,
+
+    /// Reconciliation (topology refresh) tick: ms.
+    #[arg(long, env = "SWITCHBOARD_RECONCILE_INTERVAL_MS", default_value_t = 500)]
+    pub reconcile_interval_ms: u64,
+
+    /// Liveness-probe (consumer janitor) tick: ms.
+    #[arg(long, env = "SWITCHBOARD_JANITOR_INTERVAL_MS", default_value_t = 1000)]
+    pub janitor_interval_ms: u64,
+
+    /// Consecutive refused liveness probes that declare a peer dead.
+    #[arg(long, env = "SWITCHBOARD_JANITOR_DEAD_AFTER", default_value_t = 3)]
+    pub janitor_dead_after: u32,
+
+    /// Retries for a failed off-node delivery's Release write.
+    #[arg(long, env = "SWITCHBOARD_DELIVER_RELEASE_RETRIES", default_value_t = 10)]
+    pub deliver_release_retries: u32,
+
+    /// Pause between failed off-node delivery Release retries: ms.
+    #[arg(long, env = "SWITCHBOARD_DELIVER_RELEASE_INTERVAL_MS", default_value_t = 200)]
+    pub deliver_release_interval_ms: u64,
+
+    /// AMQP heartbeat offered to clients, in seconds (0 disables).
+    #[arg(long, env = "SWITCHBOARD_HEARTBEAT", default_value_t = 60)]
+    pub heartbeat: u16,
 }
 
 #[tokio::main]
@@ -128,6 +186,21 @@ async fn main() -> anyhow::Result<()> {
             peers.push((id.trim().parse::<u64>().expect("peer id must be u64"), addr.trim().to_string()));
         }
     }
+    let timeouts = switchboard_cluster::node::Timeouts {
+        write_budget: std::time::Duration::from_millis(cli.write_budget_ms),
+        fanout_budget: std::time::Duration::from_millis(cli.fanout_budget_ms),
+        rpc_reply_budget: std::time::Duration::from_millis(cli.rpc_reply_budget_ms),
+        reconfigure_budget: std::time::Duration::from_millis(cli.reconfigure_budget_ms),
+        join_budget: std::time::Duration::from_millis(cli.join_budget_ms),
+        raft_heartbeat: std::time::Duration::from_millis(cli.raft_heartbeat_ms),
+        raft_election_min: std::time::Duration::from_millis(cli.raft_election_min_ms),
+        raft_election_max: std::time::Duration::from_millis(cli.raft_election_max_ms),
+        reconcile_interval: std::time::Duration::from_millis(cli.reconcile_interval_ms),
+        janitor_interval: std::time::Duration::from_millis(cli.janitor_interval_ms),
+        janitor_dead_after: cli.janitor_dead_after,
+        deliver_release_retries: cli.deliver_release_retries,
+        deliver_release_interval: std::time::Duration::from_millis(cli.deliver_release_interval_ms),
+    };
     let cfg = NodeConfig {
         id: cli.node_id,
         data_dir: cli.data.clone(),
@@ -137,11 +210,13 @@ async fn main() -> anyhow::Result<()> {
         bootstrap: cli.bootstrap,
         expected_nodes: cli.expected_nodes,
         peers,
+        timeouts,
     };
 
     let node = switchboard_cluster::ClusterNode::start(cfg)
         .await
         .map_err(|e| anyhow::anyhow!("cluster start failed: {e}"))?;
+
 
     // Self-discovery: DNS seeds / SRV records / mDNS all feed the join
     // protocol, so clusters assemble without listing every peer by hand.
@@ -160,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let limits = ConnectionLimits::default();
+    let limits = ConnectionLimits { heartbeat: cli.heartbeat, ..ConnectionLimits::default() };
     let protocols = switchboard_server::ProtocolConfig::from_list(&cli.protocols)
         .map_err(|e| anyhow::anyhow!("bad --protocols: {e}"))?;
 

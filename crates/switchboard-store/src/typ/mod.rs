@@ -50,6 +50,51 @@ pub enum BrokerCommand {
     Meta(MetaCmd),
     /// A data-plane (queue) mutation.
     Shard(ShardCmd),
+    /// A write tagged with a cluster-unique request id. The write path can
+    /// legitimately re-issue the same logical command — a forward whose
+    /// reply was lost is re-sent, and the retry loop may land it on
+    /// another member of the group — and raft is content-addressed by
+    /// nothing: each re-issue becomes a second log entry and the state
+    /// machine would apply it twice (e.g. two queue entries for one
+    /// publish). The dedup log makes the *second* application of a
+    /// request a no-op that replays the first reply. The variant is last
+    /// so existing log indices are unchanged.
+    Idempotent { id: RequestId, command: Box<BrokerCommand> },
+}
+
+/// Cluster-unique identity for one logical write, stamped by `write()` and
+/// carried unchanged through forwards and retries.
+pub type RequestId = uuid::Uuid;
+
+/// How many recent request replies the dedup log remembers. Bounds cover
+/// several minutes of write retries; a duplicate older than the window is
+/// one whose retry already timed out everywhere.
+const DEDUP_CAPACITY: usize = 8192;
+
+/// Bounded insertion-ordered map of recently applied request ids.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DedupLog {
+    map: std::collections::HashMap<RequestId, BrokerReply>,
+    order: std::collections::VecDeque<RequestId>,
+}
+
+impl DedupLog {
+    fn lookup(&self, id: &RequestId) -> Option<&BrokerReply> {
+        self.map.get(id)
+    }
+
+    fn remember(&mut self, id: RequestId, reply: BrokerReply) {
+        if self.map.contains_key(&id) {
+            return;
+        }
+        if self.order.len() >= DEDUP_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(id, reply);
+        self.order.push_back(id);
+    }
 }
 
 /// The applied result of a [`BrokerCommand`].
@@ -81,6 +126,9 @@ pub struct BrokerState {
     pub shard: switchboard_core::shard::ShardState,
     /// True once a `Bootstrap` command has been applied.
     pub bootstrapped: bool,
+    /// Replies for recently applied idempotent requests, so a re-issued
+    /// write (lost reply, retried forward) applies exactly once.
+    pub dedup: DedupLog,
 }
 
 impl BrokerState {
@@ -90,6 +138,14 @@ impl BrokerState {
         cmd: &BrokerCommand,
     ) -> Result<(BrokerReply, Vec<Effect>), switchboard_core::error::BrokerError> {
         match cmd {
+            BrokerCommand::Idempotent { id, command } => {
+                if let Some(reply) = self.dedup.lookup(id) {
+                    return Ok((reply.clone(), vec![]));
+                }
+                let (reply, effects) = self.apply(command)?;
+                self.dedup.remember(*id, reply.clone());
+                Ok((reply, effects))
+            }
             BrokerCommand::Bootstrap { vhost, user, password } => {
                 let (r1, _r1_effects) = self.meta.apply(&MetaCmd::DeclareVhost { name: vhost.clone() })?;
                 let (r2, _r2_effects) = self.meta.apply(&MetaCmd::CreateUser {
@@ -208,5 +264,46 @@ mod tests {
             let back: BrokerCommand = bincode::deserialize(&bytes).unwrap();
             assert_eq!(back, c);
         }
+    }
+
+    #[test]
+    fn idempotent_writes_apply_exactly_once() {
+        let mut st = BrokerState::default();
+        let id = uuid::Uuid::new_v4();
+        let enqueue = |id| BrokerCommand::Idempotent {
+            id,
+            command: Box::new(BrokerCommand::Shard(ShardCmd::Enqueue {
+                at_ms: 0,
+                queue: "q".into(),
+                message: switchboard_core::model::StoredMessage {
+                    properties: switchboard_wire::BasicProperties::new(),
+                    body: b"m".to_vec(),
+                    exchange: "ex".into(),
+                    routing_key: "k".into(),
+                    persistent: false,
+                },
+            })),
+        };
+        st.apply(&BrokerCommand::Shard(ShardCmd::CreateQueueData {
+            queue: "q".into(),
+            policy: Default::default(),
+        }))
+        .unwrap();
+
+        let (r1, _) = st.apply(&enqueue(id)).unwrap();
+        let (r2, effects2) = st.apply(&enqueue(id)).unwrap();
+        assert_eq!(r1, r2, "duplicate request replays the first reply");
+        assert!(effects2.is_empty(), "duplicate request re-emits no effects");
+
+        // Exactly one message in the queue despite two applies.
+        let depth = st.shard.queues["q"].msgs.len();
+        assert_eq!(depth, 1);
+
+        // A *different* id is a genuinely new write.
+        let (reply3, _) = st.apply(&enqueue(uuid::Uuid::new_v4())).unwrap();
+        let BrokerReply::Shard(ShardReply::Enqueued { seq }) = reply3 else {
+            panic!()
+        };
+        assert_eq!(seq, 1, "second distinct enqueue got its own sequence");
     }
 }

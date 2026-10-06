@@ -1,0 +1,19 @@
+[package]
+name = "switchboard-bench"
+description = "Throughput and latency benchmarks for Switchboard clusters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+lapin = { version = "2.5", default-features = false, features = [] }
+tokio-util = { workspace = true }
+futures-lite = "2"
+
+[[bin]]
+name = "switchboard-bench"
+path = "src/main.rs"

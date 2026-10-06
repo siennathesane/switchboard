@@ -24,3 +24,12 @@ node_modules/
 
 # Third-party spec download; docs/ carries the tracked copies
 /amqp0-9-1.pdf
+
+# Jepsen: run output, generated build context, and the throwaway SSH keypair
+/jepsen/store
+/jepsen/docker/broker-ctx
+/jepsen/docker/keys
+
+# Benchmark run output
+/bench/results
+/bench/docker/runner-ctx

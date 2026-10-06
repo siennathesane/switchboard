@@ -122,6 +122,62 @@ pub struct NodeConfig {
     /// the meta group; formation of the shard layout starts once this many
     /// nodes have registered.
     pub expected_nodes: u64,
+    /// Every wait the node can experience, in one place. This is a
+    /// realtime distributed system: defaults keep any single operation's
+    /// worst case at five seconds, and everything is configurable.
+    pub timeouts: Timeouts,
+}
+
+/// All broker timeouts and retry budgets. Defaults bound every operation
+/// to ≤ 5 s; every field is configurable via CLI/env (see the binary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Timeouts {
+    /// Retry budget for one logical write (elections, forwards, retries).
+    pub write_budget: Duration,
+    /// Retry budget for one fanout publish (leader resolution + legs).
+    pub fanout_budget: Duration,
+    /// One internal RPC's reply wait (raft, forwards, admin calls).
+    pub rpc_reply_budget: Duration,
+    /// Retry budget for a membership reconfiguration.
+    pub reconfigure_budget: Duration,
+    /// Retry budget for joining an existing cluster at startup.
+    pub join_budget: Duration,
+    /// Raft heartbeat interval.
+    pub raft_heartbeat: Duration,
+    /// Raft election timeout range (min..max); min must be ≥ 2× heartbeat
+    /// (clamped here if configured lower).
+    pub raft_election_min: Duration,
+    pub raft_election_max: Duration,
+    /// Reconciliation (topology refresh) tick.
+    pub reconcile_interval: Duration,
+    /// Liveness-probe (consumer janitor) tick…
+    pub janitor_interval: Duration,
+    /// …and how many consecutive refused probes declare a peer dead.
+    pub janitor_dead_after: u32,
+    /// Retries for a failed off-node delivery's Release write, and the
+    /// pause between attempts.
+    pub deliver_release_retries: u32,
+    pub deliver_release_interval: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            write_budget: Duration::from_secs(5),
+            fanout_budget: Duration::from_secs(5),
+            rpc_reply_budget: Duration::from_secs(5),
+            reconfigure_budget: Duration::from_secs(5),
+            join_budget: Duration::from_secs(5),
+            raft_heartbeat: Duration::from_millis(100),
+            raft_election_min: Duration::from_millis(300),
+            raft_election_max: Duration::from_millis(600),
+            reconcile_interval: Duration::from_millis(500),
+            janitor_interval: Duration::from_millis(1000),
+            janitor_dead_after: 3,
+            deliver_release_retries: 10,
+            deliver_release_interval: Duration::from_millis(200),
+        }
+    }
 }
 
 /// Errors surfaced by the cluster layer.
@@ -191,6 +247,10 @@ pub struct ClusterNode {
     topology_tx: tokio::sync::watch::Sender<Arc<MetaState>>,
     /// Local consumers awaiting deliveries, keyed by subscription.
     consumer_sinks: Arc<tokio::sync::RwLock<HashMap<SubscriptionId, ConsumerSink>>>,
+    /// Serializes fanout publishes cluster-wide: multi-destination
+    /// publishes execute one at a time on the meta leader so every
+    /// destination shard group receives them in one global order.
+    fanout_lock: tokio::sync::Mutex<()>,
 }
 
 impl ClusterNode {
@@ -200,8 +260,11 @@ impl ClusterNode {
         let kv = switchboard_store::RocksKv::open(&cfg.data_dir)?;
         let dir = Arc::new(Directory::new());
         dir.update(cfg.id, cfg.internal_addr.clone());
-        let channel =
-            Arc::new(crate::transport::PeerChannel::new(None, "switchboard-internal".into()));
+        let channel = Arc::new(crate::transport::PeerChannel::with_reply_budget(
+            None,
+            "switchboard-internal".into(),
+            cfg.timeouts.rpc_reply_budget,
+        ));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (topology_tx, _) = tokio::sync::watch::channel(Arc::new(MetaState::default()));
@@ -219,6 +282,7 @@ impl ClusterNode {
             topology_tx,
             consumer_sinks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             peer_probe_fails: std::sync::Mutex::new(HashMap::new()),
+            fanout_lock: tokio::sync::Mutex::new(()),
             cfg: cfg.clone(),
         });
 
@@ -246,9 +310,25 @@ impl ClusterNode {
         } else if !cfg.seeds.is_empty() {
             if let Err(e) = node.join_seeds().await {
                 // All seeds were unreachable for the full retry budget.
-                // Discovery may still introduce this node later, so stay
-                // up in pending mode rather than refusing to start.
-                tracing::warn!(node = node.id, err = ?e, "seed join failed; pending until discovery");
+                // The node stays up in pending mode (discovery may still
+                // introduce it), and a background task keeps retrying the
+                // configured seeds: a node that lists seeds must never
+                // strand as pending just because formation was busy at
+                // boot — it is useless until it joins.
+                tracing::warn!(node = node.id, err = ?e, "seed join failed; pending, retrying in background");
+                let n = node.clone();
+                tokio::spawn(async move {
+                    let pause = switchboard_core::tempo::scale(
+                        n.cfg.timeouts.reconcile_interval,
+                    );
+                    loop {
+                        tokio::time::sleep(pause).await;
+                        if n.join_seeds().await.is_ok() {
+                            tracing::info!(node = n.id, "background seed join succeeded");
+                            break;
+                        }
+                    }
+                });
             }
         } else {
             tracing::info!(
@@ -263,6 +343,12 @@ impl ClusterNode {
             let n = node.clone();
             let rx = shutdown_rx.clone();
             tokio::spawn(async move { n.reconcile_loop(rx).await });
+        }
+        {
+            // Total-order fanout executor: applies pending fanouts in
+            // meta-log order while this node leads the meta group.
+            let n = node.clone();
+            tokio::spawn(async move { n.fanout_executor_loop().await });
         }
         {
             let n = node.clone();
@@ -427,7 +513,7 @@ impl ClusterNode {
         };
         // Retry until the deadline: seeds may still be forming (leader not
         // elected yet, registration write deferred) or briefly restarting.
-        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(Duration::from_secs(60));
+        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(self.cfg.timeouts.join_budget);
         loop {
             for seed in &self.cfg.seeds {
                 match self.join_one_seed(seed, &info).await {
@@ -527,17 +613,21 @@ impl ClusterNode {
 
         // Test tempo shrinks these, but keep a floor: sub-30 ms election
         // timeouts flap under scheduler load and destabilize formation.
-        let scaled = |ms: u64| -> u64 {
-            switchboard_core::tempo::scale(Duration::from_millis(ms))
+        let scaled = |d: &Duration| -> u64 {
+            switchboard_core::tempo::scale(*d)
                 .max(Duration::from_millis(40))
                 .as_millis() as u64
         };
         // Openraft requires heartbeat < election_min; the floor must keep
         // that invariant at any tempo.
         let config = Config {
-            heartbeat_interval: scaled(100),
-            election_timeout_min: scaled(300).max(scaled(100) * 2),
-            election_timeout_max: (scaled(300).max(scaled(100) * 2) * 2).max(scaled(600)),
+            heartbeat_interval: scaled(&self.cfg.timeouts.raft_heartbeat),
+            election_timeout_min: scaled(&self.cfg.timeouts.raft_election_min)
+                .max(scaled(&self.cfg.timeouts.raft_heartbeat) * 2),
+            election_timeout_max: (scaled(&self.cfg.timeouts.raft_election_min)
+                .max(scaled(&self.cfg.timeouts.raft_heartbeat) * 2)
+                * 2)
+            .max(scaled(&self.cfg.timeouts.raft_election_max)),
             ..Default::default()
         };
         let config = Arc::new(
@@ -705,7 +795,7 @@ impl ClusterNode {
                     // subsequent delivery). Retry here until it lands.
                     let node = self.clone();
                     tokio::spawn(async move {
-                        for _ in 0..30 {
+                        for _ in 0..node.cfg.timeouts.deliver_release_retries {
                             match node
                                 .write(
                                     group,
@@ -722,7 +812,10 @@ impl ClusterNode {
                             {
                                 Ok(_) => return,
                                 Err(ClusterError::Transient) => {
-                                    tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(200))).await
+                                    tokio::time::sleep(switchboard_core::tempo::scale(
+                                        node.cfg.timeouts.deliver_release_interval,
+                                    ))
+                                    .await
                                 }
                                 Err(_) => return,
                             }
@@ -813,6 +906,133 @@ impl ClusterNode {
         None
     }
 
+    // ------------------------------------------------------------------
+    // Fanout publishes (cross-queue total order)
+    // ------------------------------------------------------------------
+
+    /// Enqueue `message` on every queue in `destinations`, preserving one
+    /// global order across all destination shard groups.
+    ///
+    /// Multi-destination publishes are the one place where independent
+    /// raft groups can disagree: group A and group B apply two concurrent
+    /// publishes in opposite orders, and consumers of queues on A and B
+    /// observe different sequences for the same messages. This path
+    /// replicates the fanout through the META group (`FanoutBegin`): the
+    /// meta leader executes pending fanouts strictly in meta-log order,
+    /// one at a time, so every destination group receives them in one
+    /// total order — and because that order lives in replicated meta
+    /// state, it survives meta-leader failover (a deposed leader's
+    /// unfinished fanout stays pending and is re-executed by its
+    /// successor; per-leg request ids make re-execution exactly-once).
+    ///
+    /// Returns (and confirms the publish) only after every destination's
+    /// enqueue has quorum-applied.
+    pub async fn fanout_publish(
+        self: &Arc<Self>,
+        vhost: String,
+        message: StoredMessage,
+        destinations: Vec<String>,
+    ) -> Result<(), ClusterError> {
+        let id = uuid::Uuid::new_v4();
+        self.write(
+            META_GROUP,
+            BrokerCommand::Meta(MetaCmd::FanoutBegin {
+                id,
+                vhost,
+                message,
+                queues: destinations,
+            }),
+        )
+        .await
+        .map_err(|e| {
+            if matches!(e, ClusterError::Unreachable { .. }) {
+                ClusterError::Unreachable { group: META_GROUP }
+            } else {
+                e
+            }
+        })?;
+        // The executor clears the pending entry once every leg has
+        // quorum-applied; that moment is the publisher confirm.
+        let deadline = tokio::time::Instant::now()
+            + switchboard_core::tempo::scale(self.cfg.timeouts.fanout_budget);
+        loop {
+            if !self.topology().pending_fanouts.iter().any(|f| f.id == id) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClusterError::Unreachable { group: META_GROUP });
+            }
+            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(20))).await;
+            self.refresh_topology().await;
+        }
+    }
+
+    /// The per-leg request id for `fanout_id`: stable across retries and
+    /// across nodes, distinct per destination.
+    fn fanout_leg_id(fanout_id: crate::typ::RequestId, leg: usize) -> crate::typ::RequestId {
+        debug_assert!(leg < 256, "fanout leg index must fit the id tag byte");
+        let mut bytes = *fanout_id.as_bytes();
+        bytes[15] ^= leg as u8;
+        uuid::Uuid::from_bytes(bytes)
+    }
+
+    /// Background executor: while this node leads the meta group, apply
+    /// pending fanouts strictly in meta-log order, one at a time, then
+    /// mark them done.
+    async fn fanout_executor_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(25))).await;
+            match self.leader_hint_of(META_GROUP).await {
+                Some(l) if l == self.id => {
+                    if let Err(e) = self.execute_pending_fanouts().await {
+                        tracing::debug!(node = self.id, err = ?e, "fanout executor pass failed; will retry");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Execute every pending fanout, FIFO, under the fanout lock. Legs are
+    /// idempotent (`fanout_leg_id`), so a fanout half-executed by a
+    /// deposed predecessor finishes exactly-once here.
+    async fn execute_pending_fanouts(self: &Arc<Self>) -> Result<(), ClusterError> {
+        let _guard = self.fanout_lock.lock().await;
+        loop {
+            self.refresh_topology().await;
+            let Some(pending) = self.topology().pending_fanouts.first().cloned() else {
+                return Ok(());
+            };
+            let topo = self.topology();
+            let vhost = topo.vhosts.get(&pending.vhost).cloned();
+            for (leg, q) in pending.queues.iter().enumerate() {
+                let Some(group) = vhost.as_ref().and_then(|vh| vh.queues.get(q).map(|qi| qi.shard))
+                else {
+                    // Vanished between acceptance and execution: skip,
+                    // mirroring the direct path's treatment of unrouted
+                    // destinations.
+                    continue;
+                };
+                self.write_idempotent(
+                    group,
+                    BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
+                        queue: q.clone(),
+                        message: pending.message.clone(),
+                        at_ms: now_ms(),
+                    }),
+                    Self::fanout_leg_id(pending.id, leg),
+                )
+                .await?;
+            }
+            self.write(
+                META_GROUP,
+                BrokerCommand::Meta(MetaCmd::FanoutDone { id: pending.id }),
+            )
+            .await?;
+        }
+    }
+
+
     pub async fn refresh_topology(self: &Arc<Self>) {
         // Bind the local (sync) read result, then drop the lock before any
         // await — std guards are not Send.
@@ -892,13 +1112,34 @@ impl ClusterNode {
     ///
     /// Retries transient conditions (election in flight, unreachable
     /// leader) for up to 30 seconds; hard broker errors surface
-    /// immediately.
+    /// immediately. The command is stamped with a fresh request id and
+    /// applied under `Idempotent`: retries and re-forwards of the same
+    /// logical write apply exactly once (see `BrokerState::dedup`). For a
+    /// caller that retries a logical operation across `write()` calls,
+    /// use [`Self::write_idempotent`] with a stable id instead.
     pub async fn write(
         self: &Arc<Self>,
         group: GroupId,
         command: BrokerCommand,
     ) -> Result<BrokerReply, ClusterError> {
-        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(Duration::from_secs(30));
+        let id = uuid::Uuid::new_v4();
+        self.write_idempotent(group, command, id).await
+    }
+
+    /// [`Self::write`], with the request id chosen by the caller. The same
+    /// `(id, command)` re-issued any number of times, on any member of the
+    /// group, applies exactly once.
+    pub async fn write_idempotent(
+        self: &Arc<Self>,
+        group: GroupId,
+        command: BrokerCommand,
+        id: crate::typ::RequestId,
+    ) -> Result<BrokerReply, ClusterError> {
+        let command = BrokerCommand::Idempotent {
+            id,
+            command: Box::new(command),
+        };
+        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
         loop {
             match self.try_write_depth(group, &command, 0).await {
                 Ok(reply) => return Ok(reply),
@@ -1091,7 +1332,8 @@ impl ClusterNode {
     // ------------------------------------------------------------------
 
     async fn reconcile_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(Duration::from_millis(500)));
+        let mut tick =
+            tokio::time::interval(switchboard_core::tempo::scale(self.cfg.timeouts.reconcile_interval));
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -1315,7 +1557,8 @@ impl ClusterNode {
     /// expiring per-message/queue TTLs (dead-lettering as configured) and
     /// abandoning stale prepared transactions.
     async fn janitor_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(Duration::from_secs(1)));
+        let mut tick =
+            tokio::time::interval(switchboard_core::tempo::scale(self.cfg.timeouts.janitor_interval));
         let mut janitor_tick = 0u64;
         loop {
             tokio::select! {
@@ -1352,7 +1595,7 @@ impl ClusterNode {
                 // a blocking connect-per-peer-per-tick here churned
                 // thousands of short-lived connections into TIME_WAIT
                 // exhaustion under load.
-                const DEAD_AFTER: u32 = 3;
+                let dead_after = self.cfg.timeouts.janitor_dead_after;
                 let peers: Vec<(NodeId, String)> = self
                     .topology()
                     .nodes
@@ -1399,7 +1642,7 @@ impl ClusterNode {
                         {
                             let n = fails.entry(id).or_insert(0);
                             *n += 1;
-                            let dead = *n >= DEAD_AFTER;
+                            let dead = *n >= dead_after;
                             if dead {
                                 eprintln!(
                                     "[jan-probe] node {} declares peer {id} ({addr}) dead after {n} refusals",
@@ -1642,7 +1885,7 @@ impl ClusterNode {
         // that can never happen — e.g. a voter whose address is unknown —
         // the openraft call would park forever. Bound it: the controller
         // retries on its next tick, so surfacing a timeout keeps liveness.
-        let change_budget = switchboard_core::tempo::scale(Duration::from_secs(30));
+        let change_budget = switchboard_core::tempo::scale(self.cfg.timeouts.reconfigure_budget);
         for n in &target {
             if !current.contains(n) {
                 let _ = tokio::time::timeout(
