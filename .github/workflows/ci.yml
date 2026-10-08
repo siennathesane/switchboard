@@ -1,0 +1,194 @@
+# Switchboard CI — every commit runs the full test surface:
+#
+#   rust-tests  cargo nextest over the workspace (unit + in-process
+#               integration, incl. the soak_smoke 3-node cluster test)
+#               plus doc tests
+#   harness     multi-language conformance harness: a real 3-node broker
+#               cluster driven by pika/paho-mqtt/stomp.py (python),
+#               amqp091-go (go), amqplib (node), bunny (ruby), the
+#               orchestrator durability/restart check, and the scale test
+#   jepsen      the jepsen lab in Docker: 5 broker nodes + control
+#               container, full 9-combo matrix (fifo/fanout/topo x
+#               parts/kill/chaos), 60s windows
+#   bench       docker benchmark sweep: 1/3/5/7-node clusters, all
+#               scenarios; raw results uploaded as artifacts. No perf
+#               thresholds — shared runners are too noisy for gates; the
+#               bar is "every scenario completes and reports numbers".
+#
+# The k3s churn soak (k8s/soak.yaml) runs for hours by design and stays a
+# lab workload; its smoke variant runs inside rust-tests as soak_smoke.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-tests:
+    name: rust tests (nextest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # -j 2: the hosted runner is 4 cores, smaller than the 10-core box
+      # the nextest profiles were tuned on, and every integration test
+      # runs multi-node raft clusters in-process. Stay under the profile
+      # default of 4 to keep raft timers healthy.
+      - name: workspace tests
+        run: cargo nextest run --workspace -j 2
+
+      - name: doc tests
+        run: cargo test --doc --workspace
+
+  harness:
+    name: language conformance harness (go/node/python/ruby)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: harness/clients/go/go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: python clients (pika, paho-mqtt, stomp.py)
+        run: |
+          python3 -m venv harness-venv
+          harness-venv/bin/pip install --upgrade pip
+          harness-venv/bin/pip install pika paho-mqtt stomp.py
+
+      - name: node client (amqplib)
+        run: npm ci
+        working-directory: harness/clients/node
+
+      - name: go client (amqp091-go)
+        run: go mod download
+        working-directory: harness/clients/go
+
+      - name: ruby client (bunny)
+        run: sudo gem install --no-document bunny
+
+      - name: conformance harness (builds the broker, boots 3 nodes)
+        run: harness-venv/bin/python harness/run.py
+
+      - name: scale test (load across 3->6->3 with SIGKILL churn)
+        run: harness-venv/bin/python harness/scale_test.py --seconds-per-phase 20
+
+      - name: upload harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-logs
+          path: harness/out/
+          if-no-files-found: ignore
+
+  jepsen:
+    name: jepsen (fifo/fanout/topo x parts/kill/chaos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # The lab SSH key is gitignored; the node image embeds the public
+      # half and the control image the private half.
+      - name: generate lab ssh key
+        run: |
+          mkdir -p jepsen/docker/keys
+          ssh-keygen -t ed25519 -N '' -f jepsen/docker/keys/id_ed25519
+
+      - name: build node image (compiles the broker)
+        run: ./jepsen/docker/build-node-image.sh
+
+      # Fresh node containers per combo (up.sh recreates them; the control
+      # image build inside up.sh is layer-cached after the first combo).
+      - name: run 9-combo matrix
+        run: |
+          set -euo pipefail
+          failed=0
+          for test in fifo fanout topo; do
+            for nemesis in parts kill chaos; do
+              echo "::group::jepsen: $test x $nemesis"
+              if ./jepsen/docker/up.sh 5 >/dev/null \
+                 && ./jepsen/docker/run.sh --test "$test" --nemesis "$nemesis" --time-limit 60; then
+                echo "combo $test x $nemesis: PASS"
+              else
+                echo "combo $test x $nemesis: FAIL"
+                failed=1
+              fi
+              ./jepsen/docker/down.sh >/dev/null || true
+              echo "::endgroup::"
+            done
+          done
+          exit "$failed"
+
+      - name: upload jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-results
+          path: jepsen/store/
+          if-no-files-found: ignore
+
+  bench:
+    name: bench sweep (docker, 1/3/5/7 nodes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # bench/cluster.sh reuses the jepsen node image, whose build needs
+      # the lab key's public half in place.
+      - name: generate lab ssh key
+        run: |
+          mkdir -p jepsen/docker/keys
+          ssh-keygen -t ed25519 -N '' -f jepsen/docker/keys/id_ed25519
+
+      - name: build node + runner images (compiles the broker)
+        run: |
+          echo "::group::node image"
+          ./jepsen/docker/build-node-image.sh
+          echo "::endgroup::"
+          echo "::group::bench runner image"
+          ./bench/docker/build.sh
+          echo "::endgroup::"
+
+      - name: benchmark sweep
+        run: ./bench/sweep.sh all 20
+
+      - name: upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results/
+          if-no-files-found: ignore
