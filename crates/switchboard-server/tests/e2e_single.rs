@@ -154,7 +154,7 @@ async fn mandatory_unroutable_gets_returned() {
     else {
         panic!("expected BasicReturn, got {}", m.name());
     };
-    assert_eq!(reply_code, 404);
+    assert_eq!(reply_code, 312, "unroutable mandatory returns 312 NO_ROUTE");
     assert_eq!(reply_text, "NO_ROUTE");
     assert_eq!(content.unwrap().1, b"lost");
 }

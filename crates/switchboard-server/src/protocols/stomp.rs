@@ -276,6 +276,32 @@ where
     .await?;
 
     let ctx = Arc::new(BridgeContext::create(node.clone(), "/".into()).await);
+    // Heart-beat send loop: the negotiation committed us to `sx` (the
+    // first value of our reply) — emit a bare-LF heartbeat at that
+    // cadence so idle sessions stay alive and clients' silence
+    // detectors stay quiet.
+    {
+        let sx: u64 = heart_beat
+            .split(',')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if sx > 0 {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(sx));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let mut w = writer.lock().await;
+                    use tokio::io::AsyncWriteExt;
+                    if w.write_all(b"\n").await.is_err() || w.flush().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
     let subscriptions: Arc<tokio::sync::Mutex<HashMap<String, Arc<BridgeConsumer>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // ack-id → (consumer, seq) for client/client-individual acks.

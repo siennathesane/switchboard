@@ -348,10 +348,7 @@ impl BridgeConsumer {
         tag: &str,
     ) -> BridgeResult<(Arc<BridgeConsumer>, mpsc::UnboundedReceiver<Delivery>)> {
         let node = &ctx.node;
-        let sub = switchboard_core::model::SubscriptionId {
-            node: node.id,
-            sub: ctx.sub_counter.fetch_add(1, Ordering::Relaxed),
-        };
+        let sub = node.next_subscription_id();
         let (dtx, drx) = mpsc::unbounded_channel::<Delivery>();
         let (ctx_tx, crx) = mpsc::unbounded_channel::<String>();
         let sink = ConsumerSink { deliveries: dtx, cancelled: ctx_tx };

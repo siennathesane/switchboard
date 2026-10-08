@@ -402,7 +402,13 @@ impl Session {
             // 3) Race client octets against the silence deadline. Reads
             //    collect into `pending` (bytes not yet forming a frame)
             //    and loop until either data arrives or the deadline hits.
-            let deadline = tokio::time::Instant::from_std(last_octets + heartbeat_timeout);
+            //    With heartbeats disabled (0) the deadline is "never":
+            //    checked_add instead of `+`, which overflows Instant and
+            //    panics the session task.
+            let deadline = match tokio::time::Instant::from_std(last_octets).checked_add(heartbeat_timeout) {
+                Some(d) => d,
+                None => tokio::time::Instant::now() + std::time::Duration::from_secs(10 * 365 * 24 * 3600),
+            };
             let mut chunk = [0u8; 4096];
             let mut read_buf = ReadBuf::new(&mut chunk);
             let sleep = tokio::time::sleep_until(deadline);

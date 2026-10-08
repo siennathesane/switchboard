@@ -228,14 +228,15 @@ async fn exchange_delete_lifecycle() {
         Method::ExchangeDeleteOk { .. }
     ));
 
-    // Mandatory publish now returns the message: 404 NO_ROUTE.
+    // Mandatory publish now returns the message: 312 NO_ROUTE (§1.5.3;
+    // 404 is reserved for synchronous ops on missing entities).
     publish(&mut c, 1, "ex", "k", &BasicProperties::new(), b"lost", true)
         .await
         .unwrap();
     let Method::BasicReturn { reply_code, .. } = c.expect(1).await.unwrap() else {
         panic!("expected BasicReturn");
     };
-    assert_eq!(reply_code, 404);
+    assert_eq!(reply_code, 312);
 }
 
 #[tokio::test(flavor = "multi_thread")]

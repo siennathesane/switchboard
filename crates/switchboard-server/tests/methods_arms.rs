@@ -216,10 +216,10 @@ async fn expect_return(c: &mut TestClient, code: u16) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mandatory_unroutable_returns_404_no_route() {
+async fn mandatory_unroutable_returns_312_no_route() {
     let (_node, addr) = start_broker("ma-mand").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
-    // mandatory=true with no route to "ghost" → 404 NO_ROUTE.
+    // mandatory=true with no route to "ghost" → 312 NO_ROUTE (§1.5.3).
     c.send_method(1, &Method::BasicPublish {
         ticket: 0, exchange: "".into(), routing_key: "ghost".into(),
         mandatory: true, immediate: false,
@@ -229,7 +229,7 @@ async fn mandatory_unroutable_returns_404_no_route() {
     let Method::BasicReturn { reply_code, reply_text, .. } = m else {
         panic!("expected Basic.Return, got {m:?}");
     };
-    assert_eq!(reply_code, 404, "{reply_text}");
+    assert_eq!(reply_code, 312, "{reply_text}");
     assert_eq!(reply_text, "NO_ROUTE");
     // The returned content follows the return frame.
     // The return's content was already consumed by expect(); a short
@@ -274,13 +274,13 @@ async fn mandatory_fanout_with_no_bindings_returns_312() {
         mandatory: true, immediate: false,
     }).await.unwrap();
     c.send_content(1, &BasicProperties::new(), b"nowhere").await.unwrap();
-    // Unroutable fanout returns 404 NO_ROUTE (not 312: no queue was
-    // involved at all).
+    // Unroutable fanout also returns 312 NO_ROUTE (RabbitMQ parity:
+    // 312 covers every unroutable mandatory publish).
     let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1)).await.unwrap().unwrap();
     let Method::BasicReturn { reply_code, .. } = m else {
         panic!("expected Basic.Return, got {m:?}");
     };
-    assert_eq!(reply_code, 404);
+    assert_eq!(reply_code, 312);
     // The return's content was already consumed by expect(); a short
     // negative window proves nothing else follows (e.g. a channel close).
     if tokio::time::timeout(Duration::from_millis(200), c.expect(1)).await.is_ok() {
