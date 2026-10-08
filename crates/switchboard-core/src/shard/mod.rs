@@ -49,14 +49,117 @@ const MAX_CREDIT: u32 = 1_000_000;
 /// per-queue sequence number allocated at apply time, so enqueue order is
 /// the total order of the raft log — the "content processing path" order
 /// guarantee of §4.7.
+///
+/// Persistence: the group's state blob carries only `next_seq` and
+/// `policy`; every live message is persisted under its own store key
+/// (see [`ShardStoreOp`]). `msgs` and the two derived indexes are
+/// therefore `serde(skip)` and rebuilt by [`QueueData::reindex`] on load
+/// and snapshot install.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueueData {
     /// Next sequence number to allocate.
     pub next_seq: u64,
+    #[serde(skip)]
     pub msgs: BTreeMap<u64, QueueMessage>,
     /// Queue-level policy parsed from declare arguments (`x-message-ttl`,
     /// `x-dead-letter-exchange`, `x-dead-letter-routing-key`).
     pub policy: QueuePolicy,
+    /// Ready (not held) messages, best-first: priority descending, seq
+    /// ascending. Derived from `msgs`; never serialized.
+    #[serde(skip)]
+    ready: BTreeSet<(std::cmp::Reverse<u8>, u64)>,
+    /// Ready messages' expiry deadlines, earliest first. Only messages
+    /// with a TTL appear. Derived from `msgs`; never serialized.
+    #[serde(skip)]
+    expiry: BTreeMap<u64, BTreeSet<u64>>,
+}
+
+impl QueueData {
+    pub fn new(policy: QueuePolicy) -> Self {
+        QueueData {
+            next_seq: 0,
+            msgs: BTreeMap::new(),
+            policy,
+            ready: BTreeSet::new(),
+            expiry: BTreeMap::new(),
+        }
+    }
+
+    /// Rebuild the derived indexes from `msgs` (load, snapshot install).
+    pub fn reindex(&mut self) {
+        self.ready.clear();
+        self.expiry.clear();
+        let facts: Vec<(u64, u8, Option<u64>, bool)> = self
+            .msgs
+            .iter()
+            .map(|(seq, m)| (*seq, m.message.properties.priority.unwrap_or(0), m.expires_at, m.held_by.is_none()))
+            .collect();
+        for (seq, prio, expires, ready) in facts {
+            if ready {
+                self.index_insert(seq, prio, expires);
+            }
+        }
+    }
+
+    /// Add a ready (not held) message to the derived indexes. `prio` /
+    /// `expires` are the message's priority and expiry deadline, passed
+    /// separately so callers never hold a borrow of `msgs` across the
+    /// index update.
+    fn index_insert(&mut self, seq: u64, prio: u8, expires: Option<u64>) {
+        self.ready.insert((std::cmp::Reverse(prio), seq));
+        if let Some(t) = expires {
+            self.expiry.entry(t).or_default().insert(seq);
+        }
+    }
+
+    /// Remove a ready message from the derived indexes (before mutating
+    /// or removing it from `msgs`).
+    fn index_remove(&mut self, seq: u64, prio: u8, expires: Option<u64>) {
+        self.ready.remove(&(std::cmp::Reverse(prio), seq));
+        if let Some(t) = expires {
+            let drained = match self.expiry.get_mut(&t) {
+                Some(set) => {
+                    set.remove(&seq);
+                    set.is_empty()
+                }
+                None => false,
+            };
+            if drained {
+                self.expiry.remove(&t);
+            }
+        }
+    }
+
+    /// Best ready message (priority desc, seq asc) without scanning the
+    /// queue. Callers expire first, so no expiry check here.
+    pub fn best_ready(&self) -> Option<u64> {
+        self.ready.iter().next().map(|(_, s)| *s)
+    }
+
+    /// Whether the derived indexes are in step with `msgs` (diagnostics
+    /// and tests).
+    pub fn indexes_consistent(&self) -> bool {
+        let ready: BTreeSet<u64> = self.ready.iter().map(|(_, s)| *s).collect();
+        let expired: BTreeSet<u64> = self.expiry.values().flat_map(|s| s.iter().copied()).collect();
+        let expect: BTreeSet<u64> =
+            self.msgs.iter().filter(|(_, m)| m.held_by.is_none()).map(|(s, _)| *s).collect();
+        ready == expect && expired == expect
+    }
+}
+
+/// One recorded storage mutation, applied by the state machine host
+/// alongside the raft log so a restart can reload every message. Recorded
+/// by [`ShardState`] mutations; the store drains and persists them once
+/// per apply batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShardStoreOp {
+    /// Upsert one message's persisted record to its current in-memory
+    /// state (resolved at drain time — no body is copied here).
+    Put { queue: String, seq: u64 },
+    /// Remove one message.
+    Del { queue: String, seq: u64 },
+    /// Remove a queue's every message (queue deleted).
+    DelQueue { queue: String },
 }
 
 /// Queue policies from declare arguments.
@@ -148,7 +251,7 @@ pub enum TxOp {
 }
 
 /// The shard state machine.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShardState {
     pub queues: BTreeMap<String, QueueData>,
     pub subs: BTreeMap<SubscriptionId, Subscription>,
@@ -163,6 +266,26 @@ pub struct ShardState {
     /// Wall-clock ms carried by the most recent command that stamps time
     /// (`Enqueue`, `Sweep`). Command-carried, so replicas stay identical.
     pub last_ms: u64,
+    /// Storage mutations recorded by the current apply. The state machine
+    /// host drains this after each entry and persists it alongside the
+    /// raft log, so per-message records stay in step with the state.
+    /// Never serialized (it is a side channel, not state).
+    #[serde(skip)]
+    pub store: Vec<ShardStoreOp>,
+}
+
+/// Equality ignores `store`: it is apply-time scratch whose contents
+/// depend on whether an apply was a first application or a dedup replay.
+impl PartialEq for ShardState {
+    fn eq(&self, other: &Self) -> bool {
+        self.queues == other.queues
+            && self.subs == other.subs
+            && self.prepared == other.prepared
+            && self.prepared_at == other.prepared_at
+            && self.tx_timeout_ticks == other.tx_timeout_ticks
+            && self.now == other.now
+            && self.last_ms == other.last_ms
+    }
 }
 
 impl ShardState {
@@ -171,29 +294,20 @@ impl ShardState {
         self.subs.values().filter(|s| s.queue == queue).count() as u32
     }
 
-    /// Next ready (not held, not expired) sequence for a queue: highest
+    /// Best ready (not held, not expired) sequence for a queue: highest
     /// message priority first (§2.1.3? priority is a RabbitMQ/`basic`
-    /// property server extension), FIFO within a priority.
+    /// property server extension), FIFO within a priority. O(log n) via
+    /// the ready index; callers run expiry first so expired sequences are
+    /// already gone.
     pub fn next_ready(&self, queue: &str) -> Option<u64> {
-        let q = self.queues.get(queue)?;
-        let mut best: Option<(u8, u64)> = None;
-        for (s, m) in q.msgs.iter() {
-            if m.held_by.is_some() {
-                continue;
-            }
-            if m.expires_at.map_or(false, |t| t <= self.last_ms) {
-                continue;
-            }
-            let prio = m.message.properties.priority.unwrap_or(0);
-            let better = match best {
-                None => true,
-                Some((bp, bs)) => prio > bp || (prio == bp && *s < bs),
-            };
-            if better {
-                best = Some((prio, *s));
-            }
+        self.queues.get(queue)?.best_ready()
+    }
+
+    /// Rebuild every queue's derived indexes (load, snapshot install).
+    pub fn reindex_all(&mut self) {
+        for q in self.queues.values_mut() {
+            q.reindex();
         }
-        best.map(|(_, s)| s)
     }
 
     fn queue(&self, name: &str) -> Result<&QueueData, BrokerError> {
@@ -205,19 +319,15 @@ impl ShardState {
     /// Apply a shard command: mutate state, reply, emit effects. Pure —
     /// identical on every replica of the group.
     pub fn apply(&mut self, cmd: &ShardCmd) -> Result<(ShardReply, Vec<ShardEffect>), BrokerError> {
-        self.now += 1;
-        match cmd {
+        self.now += 1;        match cmd {
             ShardCmd::CreateQueueData { queue, policy } => {
-                self.queues.entry(queue.clone()).or_insert_with(|| QueueData {
-                    next_seq: 0,
-                    msgs: BTreeMap::new(),
-                    policy: policy.clone(),
-                });
+                self.queues.entry(queue.clone()).or_insert_with(|| QueueData::new(policy.clone()));
                 Ok((ShardReply::Ok, vec![]))
             }
 
             ShardCmd::DeleteQueueData { queue } => {
                 self.queues.remove(queue);
+                self.store.push(ShardStoreOp::DelQueue { queue: queue.clone() });
                 // Cancel every consumer of this queue; the nodes inform the
                 // client channels.
                 let mut effects = Vec::new();
@@ -332,6 +442,8 @@ impl ShardState {
                 let mut freed: Vec<(SubscriptionId, u64)> = Vec::new();
                 for seq in seqs {
                     if let Some(m) = q.msgs.remove(seq) {
+                        // Held messages are not in the derived indexes.
+                        self.store.push(ShardStoreOp::Del { queue: queue.clone(), seq: *seq });
                         if let Some(holder) = m.held_by {
                             freed.push((holder, m.message.size()));
                         }
@@ -376,25 +488,29 @@ impl ShardState {
                     .filter(|(_, s)| !live_nodes.contains(&s.node))
                     .map(|(id, _)| *id)
                     .collect();
-                if !dead_subs.is_empty() {
-                    eprintln!("[orphan-probe] live={live_nodes:?} dead_subs={dead_subs:?}");
-                }
                 let mut effects = Vec::new();
-                let mut requeued = 0u32;
                 for sub in &dead_subs {
                     let Some(s) = self.subs.remove(sub) else { continue };
-                    let Some(q) = self.queues.get_mut(&s.queue) else { continue };
-                    for (seq, m) in q.msgs.iter_mut() {
-                        if m.held_by == Some(*sub) {
-                            m.held_by = None;
-                            m.delivered_once = true;
-                            requeued += 1;
+                    let queue = s.queue.clone();
+                    let mut requeued: Vec<(u64, u8, Option<u64>)> = Vec::new();
+                    if let Some(q) = self.queues.get_mut(&queue) {
+                        for (seq, m) in q.msgs.iter_mut() {
+                            if m.held_by == Some(*sub) {
+                                m.held_by = None;
+                                m.delivered_once = true;
+                                requeued.push((*seq, m.message.properties.priority.unwrap_or(0), m.expires_at));
+                            }
+                        }
+                        for (seq, prio, expires) in &requeued {
+                            q.index_insert(*seq, *prio, *expires);
                         }
                     }
-                    let effects_here = self.pump(&s.queue);
+                    for (seq, _, _) in requeued {
+                        self.store.push(ShardStoreOp::Put { queue: queue.clone(), seq });
+                    }
+                    let effects_here = self.pump(&queue);
                     effects.extend(effects_here);
                 }
-                let _ = requeued;
                 Ok((ShardReply::Ok, effects))
             }
 
@@ -403,6 +519,8 @@ impl ShardState {
                 if !self.queues.contains_key(queue.as_str()) {
                     return Err(BrokerError::not_found(format!("no queue {queue:?} on this shard")));
                 }
+                let mut effects = Vec::new();
+                self.expire_ready(queue, &mut effects);
                 let Some(seq) = self.next_ready(queue) else {
                     let depth = self
                         .queues
@@ -415,22 +533,23 @@ impl ShardState {
                     .queues
                     .get_mut(queue)
                     .ok_or_else(|| BrokerError::not_found(format!("no queue {queue:?}")))?;
-                // Scope the mutable borrow so depth is readable after.
-                let (redelivered, message) = {
-                    let m = q.msgs.get_mut(&seq).expect("seq from live map");
-                    let redelivered = m.delivered_once;
-                    m.delivered_once = true;
-                    if *no_ack {
-                        let holder = SubscriptionId { node: GET_HOLDER_NODE, sub: *get_id };
-                        m.held_by = Some(holder);
-                    } else {
-                        let holder = SubscriptionId { node: GET_HOLDER_NODE, sub: *get_id };
-                        m.held_by = Some(holder);
-                    }
-                    (redelivered, m.message.clone())
+                // Capture the message's facts (its body included), then
+                // mutate: index updates take plain facts so `msgs` is
+                // never borrowed across them.
+                let (prio, expires, redelivered, message) = {
+                    let m = q.msgs.get(&seq).expect("seq from live map");
+                    (m.message.properties.priority.unwrap_or(0), m.expires_at, m.delivered_once, m.message.clone())
                 };
+                q.index_remove(seq, prio, expires);
+                let holder = SubscriptionId { node: GET_HOLDER_NODE, sub: *get_id };
                 if *no_ack {
                     q.msgs.remove(&seq);
+                    self.store.push(ShardStoreOp::Del { queue: queue.clone(), seq });
+                } else {
+                    let m = q.msgs.get_mut(&seq).expect("seq from live map");
+                    m.delivered_once = true;
+                    m.held_by = Some(holder);
+                    self.store.push(ShardStoreOp::Put { queue: queue.clone(), seq });
                 }
                 let depth = q.msgs.len() as u32;
                 Ok((ShardReply::Got { seq, redelivered, depth, message }, vec![]))
@@ -444,7 +563,17 @@ impl ShardState {
                 // Purge clears ready messages; messages held unacked are not
                 // the queue's to purge (they belong to their consumer).
                 let before = q.msgs.len() as u32;
-                q.msgs.retain(|_, m| m.held_by.is_some());
+                let purged: Vec<(u64, u8, Option<u64>)> = q
+                    .msgs
+                    .iter()
+                    .filter(|(_, m)| m.held_by.is_none())
+                    .map(|(s, m)| (*s, m.message.properties.priority.unwrap_or(0), m.expires_at))
+                    .collect();
+                for (seq, prio, expires) in &purged {
+                    q.index_remove(*seq, *prio, *expires);
+                    q.msgs.remove(seq);
+                    self.store.push(ShardStoreOp::Del { queue: queue.clone(), seq: *seq });
+                }
                 Ok((ShardReply::Purged { message_count: before - q.msgs.len() as u32 }, vec![]))
             }
 
@@ -480,7 +609,9 @@ impl ShardState {
                         }
                         TxOp::Ack { queue, seq } => {
                             if let Some(q) = self.queues.get_mut(queue) {
-                                q.msgs.remove(seq);
+                                if q.msgs.remove(seq).is_some() {
+                                    self.store.push(ShardStoreOp::Del { queue: queue.clone(), seq: *seq });
+                                }
                             }
                         }
                     }
@@ -542,30 +673,36 @@ impl ShardState {
             .ok_or_else(|| BrokerError::not_found(format!("no queue {queue:?}")))?;
         let seq = q.next_seq;
         q.next_seq += 1;
-        q.msgs.insert(
-            seq,
-            QueueMessage {
-                message,
-                held_by: None,
-                delivered_once: false,
-                expires_at: ttl.map(|ttl| at_ms.saturating_add(ttl)),
-            },
-        );
+        let m = QueueMessage {
+            message,
+            held_by: None,
+            delivered_once: false,
+            expires_at: ttl.map(|ttl| at_ms.saturating_add(ttl)),
+        };
+        let prio = m.message.properties.priority.unwrap_or(0);
+        let expires = m.expires_at;
+        q.msgs.insert(seq, m);
+        q.index_insert(seq, prio, expires);
+        self.store.push(ShardStoreOp::Put { queue: queue.to_string(), seq });
         Ok(seq)
     }
 
     /// Drop expired ready messages; emit dead-letter effects for them.
+    /// O(expired) via the expiry index — empty when no TTLs are in play.
     fn expire_ready(&mut self, queue: &str, effects: &mut Vec<ShardEffect>) -> u32 {
         let Some(q) = self.queues.get_mut(queue) else { return 0 };
-        let expired: Vec<u64> = q
-            .msgs
-            .iter()
-            .filter(|(_, m)| m.held_by.is_none() && m.expires_at.map_or(false, |t| t <= self.last_ms))
-            .map(|(s, _)| *s)
-            .collect();
+        let mut expired: Vec<u64> = Vec::new();
+        for (_, seqs) in q.expiry.range(..=self.last_ms) {
+            expired.extend(seqs.iter().copied());
+        }
         let n = expired.len() as u32;
         for seq in expired {
+            let Some(m) = q.msgs.get(&seq) else { continue };
+            let prio = m.message.properties.priority.unwrap_or(0);
+            let expires = m.expires_at;
+            q.index_remove(seq, prio, expires);
             if let Some(m) = q.msgs.remove(&seq) {
+                self.store.push(ShardStoreOp::Del { queue: queue.to_string(), seq });
                 let dlx = Self::dlx_of(&q.policy);
                 effects.push(ShardEffect::DeadLettered {
                     queue: queue.to_string(),
@@ -607,6 +744,7 @@ impl ShardState {
         }
         for seq in dead {
             if let Some(m) = q.msgs.remove(&seq) {
+                self.store.push(ShardStoreOp::Del { queue: queue.to_string(), seq });
                 if let Some(holder) = sub {
                     if let Some(s) = self.subs.get_mut(&holder) {
                         s.held_bytes = s.held_bytes.saturating_sub(m.message.size());
@@ -630,16 +768,26 @@ impl ShardState {
     /// re-registering wants redelivery), so holding them forever would
     /// strand confirmed messages after a crash.
     fn release_orphan_holds(&mut self, sub: &SubscriptionId) {
-        for q in self.queues.values_mut() {
+        let queues: Vec<String> = self.queues.keys().cloned().collect();
+        for queue in queues {
+            let Some(q) = self.queues.get_mut(&queue) else { continue };
             let mut freed = 0u64;
-            for m in q.msgs.values_mut() {
+            let mut released: Vec<(u64, u8, Option<u64>)> = Vec::new();
+            for (seq, m) in q.msgs.iter_mut() {
                 if m.held_by == Some(*sub) {
                     m.held_by = None;
                     m.delivered_once = true;
                     freed += m.message.size();
+                    released.push((*seq, m.message.properties.priority.unwrap_or(0), m.expires_at));
                 }
             }
+            for (seq, prio, expires) in &released {
+                q.index_insert(*seq, *prio, *expires);
+            }
             if freed > 0 {
+                for (seq, _, _) in &released {
+                    self.store.push(ShardStoreOp::Put { queue: queue.clone(), seq: *seq });
+                }
                 if let Some(s) = self.subs.get_mut(sub) {
                     s.held_bytes = s.held_bytes.saturating_sub(freed);
                 }
@@ -657,6 +805,7 @@ impl ShardState {
         let Some(q) = self.queues.get_mut(queue) else { return 0 };
         let mut freed: Vec<(SubscriptionId, u64)> = Vec::new();
         let mut n = 0;
+        let mut released: Vec<(u64, u8, Option<u64>)> = Vec::new();
         for (s, m) in q.msgs.iter_mut() {
             let hit = match sub {
                 Some(holder) => m.held_by == Some(holder),
@@ -667,8 +816,15 @@ impl ShardState {
                     freed.push((holder, m.message.size()));
                 }
                 m.held_by = None;
+                released.push((*s, m.message.properties.priority.unwrap_or(0), m.expires_at));
                 n += 1;
             }
+        }
+        for (seq, prio, expires) in &released {
+            q.index_insert(*seq, *prio, *expires);
+        }
+        for (seq, _, _) in &released {
+            self.store.push(ShardStoreOp::Put { queue: queue.to_string(), seq: *seq });
         }
         for (holder, bytes) in freed {
             if let Some(s) = self.subs.get_mut(&holder) {
@@ -680,6 +836,7 @@ impl ShardState {
 
     /// The delivery pump: hand ready messages to consumers with credit.
     /// Runs after any state change that could satisfy a pending pull.
+    /// O(messages handed out), not O(queue depth).
     fn pump(&mut self, queue: &str) -> Vec<ShardEffect> {
         let mut effects = Vec::new();
         self.expire_ready(queue, &mut effects);
@@ -702,20 +859,27 @@ impl ShardState {
                 .map(|(id, _)| *id)
                 .min();
             let Some(sub) = candidate else { break };
-            let Some(seq) = self.next_ready(queue) else { break };
+
+            // Capture the best ready message's facts, then hand it out.
+            let (seq, prio, expires, redelivered, message) = {
+                let q = self.queues.get(queue).expect("queue exists");
+                let Some(seq) = q.best_ready() else { break };
+                let m = q.msgs.get(&seq).expect("ready seq from live map");
+                (seq, m.message.properties.priority.unwrap_or(0), m.expires_at, m.delivered_once, m.message.clone())
+            };
 
             let no_ack = self.subs[&sub].no_ack;
             let byte_limit = self.subs[&sub].byte_limit;
             let q = self.queues.get_mut(queue).expect("queue exists");
-            let m = q.msgs.get_mut(&seq).expect("seq from live map");
-            let redelivered = m.delivered_once;
-            m.delivered_once = true;
-            let message = m.message.clone();
-
+            q.index_remove(seq, prio, expires);
             if no_ack {
                 q.msgs.remove(&seq);
+                self.store.push(ShardStoreOp::Del { queue: queue.to_string(), seq });
             } else {
+                let m = q.msgs.get_mut(&seq).expect("seq from live map");
+                m.delivered_once = true;
                 m.held_by = Some(sub);
+                self.store.push(ShardStoreOp::Put { queue: queue.to_string(), seq });
             }
             {
                 let s = self.subs.get_mut(&sub).expect("candidate sub");
