@@ -157,6 +157,11 @@ pub struct Cli {
     #[arg(long, env = "SWITCHBOARD_JANITOR_DEAD_AFTER", default_value_t = 3)]
     pub janitor_dead_after: u32,
 
+    /// Consecutive refused controller probes before a registered node is
+    /// reaped from the directory (≈400 ms per probe).
+    #[arg(long, env = "SWITCHBOARD_REAP_DEAD_AFTER", default_value_t = 25)]
+    pub reap_dead_after: u32,
+
     /// Retries for a failed off-node delivery's Release write.
     #[arg(long, env = "SWITCHBOARD_DELIVER_RELEASE_RETRIES", default_value_t = 10)]
     pub deliver_release_retries: u32,
@@ -169,6 +174,9 @@ pub struct Cli {
     #[arg(long, env = "SWITCHBOARD_HEARTBEAT", default_value_t = 60)]
     pub heartbeat: u16,
 }
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -198,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
         reconcile_interval: std::time::Duration::from_millis(cli.reconcile_interval_ms),
         janitor_interval: std::time::Duration::from_millis(cli.janitor_interval_ms),
         janitor_dead_after: cli.janitor_dead_after,
+        reap_dead_after: cli.reap_dead_after,
         deliver_release_retries: cli.deliver_release_retries,
         deliver_release_interval: std::time::Duration::from_millis(cli.deliver_release_interval_ms),
     };
@@ -217,6 +226,39 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("cluster start failed: {e}"))?;
 
+    // Graceful departure on SIGTERM/SIGINT: announce ForgetNode through
+    // meta so the directory, meta voter set, and group member lists
+    // converge immediately instead of waiting out the dead-node reaper.
+    // Orchestrators (k8s, systemd, docker stop) get a bounded window;
+    // if the process is SIGKILLed anyway, the controller's reaper heals
+    // the membership on its own.
+    {
+        let node2 = node.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::signal;
+                use tokio::signal::unix::SignalKind;
+                let mut term = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut int = match signal(SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                tokio::select! {
+                    _ = term.recv() => tracing::info!("SIGTERM: leaving cluster"),
+                    _ = int.recv() => tracing::info!("SIGINT: leaving cluster"),
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await.ok();
+            let _ = node2.leave().await;
+            std::process::exit(0);
+        });
+    }
+
 
     // Self-discovery: DNS seeds / SRV records / mDNS all feed the join
     // protocol, so clusters assemble without listing every peer by hand.
@@ -229,8 +271,13 @@ async fn main() -> anyhow::Result<()> {
     };
     {
         let node2 = node.clone();
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
+            // The sender MUST live as long as discovery: a dropped
+            // sender resolves `changed()` immediately, which ended the
+            // discovery loop on its first poll — every --dns-seed /
+            // mDNS deployment silently never discovered anything.
+            let _keep_alive = shutdown_tx;
             switchboard_cluster::discovery::run(node2, discovery_cfg, shutdown_rx).await;
         });
     }

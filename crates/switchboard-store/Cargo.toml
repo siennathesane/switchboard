@@ -8,6 +8,7 @@ description = "RocksDB-backed KV store and OpenRaft log/state-machine storage"
 
 [dependencies]
 switchboard-core = { workspace = true }
+serde_json = { workspace = true }
 switchboard-wire = { workspace = true }
 openraft = { workspace = true }
 rocksdb = { workspace = true }

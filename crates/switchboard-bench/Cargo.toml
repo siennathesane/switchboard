@@ -13,7 +13,22 @@ clap = { workspace = true }
 lapin = { version = "2.5", default-features = false, features = [] }
 tokio-util = { workspace = true }
 futures-lite = "2"
+mimalloc = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tracing = { workspace = true }
+switchboard-server = { workspace = true }
+switchboard-wire = { workspace = true }
+tokio-executor-trait = "2.1.0"
+
+[lib]
+name = "switchboard_bench"
+path = "src/lib.rs"
 
 [[bin]]
 name = "switchboard-bench"
 path = "src/main.rs"
+
+[[bin]]
+name = "switchboard-soak"
+path = "src/bin/soak.rs"

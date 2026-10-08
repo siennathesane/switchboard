@@ -11,6 +11,7 @@ name = "switchboard"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { workspace = true }
 switchboard-wire = { workspace = true }
 switchboard-core = { workspace = true }
 switchboard-store = { workspace = true }

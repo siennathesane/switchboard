@@ -1314,6 +1314,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "librocksdb-sys"
 version = "0.19.0+11.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1431,6 +1440,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "minimal-lexical"
@@ -2232,6 +2250,7 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "clap",
+ "mimalloc",
  "rustls",
  "serde",
  "switchboard-cluster",
@@ -2252,9 +2271,16 @@ dependencies = [
  "clap",
  "futures-lite 2.6.1",
  "lapin",
+ "mimalloc",
+ "rustls-pemfile",
  "serde_json",
+ "switchboard-server",
+ "switchboard-wire",
  "tokio",
+ "tokio-executor-trait",
+ "tokio-rustls",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2275,6 +2301,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "switchboard-core",
  "switchboard-store",
  "switchboard-wire",
@@ -2312,7 +2339,9 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sha1",
+ "switchboard-bench",
  "switchboard-cluster",
  "switchboard-core",
  "switchboard-wire",
@@ -2332,6 +2361,7 @@ dependencies = [
  "openraft",
  "rocksdb",
  "serde",
+ "serde_json",
  "switchboard-core",
  "switchboard-wire",
  "thiserror 2.0.20",
@@ -2505,6 +2535,17 @@ dependencies = [
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-executor-trait"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6278565f9fd60c2d205dfbc827e8bb1236c2b1a57148708e95861eff7a6b3bad"
+dependencies = [
+ "async-trait",
+ "executor-trait",
+ "tokio",
 ]
 
 [[package]]
