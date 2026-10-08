@@ -20,6 +20,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -434,6 +435,22 @@ where
     for (_, link) in links.lock().await.drain() {
         teardown_link(&ctx, &link).await;
     }
+    // A protocol error can fire while the peer still has bytes in flight
+    // (a pipelined frame body behind the offending header). Closing now
+    // would RST the socket under those bytes; drain what has already
+    // arrived (bounded, brief) so the peer sees a clean EOF.
+    {
+        use tokio::io::AsyncReadExt;
+        let mut scratch = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, reader.read(&mut scratch)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+            }
+        }
+    }
     Ok(())
 }
 
@@ -446,7 +463,9 @@ async fn read_frame<R: AsyncRead + Unpin>(
     if reader.read_exact(&mut head).await? == 0 {
         return Ok(None);
     }
-    let doff = head[0] as usize;
+    // §2.3 frame header: size (4), doff (1), type (1), channel (2).
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let doff = head[4] as usize;
     if doff < 2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -454,20 +473,17 @@ async fn read_frame<R: AsyncRead + Unpin>(
         ));
     }
     let header_len = doff * 4;
-    let mut rest_len = header_len - 8;
-    let size = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
     if size < header_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "amqp1: frame smaller than fixed header",
         ));
     }
-    let mut extended = vec![0u8; rest_len];
+    let mut extended = vec![0u8; header_len - 8];
     if header_len > 8 {
         reader.read_exact(&mut extended).await?;
-        rest_len = 0;
     }
-    let mut body = vec![0u8; size - header_len + rest_len];
+    let mut body = vec![0u8; size - header_len];
     if !body.is_empty() {
         reader.read_exact(&mut body).await?;
     }

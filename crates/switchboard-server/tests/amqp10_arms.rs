@@ -71,7 +71,8 @@ async fn read_frame_raw(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     let mut head = [0u8; 8];
     sock.read_exact(&mut head).await.unwrap();
-    let size = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    // §2.3: size (0..4), doff (4), type (5), channel (6..8).
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
     let mut rest = vec![0u8; size.saturating_sub(8)];
     sock.read_exact(&mut rest).await.unwrap();
     let mut frame = head.to_vec();
@@ -358,16 +359,17 @@ async fn a10_bad_second_protocol_header_closes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a10_malformed_frames_close_gracefully() {
     let (addr, _node) = gw().await;
-    // doff < 2 → invalid frame offset.
+    // doff < 2 → invalid frame offset (§2.3 layout: size, doff, ...).
     let mut sock = amqp10_open_session(&addr).await;
-    sock.write_all(&[0x01, 0, 0, 0, 0, 0, 0, 8]).await.unwrap();
+    sock.write_all(&[0, 0, 0, 16, 0x01, 0, 0, 0]).await.unwrap();
+    sock.write_all(&[0u8; 8]).await.unwrap();
     let mut buf = [0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await.unwrap().unwrap();
     assert_eq!(n, 0, "bad doff must close");
 
     // size < header length → closed as well.
     let mut sock = amqp10_open_session(&addr).await;
-    sock.write_all(&[0x02, 0, 0, 0, 0, 0, 0, 4]).await.unwrap();
+    sock.write_all(&[0, 0, 0, 7, 0x02, 0, 0, 0]).await.unwrap();
     let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await.unwrap().unwrap();
     assert_eq!(n, 0, "bad size must close");
 }
@@ -379,13 +381,13 @@ async fn a10_extended_header_frame_parses_and_session_survives() {
     // doff=3: an 12-byte frame header (8 fixed + 4 extended), carrying a
     // CLOSE performative body. The extended bytes are ignored; the
     // session processes the frame.
-    let mut frame = vec![0x03, 0, 0, 0, 0, 0, 0, 20];
+    let mut frame = vec![0, 0, 0, 20, 0x03, 0, 0, 0]; // size, doff=3
     frame.extend_from_slice(&[0u8; 4]); // extended header
     frame.extend_from_slice(&{
         let mut body = Vec::new();
         types::encode(&types::Value::ULong(frames::codes::CLOSE), &mut body);
-        // channel 0 + described body per transport framing: the frame
-        // body starts with the channel word.
+        // described body per transport framing: the frame body starts
+        // with the channel word.
         let mut full = vec![0, 0, 0, 0];
         full.extend_from_slice(&body);
         full.resize(20 - 12, 0); // pad to declared size

@@ -94,10 +94,11 @@ pub fn encode_frame_with_payload(
     body.extend_from_slice(payload);
     let size = 8 + body.len();
     let mut out = Vec::with_capacity(size);
+    // §2.3 frame header: size (4), doff (1), type (1), channel (2).
+    out.extend_from_slice(&(size as u32).to_be_bytes());
     out.push(2); // doff
     out.push(FRAME_TYPE_AMQP);
     out.extend_from_slice(&channel.to_be_bytes());
-    out.extend_from_slice(&(size as u32).to_be_bytes());
     out.extend_from_slice(&body);
     out
 }
@@ -109,10 +110,10 @@ pub fn encode_sasl_frame(code: u64, fields: Vec<Value>) -> Vec<u8> {
     encode(&described, &mut body);
     let size = 8 + body.len();
     let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(&(size as u32).to_be_bytes());
     out.push(2);
     out.push(FRAME_TYPE_SASL);
     out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&(size as u32).to_be_bytes());
     out.extend_from_slice(&body);
     out
 }
@@ -122,23 +123,21 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Frame, usize), String> {
     if buf.len() < 8 {
         return Ok(want_more());
     }
-    let doff = buf[0] as usize;
+    // §2.3 frame header: size (4), doff (1), type (1), channel (2).
+    let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let doff = buf[4] as usize;
     if doff < 2 {
         return Err("amqp1: frame offset < 2".into());
     }
     let header_len = doff * 4;
-    if buf.len() < header_len {
-        return Ok(want_more());
-    }
-    let frame_type = buf[1];
-    let channel = u16::from_be_bytes([buf[2], buf[3]]);
-    let size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    if size < header_len {
+    if size < 8 || size < header_len {
         return Err("amqp1: frame size smaller than header".into());
     }
     if buf.len() < size {
         return Ok(want_more());
     }
+    let frame_type = buf[5];
+    let channel = u16::from_be_bytes([buf[6], buf[7]]);
     let body = &buf[header_len..size];
     if !body.is_empty() && (frame_type == FRAME_TYPE_AMQP || frame_type == FRAME_TYPE_SASL) {
         // Both frame types carry a described performative; transfer adds
@@ -526,11 +525,17 @@ mod builder_tests {
 
     #[test]
     fn garbage_frames_error_cleanly() {
+        // §2.3 layout: size (0..4), doff (4), type (5), channel (6..8).
         // Frame offset < 2.
-        let mut b = vec![1u8, 0, 0, 0, 8, 0, 0, 0];
+        let mut b = vec![0u8, 0, 0, 16, 1, 0, 0, 0];
         b.extend_from_slice(&[0; 8]);
         assert!(decode_frame(&b).is_err());
-        // size field (offset 4..8) below the 8-byte fixed header → error.
-        assert!(decode_frame(&[2u8, 0, 0, 0, 0, 0, 0, 7]).is_err());
+        // size below the 8-byte fixed header → error.
+        assert!(decode_frame(&[0u8, 0, 0, 7, 2, 0, 0, 0]).is_err());
+        // Shorter than the announced size → want-more sentinel, not an
+        // error.
+        let (f, used) = decode_frame(&[0u8, 0, 0, 64, 2, 0, 0, 0]).unwrap();
+        assert_eq!(used, 0);
+        assert_eq!(f.frame_type, 0xFF);
     }
 }
