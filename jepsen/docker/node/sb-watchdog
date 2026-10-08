@@ -4,18 +4,22 @@
 # race) or when the process is up but the client port stays closed for
 # ~30s (wedged). The enable flag is how the Jepsen kill nemesis keeps a
 # node down: kill! removes the flag before pkill; start! re-arms it.
+#
+# Liveness is judged by pgrep, not the pidfile: the pidfile can name a
+# broker that lost the RocksDB lock race against a concurrent starter
+# (Jepsen start! vs this watchdog), and acting on a stale pid meant
+# start-spam against the live broker or restarts that never happened.
 fails=0
 while :; do
   sleep 1
   [ -f /var/run/sb-enabled ] || continue
-  pid=$(cat /var/run/switchboard.pid 2>/dev/null)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if pgrep -x switchboard >/dev/null 2>&1; then
     if nc -z 127.0.0.1 5672 >/dev/null 2>&1; then
       fails=0
     else
       fails=$((fails+1))
       if [ "$fails" -ge 30 ]; then
-        kill -9 "$pid" 2>/dev/null
+        pkill -9 -x switchboard
         sleep 1
         if [ -f /var/run/sb-args ]; then
           /usr/local/bin/sb-start $(cat /var/run/sb-args) >/dev/null 2>&1 || true

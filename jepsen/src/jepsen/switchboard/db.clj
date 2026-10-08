@@ -48,8 +48,11 @@
     (c/exec "sh" "-c"
             (str "printf '%s\\n' " (str/join " " (map #(str "'" % "'") args))
                  " > /var/run/sb-args"))
-    (c/exec "sh" "-c" (str "touch " enable-flag))
-    (apply c/exec* start-cmd (str node-id) node (str (count nodes)) extra)))
+    ;; Start BEFORE arming the watchdog: the watchdog judges liveness by
+    ;; pgrep, so arming first lets its next tick race this very start and
+    ;; spawn a second broker (the loser dies on the RocksDB lock).
+    (apply c/exec* start-cmd (str node-id) node (str (count nodes)) extra)
+    (c/exec "sh" "-c" (str "touch " enable-flag))))
 
 (defn await-port!
   "Waits until this node's client port accepts TCP."
@@ -71,7 +74,7 @@
   (let [code (c/exec "sh" "-c"
                      (str "for i in $(seq 1 40); do "
                           "nc -z 127.0.0.1 " client-port " >/dev/null 2>&1 && exit 0; "
-                          "kill -0 $(cat " pid-file ") 2>/dev/null || exit 2; "
+                          "pgrep -x switchboard >/dev/null 2>&1 || exit 2; "
                           "sleep 0.5; done; exit 3"))]
     (case (str/trim code)
       "0" :up
@@ -111,11 +114,13 @@
   db/Pause
   (pause! [_ _ _]
     (info "Pausing switchboard (SIGSTOP)")
-    (c/exec "sh" "-c" (str "kill -STOP $(cat " pid-file ") || true")))
+    ;; By name, not by the pidfile: the pidfile can name a broker that
+    ;; lost a start race; the pause must hit the broker that runs.
+    (c/exec "sh" "-c" "pkill -STOP -x switchboard; exit 0"))
 
   (resume! [_ _ _]
     (info "Resuming switchboard (SIGCONT)")
-    (c/exec "sh" "-c" (str "kill -CONT $(cat " pid-file ") || true")))
+    (c/exec "sh" "-c" "pkill -CONT -x switchboard; exit 0"))
 
   db/LogFiles
   (log-files [_ _ _]

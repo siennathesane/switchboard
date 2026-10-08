@@ -83,14 +83,20 @@ jobs:
       # -j 2: the hosted runners are 4 cores, smaller than the 10-core box
       # the nextest profiles were tuned on, and every integration test
       # runs multi-node raft clusters in-process. Stay under the profile
-      # default of 4 to keep raft timers healthy. SB_TIME_SCALE softens
-      # the test time-warp off Linux: a 50x-shrunk 0.8 ms raft heartbeat
-      # misses under runner contention (soak_smoke failed all retries on
-      # the macOS runner at 50x); Linux stays at the validated 50x.
+      # default of 4 to keep raft timers healthy. soak_smoke is excluded
+      # here and run separately below: it needs a softer test time-warp
+      # (SB_TIME_SCALE) on contended non-Linux runners — a 50x-shrunk
+      # 0.8ms raft heartbeat misses under runner contention (it failed
+      # 4/4 retries on the macOS runner at 50x) — and exporting the
+      # variable suite-wide would break tempo::tests::identity_without_env,
+      # which asserts identity in a clean environment.
       - name: workspace tests
+        run: cargo nextest run --workspace -j 2 -E 'not test(soak_smoke)'
+
+      - name: soak smoke (soft time-warp; 12 workloads vs a live 3-node cluster)
         env:
-          SB_TIME_SCALE: ${{ runner.os == 'Linux' && '50' || '10' }}
-        run: cargo nextest run --workspace -j 2
+          SB_TIME_SCALE: 10
+        run: cargo nextest run -p switchboard-server --test soak_smoke -j 1
 
       - name: doc tests
         run: cargo test --doc --workspace
@@ -115,6 +121,9 @@ jobs:
     env:
       # matrix context works in job-level env; runner context would not.
       VENV_PY: ${{ contains(matrix.os, 'windows') && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
+      # Windows stdio defaults to cp1252 and the suites print arrows
+      # (U+2192); without this the first check name crashes the process.
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 

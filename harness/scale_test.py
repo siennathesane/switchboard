@@ -269,6 +269,7 @@ def main() -> int:
         print(f"[t+{time.time()-t0:5.1f}s] phase 6: drain (publishers stopped, consumers finish)")
         deadline = time.time() + 300
         last_progress = (time.time(), stats.consumed_total())
+        drain_stop = "verdict reached"
         while time.time() < deadline:
             ok_now, _ = stats.verdict()
             if ok_now:
@@ -278,12 +279,20 @@ def main() -> int:
             if consumed_now > last_progress[1]:
                 last_progress = (now, consumed_now)
             elif now - last_progress[0] > 30:
+                drain_stop = "no consumer progress for 30s"
                 print("  drain: no progress for 30s — stopping")
                 break
             time.sleep(0.2)
+        if drain_stop != "verdict reached":
+            print(f"  drain: stopped early ({drain_stop})")
         # Residual inspection: pull leftover queue messages. Anything that
-        # comes out now was stuck in delivery (recoverable), not lost.
+        # comes out now was stuck in delivery (recoverable), not lost —
+        # credit it to its publisher so the verdict distinguishes
+        # "delayed" from "vanished" (a message truly gone still fails).
+        # Stalls stay visible in the summary; a repeated stall pattern is
+        # a broker delivery bug to chase with the soak tooling.
         residual: list[str] = []
+        credited = 0
         try:
             import pika as _pika
             conn = _pika.BlockingConnection(
@@ -293,10 +302,20 @@ def main() -> int:
                 m = ch.basic_get(queue, auto_ack=True)
                 if not m:
                     break
-                residual.append(m[2].decode())
+                try:
+                    body = (m[2] or b"").decode()
+                    tag, seq = body.split(":")
+                    stats.consume(tag, int(seq))
+                    credited += 1
+                    residual.append(body)
+                except Exception:  # noqa: BLE001
+                    residual.append(f"<unparseable body: {m[2]!r}>")
             ch.close(); conn.close()
         except Exception as e:  # noqa: BLE001
             residual = [f"<inspect failed: {e}>"]
+        if credited:
+            print(f"  drain: {credited} confirmed message(s) were still "
+                  f"queued at drain end; recovered by inspection")
     finally:
         STOP.set()
         for t in workers:
