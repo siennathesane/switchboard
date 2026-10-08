@@ -12,7 +12,7 @@
                  [org.slf4j/slf4j-api "1.7.36"]
                  [ch.qos.logback/logback-classic "1.2.13"]]
   :main jepsen.switchboard
-  :jvm-opts ["-Xmx4g"
+  :jvm-opts ["-Xmx6g"
              "-server"
              "-Djava.awt.headless=true"]
   :profiles {:uberjar {:aot :all}})

@@ -137,7 +137,7 @@ def pika_publisher(url: str, queue: str, stats: Stats, tag: str) -> None:
     backoff = 0.5
     while not STOP.is_set():
         try:
-            conn = pika.BlockingConnection(pika.URLParameters(url))
+            conn = support.blocking_connection(url)
             ch = conn.channel()
             ch.confirm_delivery()
             while not STOP.is_set():
@@ -159,7 +159,7 @@ def pika_consumer(url: str, queue: str, stats: Stats) -> None:
     backoff = 0.5
     while not STOP.is_set():
         try:
-            conn = pika.BlockingConnection(pika.URLParameters(url))
+            conn = support.blocking_connection(url)
             ch = conn.channel()
             for method, _props, body in ch.consume(queue, inactivity_timeout=1):
                 if STOP.is_set():
@@ -208,7 +208,7 @@ def main() -> int:
     stats = Stats()
 
     import pika
-    conn = pika.BlockingConnection(pika.URLParameters(cluster.amqp_urls[0]))
+    conn = support.blocking_connection(cluster.amqp_urls[0])
     ch = conn.channel()
     ch.queue_declare(queue, durable=True)
     conn.close()
@@ -295,8 +295,7 @@ def main() -> int:
         credited = 0
         try:
             import pika as _pika
-            conn = _pika.BlockingConnection(
-                _pika.URLParameters(cluster.amqp_urls[0]))
+            conn = support.blocking_connection(cluster.amqp_urls[0])
             ch = conn.channel()
             while True:
                 m = ch.basic_get(queue, auto_ack=True)

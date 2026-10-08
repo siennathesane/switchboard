@@ -152,8 +152,7 @@ def wait_broker_ready(cluster: Cluster, timeout: float = 180.0) -> None:
     last: Exception | None = None
     while time.time() < deadline:
         try:
-            conn = pika.BlockingConnection(
-                pika.URLParameters(cluster.amqp_urls[0]))
+            conn = blocking_connection(cluster.amqp_urls[0])
             ch = conn.channel()
             ch.queue_declare("harness-ready", durable=True)
             ch.queue_delete("harness-ready")
@@ -214,6 +213,21 @@ def restart_cluster(cluster: Cluster) -> None:
     wait_broker_ready(cluster)
 
 
+def blocking_connection(url: str, timeout: float = 15.0):
+    """A pika BlockingConnection with a real socket timeout.
+
+    URLParameters defaults to no timeout: an op against a broker that
+    accepts TCP and then stalls (mid-restart, raft-starved) blocks the
+    caller forever. Every harness connection goes through here so a stall
+    surfaces as an exception the caller's retry loop can absorb.
+    """
+    import pika
+
+    params = pika.URLParameters(url)
+    params.socket_timeout = timeout
+    return pika.BlockingConnection(params)
+
+
 def die(msg: str) -> None:
     print(f"harness: {msg}", file=sys.stderr)
     sys.exit(2)
@@ -248,8 +262,7 @@ def add_node(cluster: Cluster, wait: bool = True) -> int:
             # Coverage via a pika check on any queue op through the NEW node.
             try:
                 import pika
-                conn = pika.BlockingConnection(
-                    pika.URLParameters(cluster.amqp_urls[-1]))
+                conn = blocking_connection(cluster.amqp_urls[-1])
                 ch = conn.channel()
                 ch.queue_declare(f"scale-probe-{node_id}", durable=True)
                 ch.queue_delete(f"scale-probe-{node_id}")
@@ -270,7 +283,7 @@ def wait_broker_ready_on(cluster: Cluster, addr: str, timeout: float = 180.0) ->
     url = f"amqp://{cluster.user}:{cluster.password}@{addr}/"
     while time.time() < deadline:
         try:
-            conn = pika.BlockingConnection(pika.URLParameters(url))
+            conn = blocking_connection(url)
             ch = conn.channel()
             ch.queue_declare("harness-ready", durable=True)
             ch.queue_delete("harness-ready")

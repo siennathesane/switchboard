@@ -32,7 +32,11 @@ func must(err error, what string) {
 }
 
 func connect(url string) *amqp.Connection {
-	c, err := amqp.Dial(url)
+	// The library defaults to a 10s heartbeat: a 20s no-traffic stretch
+	// (the qos check waits that long between deliveries) brushes the
+	// broker's missed-heartbeat close on a contended runner. Production
+	// deployments run 30-60s heartbeats; ask for 30 explicitly.
+	c, err := amqp.DialConfig(url, amqp.Config{Heartbeat: 30 * time.Second})
 	must(err, "dial "+url)
 	return c
 }
@@ -131,7 +135,13 @@ func main() {
 			for {
 				select {
 				case <-acks:
-				case t := <-ncks:
+				case t, ok := <-ncks:
+					// A closed ncks channel yields zero values
+					// forever; the printer must not mistake the
+					// shutdown for broker confirm-nacks.
+					if !ok {
+						return
+					}
 					fmt.Printf("[go-debug] NACK frame for tag %d\n", t)
 				case <-time.After(60 * time.Second):
 					return

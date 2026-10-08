@@ -169,6 +169,8 @@ jobs:
         run: gem install --no-document bunny
 
       - name: conformance harness (builds the broker, boots 3 nodes)
+        env:
+          SB_BROKER_LOG_DIR: harness/broker-logs
         run: $VENV_PY harness/run.py
 
       - name: scale test (load across 3->6->3 with hard-kill churn)
@@ -179,7 +181,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: harness-logs-${{ matrix.os }}
-          path: harness/out/
+          path: |
+            harness/out/
+            harness/broker-logs/
           if-no-files-found: ignore
 
   jepsen:
