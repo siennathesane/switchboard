@@ -98,6 +98,9 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
+    env:
+      # matrix context works in job-level env; runner context would not.
+      VENV_PY: ${{ contains(matrix.os, 'windows') && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -139,13 +142,9 @@ jobs:
         run: gem install --no-document bunny
 
       - name: conformance harness (builds the broker, boots 3 nodes)
-        env:
-          VENV_PY: ${{ runner.os == 'Windows' && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
         run: $VENV_PY harness/run.py
 
       - name: scale test (load across 3->6->3 with hard-kill churn)
-        env:
-          VENV_PY: ${{ runner.os == 'Windows' && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
         run: $VENV_PY harness/scale_test.py --seconds-per-phase 20
 
       - name: upload harness logs
@@ -186,8 +185,12 @@ jobs:
           for test in fifo fanout topo; do
             for nemesis in parts kill chaos; do
               echo "::group::jepsen: $test x $nemesis"
+              # --drain-limit: the 45s default assumes a quiet developer
+              # box; on shared CI runners a 60s window under nemesis needs
+              # more drain headroom or the checker reports :unknown.
               if ./jepsen/docker/up.sh 5 >/dev/null \
-                 && ./jepsen/docker/run.sh --test "$test" --nemesis "$nemesis" --time-limit 60; then
+                 && ./jepsen/docker/run.sh --test "$test" --nemesis "$nemesis" \
+                      --time-limit 60 --drain-limit 180; then
                 echo "combo $test x $nemesis: PASS"
               else
                 echo "combo $test x $nemesis: FAIL"
@@ -199,12 +202,21 @@ jobs:
           done
           exit "$failed"
 
+      # Jepsen's store paths embed ISO timestamps with colons, which
+      # upload-artifact rejects — ship one tarball instead.
+      - name: collect jepsen results
+        if: always()
+        run: |
+          if [ -d jepsen/store ]; then
+            tar -czf jepsen-results.tar.gz -C jepsen store
+          fi
+
       - name: upload jepsen results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jepsen-results-${{ matrix.os }}
-          path: jepsen/store/
+          path: jepsen-results.tar.gz
           if-no-files-found: ignore
 
   bench:

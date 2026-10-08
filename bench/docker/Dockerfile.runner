@@ -3,6 +3,13 @@
 # cluster nodes come from the jepsen node image.
 
 FROM rust:1 AS build
+
+# clang/libclang: bindgen (librocksdb-sys). cmake/perl/go: aws-lc-sys.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      clang libclang-dev cmake perl golang-go pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo

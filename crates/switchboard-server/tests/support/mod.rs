@@ -59,6 +59,10 @@ pub struct TestClient {
     pub writer: OwnedWriteHalf,
     /// Last non-content method seen (diagnostics for failed expectations).
     pub last_method: Option<String>,
+    /// Methods decoded on a channel other than the one an `expect` was
+    /// waiting on (server-side notifications race replies across
+    /// channels); handed back when that channel is asked for.
+    backlog: Vec<(u16, Method)>,
 }
 
 impl TestClient {
@@ -79,7 +83,7 @@ impl TestClient {
             w.write_all(first).await?;
             w.flush().await?;
         }
-        Ok(TestClient { reader: FrameReader::new(), read_half: r, writer: w, last_method: None })
+        Ok(TestClient { reader: FrameReader::new(), read_half: r, writer: w, last_method: None, backlog: Vec::new() })
     }
 
     pub async fn send_method(&mut self, channel: u16, m: &Method) -> std::io::Result<()> {
@@ -110,10 +114,16 @@ impl TestClient {
     /// Read frames until a method arrives on `channel`; returns it with any
     /// assembled content (header properties + body). Content-bearing
     /// methods hold until their header and body frames have arrived.
+    /// Methods that arrive on a *different* channel are buffered and
+    /// returned by a later `expect` for their own channel.
     pub async fn expect_method(
         &mut self,
-        _channel: u16,
+        channel: u16,
     ) -> Result<(Method, Option<(BasicProperties, Vec<u8>)>), String> {
+        if let Some(pos) = self.backlog.iter().position(|(ch, _)| *ch == channel) {
+            let (_, m) = self.backlog.remove(pos);
+            return Ok((m, None));
+        }
         let mut pending: Option<ContentHeader> = None;
         let mut body: Vec<u8> = Vec::new();
         let mut content_for: Option<Method> = None;
@@ -130,6 +140,10 @@ impl TestClient {
                         }
                         if m.carries_content() {
                             content_for = Some(m);
+                            continue;
+                        }
+                        if frame.channel != channel {
+                            self.backlog.push((frame.channel, m));
                             continue;
                         }
                         return Ok((m, None));

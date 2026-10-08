@@ -131,6 +131,11 @@ async fn dns_seed_discovery_joins_a_pending_node() {
 
 /// Real mDNS multicast round-trip: two pending nodes find each other
 /// purely through `_switchboard._tcp.local.` — zero static configuration.
+///
+/// Needs a multicast-capable network: GitHub's macOS and Windows runners
+/// (and some developer Macs) don't deliver multicast, so the test only
+/// runs where it can (Linux).
+#[cfg_attr(not(target_os = "linux"), ignore)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mdns_discovery_assembles_two_nodes() {
     set_test_tempo();

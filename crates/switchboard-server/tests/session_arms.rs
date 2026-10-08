@@ -297,18 +297,19 @@ async fn channel_level_error_sends_channel_close() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn content_without_a_publish_is_a_connection_error() {
+    // connect_and_open already opened channel 1. A content header with no
+    // preceding Basic.Publish on that channel is an unexpected-frame
+    // violation the session answers with a connection-level close.
     let (_node, addr) = start_broker("sa-nopub").await;
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
-    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() }).await.unwrap();
-    let _ = c.expect(1).await.unwrap();
-    // A content HEADER with no preceding Basic.Publish on the channel.
     let f = Frame::header(1, &switchboard_wire::ContentHeader::new(0, BasicProperties::new()));
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    // The session terminates (connection-level 506/312 framing error).
-    let mut buf = [0u8; 128];
-    let n = tokio::time::timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
-    assert!(n.is_ok(), "session must react to orphan content header");
+    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0)).await;
+    assert!(
+        matches!(m, Ok(Ok(Method::ConnectionClose { .. }))),
+        "session must react to orphan content header: {m:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

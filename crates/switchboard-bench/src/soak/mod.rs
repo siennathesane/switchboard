@@ -402,24 +402,40 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     let deadline = tokio::time::Instant::now() + cfg.duration;
     let report_every = tokio::time::interval(cfg.report_every);
     tokio::pin!(report_every);
+    // Stop signals: SIGTERM/SIGINT where they are catchable (unix).
+    // Windows cannot catch external termination, so there the deadline
+    // (or an injected stop) ends the run.
+    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    let stop = async {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = async {
+                    match sigterm.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => "SIGTERM",
+                _ = async {
+                    match sigint.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<&'static str>().await
+    };
+    tokio::pin!(stop);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
             _ = report_every.tick() => report::status_line(&ctx).await,
-            _ = async {
-                match sigterm.as_mut() {
-                    Some(s) => { s.recv().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => { notes.push("SIGTERM".into()); break }
-            _ = async {
-                match sigint.as_mut() {
-                    Some(s) => { s.recv().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => { notes.push("SIGINT".into()); break }
+            reason = &mut stop => { notes.push(reason.to_string()); break }
         }
     }
 

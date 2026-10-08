@@ -489,13 +489,31 @@ async fn deleting_the_queue_cancels_its_consumers() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn commit_and_rollback_of_unknown_transactions_are_noops() {
+async fn tx_methods_without_tx_select_error_like_rabbitmq() {
+    // tx.commit / tx.rollback on a channel that never selected a
+    // transaction are NOT silent no-ops: RabbitMQ answers
+    // PRECONDITION_FAILED "channel is not transacted" and closes the
+    // channel. The connection must survive a protocol-correct client
+    // (which answers Channel.CloseOk), and a fresh channel transacts
+    // normally afterwards.
     let (_node, addr) = start_broker("mc-notx").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
     c.send_method(1, &Method::TxCommit {}).await.unwrap();
-    let _ = c.expect(1).await.unwrap();
-    c.send_method(1, &Method::TxRollback {}).await.unwrap();
-    let _ = c.expect(1).await.unwrap();
+    let Method::ChannelClose { reply_code, reply_text, .. } = c.expect(1).await.unwrap() else {
+        panic!("expected Channel.Close after Tx.Commit without Tx.Select");
+    };
+    assert_eq!(reply_code, 406, "{reply_text}");
+    assert!(reply_text.contains("transacted"), "{reply_text}");
+    c.send_method(1, &Method::ChannelCloseOk {}).await.unwrap();
+
+    // A fresh channel on the same connection works, transactions included.
+    c.send_method(2, &Method::ChannelOpen { out_of_band: String::new() }).await.unwrap();
+    let _ = c.expect(2).await.unwrap();
+    c.send_method(2, &Method::TxSelect {}).await.unwrap();
+    let _ = c.expect(2).await.unwrap();
+    c.send_method(2, &Method::TxCommit {}).await.unwrap();
+    let m = c.expect(2).await.unwrap();
+    assert!(matches!(m, Method::TxCommitOk { .. }), "got {m:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
