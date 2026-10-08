@@ -1,0 +1,13 @@
+#!/bin/bash
+# Readiness = client port serving /stats AND the node has actually
+# joined a cluster (bootstrap entities + shard layout visible). The
+# soak driver only ever sends load to Ready pods, so a still-joining
+# node must not report ready.
+exec 3<>/dev/tcp/127.0.0.1/5672 || exit 1
+printf 'GET /stats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+out=$(timeout 2 cat <&3 || true)
+exec 3<&- 3>&-
+case "$out" in
+  *'"joined":true'*) exit 0 ;;
+  *) exit 1 ;;
+esac

@@ -1,0 +1,118 @@
+#!/bin/bash
+# Switchboard k8s entrypoint: decide bootstrap vs join, then run the
+# broker.
+#
+# * Node id: hash of the pod name — unique per pod, stable across
+#   container restarts within the pod, collision-free in practice.
+# * Discovery: the headless service's A records list the live members'
+#   pod IPs (internal port 5673). A pod that finds members joins them.
+# * Bootstrap: only when NO members appear for a full two minutes —
+#   i.e. the initial rollout at replicas=1. The staggered re-check
+#   (hash-derived delay + one final member poll) keeps the theoretical
+#   cold-start race of two pods bootstrapping simultaneously from ever
+#   firing in the soak's lifecycle; total cluster loss is manual
+#   recovery anyway (scale to 0, then 1), since raft state is emptyDir.
+# * Join-deadlock guard: a pod that chose JOIN can outlive every member
+#   it saw (a rolling update kills the very pods whose DNS records
+#   convinced it to join). If a joining broker is still not Ready three
+#   minutes in AND the headless service shows no other members, the
+#   decision restarts from scratch — its raft store is emptyDir, so
+#   whoever gets there first forms the cluster exactly as in a cold
+#   start.
+set -euo pipefail
+
+POD_NAME="${POD_NAME:?POD_NAME must be set}"
+POD_IP="${POD_IP:?POD_IP must be set}"
+SVC="${SB_SERVICE_DNS:-switchboard-hs.soak.svc.cluster.local}"
+
+NODE_ID=$(( $(echo -n "$POD_NAME" | cksum | cut -d' ' -f1) % 4000000000 + 1000 ))
+
+members() {
+  getent ahosts "$SVC" 2>/dev/null | awk '{print $1}' | sort -u | grep -v "^${POD_IP}$" | wc -l
+}
+
+joined() {
+  exec 3<>/dev/tcp/127.0.0.1/5672 || return 1
+  printf 'GET /stats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+  out=$(timeout 2 cat <&3 || true)
+  exec 3<&- 3>&-
+  case "$out" in
+    *'"joined":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_broker() {
+  # $1 = node id, $2 = extra args (bootstrap or dns-seed)
+  mkdir -p /var/lib/switchboard
+  /usr/local/bin/switchboard \
+    --listen 0.0.0.0:5672 \
+    --internal 0.0.0.0:5673 \
+    --advertise "${POD_IP}:5673" \
+    --data /var/lib/switchboard \
+    --expected-nodes 1 \
+    --node-id "$1" \
+    --log "${SB_LOG:-info}" \
+    $2 &
+  BROKER_PID=$!
+}
+
+stop_broker() {
+  kill "$BROKER_PID" 2>/dev/null || true
+  wait "$BROKER_PID" 2>/dev/null || true
+}
+
+while true; do
+  seen_members=0
+  for _ in $(seq 1 12); do # 12 x 5s = 60s
+    if [ "$(members)" -gt 0 ]; then
+      seen_members=1
+      break
+    fi
+    sleep 5
+  done
+
+  if [ "$seen_members" -eq 1 ]; then
+    run_broker "$NODE_ID" "--dns-seed $SVC:5673"
+  else
+    # Nobody out there. Stagger, re-check once, then bootstrap as node 1
+    # (the formation voter id must match this pod's own id).
+    sleep $(( $(echo -n "$POD_NAME" | cksum | cut -d' ' -f1) % 30 ))
+    if [ "$(members)" -gt 0 ]; then
+      run_broker "$NODE_ID" "--dns-seed $SVC:5673"
+    else
+      echo "sb-entrypoint: no cluster found; bootstrapping as node 1"
+      run_broker 1 "--bootstrap"
+    fi
+  fi
+
+  # Watch the broker: joined → hand over the pod's lifetime to it.
+  joined_ok=0
+  for _ in $(seq 1 180); do # 180 x 1s
+    if joined; then
+      joined_ok=1
+      break
+    fi
+    if ! kill -0 "$BROKER_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$joined_ok" -eq 1 ]; then
+    wait "$BROKER_PID"
+    exit 0
+  fi
+
+  # Not joined after three minutes. A JOIN-mode broker whose target
+  # vanished gets one restart of the formation decision; anything else
+  # (broker death, bootstrap loss) also loops back to a fresh decision.
+  if [ "$seen_members" -eq 1 ] && [ "$(members)" -gt 0 ] && kill -0 "$BROKER_PID" 2>/dev/null; then
+    # A real cluster is still visible — keep waiting on this broker.
+    wait "$BROKER_PID"
+    exit 0
+  fi
+  echo "sb-entrypoint: not joined and no members visible; restarting formation decision"
+  stop_broker
+  sleep 2
+done

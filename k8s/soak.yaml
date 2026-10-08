@@ -1,0 +1,200 @@
+# Switchboard soak lab on k3s.
+#
+# Design notes:
+# * The broker is a plain Deployment (per the soak requirement — no
+#   StatefulSet identities). Every pod is an interchangeable node:
+#   node id = hash of the pod name, address = pod IP, discovery =
+#   headless-service DNS. Scale churn is just `replicas`.
+# * The FIRST pod bootstraps the cluster (SWITCHBOARD_EXPECTED_NODES=1,
+#   meta voters {self}); the membership controller grows meta to the
+#   first 3 registered nodes automatically as pods join, anchors new
+#   shard groups on joiners, heals departures, and reaps dead nodes.
+# * Bootstrap eligibility is gated on the headless DNS showing no
+#   existing members, so recreated pods join instead of forking a
+#   cluster. The soak driver never scales up before pod 1 is Ready, so
+#   the only bootstrap window is the initial rollout at replicas=1.
+# * Raft data lives in emptyDir on purpose: a restarted container is a
+#   fresh node rejoining (replicas of everything confirmed live on the
+#   other group members), which is exactly the churn model under test.
+#   Total simultaneous loss of all pods loses data by design; the soak
+#   drain protocol keeps that window empty.
+#
+# Apply with:  kubectl apply -f k8s/soak.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: soak
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: soak-driver
+  namespace: soak
+---
+# The driver scales the broker Deployment and deletes pods (unclean
+# churn) — nothing more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: soak-driver
+  namespace: soak
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: soak-driver
+  namespace: soak
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: soak-driver
+subjects:
+  - kind: ServiceAccount
+    name: soak-driver
+    namespace: soak
+---
+# Headless service: DNS A records = live pod IPs. Broker pods resolve
+# this to find the cluster; the driver could too (it uses the API
+# instead, for pod names + restart counts + logs).
+apiVersion: v1
+kind: Service
+metadata:
+  name: switchboard-hs
+  namespace: soak
+  labels:
+    app: switchboard
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app: switchboard
+  ports:
+    - name: client
+      port: 5672
+    - name: internal
+      port: 5673
+---
+# The broker workload. Initial replicas=1: that pod bootstraps; the soak
+# driver owns `replicas` from then on (1..9, continuously).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: switchboard
+  namespace: soak
+  labels:
+    app: switchboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: switchboard
+  template:
+    metadata:
+      labels:
+        app: switchboard
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: switchboard
+          image: switchboard-soak-lab:v14
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/sb-k8s-entrypoint"]
+          ports:
+            - containerPort: 5672
+              name: client
+            - containerPort: 5673
+              name: internal
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            # Ready = client port accepting AND joined (meta applied),
+            # so the soak driver's endpoint set only ever contains real
+            # cluster members.
+            exec:
+              command: ["/usr/local/bin/sb-ready"]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            # A wedged accept loop gets recycled (unclean churn the soak
+            # is designed to absorb). Generous: never kill a busy broker.
+            # initialDelay covers the entrypoint's bootstrap-vs-join
+            # discovery window (≤90 s) before the broker execs.
+            tcpSocket:
+              port: 5672
+            initialDelaySeconds: 150
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+# The soak driver: load + monitors + the 1..9 scaler + unclean pod
+# kills, for the whole soak. Scaling is a requirement of the run, so it
+# is baked into the args, not optional.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: soak-driver
+  namespace: soak
+  labels:
+    app: soak-driver
+spec:
+  replicas: 1
+  # Never overlap two driver generations: a rolling update would run
+  # two drivers against the same durable soak queues and streams.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: soak-driver
+  template:
+    metadata:
+      labels:
+        app: soak-driver
+    spec:
+      serviceAccountName: soak-driver
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: soak-driver
+          image: switchboard-soak-lab:v14
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/switchboard-soak"]
+          args:
+            - --scale=soak/switchboard:1:9
+            - --scale-every=90s
+            - --kill-every=3m
+            - --duration=30d
+            - --report-every=60s
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

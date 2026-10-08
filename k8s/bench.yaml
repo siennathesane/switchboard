@@ -1,0 +1,122 @@
+# Switchboard benchmark cluster on k3s: a FIXED 3-broker cluster (no
+# churn) plus a runner pod holding the bench binary. The baseline and
+# every optimization re-run use the same topology, so numbers are
+# comparable.
+#
+#   kubectl apply -f k8s/bench.yaml
+#   # then, per run:
+#   IPS=$(kubectl -n bench get pods -l app=switchboard -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.status.podIP}{" "}{end}')
+#   kubectl -n bench exec deploy/bench-runner -- switchboard-bench \
+#     --hosts $(echo $IPS | tr ' ' ',') --scenario all --duration 20
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: switchboard-hs
+  namespace: bench
+  labels:
+    app: switchboard
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app: switchboard
+  ports:
+    - name: client
+      port: 5672
+    - name: internal
+      port: 5673
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: switchboard
+  namespace: bench
+  labels:
+    app: switchboard
+spec:
+  replicas: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: switchboard
+  template:
+    metadata:
+      labels:
+        app: switchboard
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: switchboard
+          image: switchboard-bench-lab:v8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/sb-k8s-entrypoint"]
+          env:
+            - name: SB_SERVICE_DNS
+              value: switchboard-hs.bench.svc.cluster.local
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/sb-ready"]
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5672
+            initialDelaySeconds: 150
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+# The bench runner: same image, no workload — scenarios are exec'd into
+# it so each run gets fresh counters.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-runner
+  namespace: bench
+  labels:
+    app: bench-runner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bench-runner
+  template:
+    metadata:
+      labels:
+        app: bench-runner
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: runner
+          image: switchboard-bench-lab:v8
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

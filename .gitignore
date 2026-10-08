@@ -33,3 +33,6 @@ node_modules/
 # Benchmark run output
 /bench/results
 /bench/docker/runner-ctx
+
+# Prebuilt binaries staged for the thin runtime image (built on the k3s host)
+/k8s/bin

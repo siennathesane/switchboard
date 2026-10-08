@@ -1,0 +1,18 @@
+# Thin runtime image from prebuilt linux/amd64 binaries (built natively
+# on the k3s host by a builder pod — see bench/SOAK.md). No compile
+# stage, so this assembles in seconds.
+#
+#   docker buildx build --platform linux/amd64 -f k8s/Dockerfile.runtime \
+#     -t switchboard-soak-lab:v2 .
+FROM ubuntu:24.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY k8s/bin/switchboard k8s/bin/switchboard-soak k8s/bin/switchboard-bench /usr/local/bin/
+COPY k8s/sb-k8s-entrypoint k8s/sb-ready /usr/local/bin/
+RUN chmod +x /usr/local/bin/switchboard /usr/local/bin/switchboard-soak /usr/local/bin/switchboard-bench \
+        /usr/local/bin/sb-k8s-entrypoint /usr/local/bin/sb-ready \
+ && ln -sf /usr/local/bin/switchboard-soak /usr/local/bin/soak
+# glibc arena cap: fewer arenas = less retained heap after bursts
+# (the broker also malloc_trims periodically).
+ENV MALLOC_ARENA_MAX=2
