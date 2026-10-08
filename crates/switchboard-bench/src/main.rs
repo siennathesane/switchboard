@@ -5,11 +5,11 @@
 //! `=== RESULTS ===` marker on stdout) for machine consumption.
 
 mod scenarios;
-mod stats;
 
 use anyhow::{bail, Result};
 use clap::Parser;
 use serde_json::json;
+use switchboard_bench::stats;
 
 #[derive(Parser, Debug)]
 #[command(name = "switchboard-bench")]

@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::stats::{mean, percentile, Counter, RateSampler};
+use switchboard_bench::stats::{mean, percentile, Counter, RateSampler};
 
 static FAILED: AtomicU64 = AtomicU64::new(0);
 
@@ -118,6 +118,12 @@ async fn publisher_task(
             }
         };
         let Ok(ch) = conn.create_channel().await else { continue };
+        // Ack-counting publishers require confirm mode; without it the
+        // broker never sends Basic.Ack and every awaited confirm times
+        // out.
+        if wait_for_ack {
+            let _ = ch.confirm_select(lapin::options::ConfirmSelectOptions::default()).await;
+        }
         let props = persistent_props();
         let size = payload.len() as u64;
         loop {
@@ -195,13 +201,27 @@ async fn consumer_task(
             }
         }
     };
-    let Ok(ch) = conn.create_channel().await else { return };
-    let Ok(mut consumer) = ch
-        .basic_consume(&queue, "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
-        .await
-    else {
-        eprintln!("bench: consumer could not subscribe to {queue}");
-        return;
+    let mut consumer = loop {
+        // A channel that took a channel-level error (e.g. a 404 racing a
+        // concurrent re-declare) is closed for good: retry on a fresh one.
+        let ch = match conn.create_channel().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bench: consumer channel to {queue} failed ({e}); retrying");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+        };
+        match ch
+            .basic_consume(&queue, "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
+            .await
+        {
+            Ok(c) => break c,
+            Err(e) => {
+                eprintln!("bench: consumer subscribe to {queue} failed ({e}); retrying");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
     };
     loop {
         let delivery: Delivery = tokio::select! {
@@ -585,31 +605,43 @@ pub async fn latency(b: &Bench) -> Result<Value> {
         let uri = b.uri(&b.host(0));
         let payload = payload.clone();
         tokio::spawn(async move {
-            let Ok(conn) = connect_uri(&uri).await else { return };
-            let Ok(in_ch) = conn.create_channel().await else { return };
-            let Ok(out_ch) = conn.create_channel().await else { return };
-            let Ok(mut consumer) = in_ch
+            let conn = match connect_uri(&uri).await {
+                Ok(c) => c,
+                Err(e) => { eprintln!("latency: echo connect failed: {e}"); return },
+            };
+            let in_ch = match conn.create_channel().await {
+                Ok(c) => c,
+                Err(e) => { eprintln!("latency: echo in-channel failed: {e}"); return },
+            };
+            let out_ch = match conn.create_channel().await {
+                Ok(c) => c,
+                Err(e) => { eprintln!("latency: echo out-channel failed: {e}"); return },
+            };
+            match in_ch
                 .basic_consume("bench.lat.req", "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
                 .await
-            else {
-                return;
-            };
-            loop {
-                let d: Delivery = tokio::select! {
-                    _ = t.cancelled() => return,
-                    d = futures_lite::StreamExt::next(&mut consumer) => match d {
-                        Some(Ok(d)) => d,
-                        _ => return,
+            {
+                Ok(mut consumer) => {
+                    loop {
+                        let d: Delivery = tokio::select! {
+                            _ = t.cancelled() => return,
+                            d = futures_lite::StreamExt::next(&mut consumer) => match d {
+                                Some(Ok(d)) => d,
+                                Some(Err(e)) => { eprintln!("latency: echo consume error: {e}"); return }
+                                None => return,
+                            }
+                        };
+                        let _ = d;
+                        if let Err(e) = out_ch
+                            .basic_publish("", "bench.lat.rep", BasicPublishOptions::default(), &payload, persistent_props())
+                            .await
+                        {
+                            eprintln!("latency: echo republish failed: {e}");
+                            return;
+                        }
                     }
-                };
-                let _ = d;
-                if out_ch
-                    .basic_publish("", "bench.lat.rep", BasicPublishOptions::default(), &payload, persistent_props())
-                    .await
-                    .is_err()
-                {
-                    return;
                 }
+                Err(e) => { eprintln!("latency: echo subscribe failed: {e}"); return },
             }
         });
     }

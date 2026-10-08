@@ -1,0 +1,14 @@
+# Benchmark runner: builds switchboard-bench and runs it against a live
+# cluster over the jepsen docker network. No broker in this image —
+# cluster nodes come from the jepsen node image.
+
+FROM rust:1 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+RUN cargo build --release --bin switchboard-bench
+
+FROM ubuntu:24.04
+COPY --from=build /src/target/release/switchboard-bench /usr/local/bin/
+ENTRYPOINT ["switchboard-bench"]

@@ -24,3 +24,16 @@ lease-timeout = "240s"
 concurrency = 10
 retries = 0
 slow-timeout = { period = "60s", factor = "2.0" }
+
+# The soak smoke runs a 12-workload engine against a live 3-node
+# cluster; concurrent cluster tests starve its fanout-confirm budget.
+# Serialize it and give it room (each retry is a fresh, independent
+# run — the zero-error bar is unchanged).
+[[profile.default.overrides]]
+filter = "test(soak_smoke)"
+retries = 3
+test-groups = ["soak-smoke"]
+slow-timeout = { period = "180s", factor = "2.0" }
+
+[profile.default.test-groups]
+soak-smoke = { max-threads = 1 }

@@ -101,3 +101,78 @@ pub fn mean(v: &[u64]) -> u64 {
     }
     v.iter().sum::<u64>() / v.len() as u64
 }
+
+/// Fixed-memory latency histogram: 3-bit mantissa log-scale buckets
+/// (HdrHistogram-style), 256 buckets total, exact enough for p50/p99/max
+/// status lines yet O(1) memory — a month of samples never grows it.
+#[derive(Debug)]
+pub struct Hist {
+    counts: Mutex<Vec<u64>>,
+    total: AtomicU64,
+    max: AtomicU64,
+}
+
+impl Default for Hist {
+    fn default() -> Self {
+        Hist { counts: Mutex::new(vec![0; 256]), total: AtomicU64::new(0), max: AtomicU64::new(0) }
+    }
+}
+
+impl Hist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn bucket(v: u64) -> usize {
+        if v == 0 {
+            return 0;
+        }
+        let e = 63 - v.leading_zeros() as usize;
+        let shift = e.saturating_sub(2);
+        (e * 4 + ((v >> shift) & 3) as usize).min(255)
+    }
+
+    fn bucket_value(idx: usize) -> u64 {
+        let (e, sub) = (idx / 4, idx % 4);
+        if e == 0 {
+            return sub as u64;
+        }
+        (1u64 << e) | ((sub as u64) << (e - 2))
+    }
+
+    pub fn record(&self, v: u64) {
+        self.counts.lock().unwrap()[Self::bucket(v)] += 1;
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.max.fetch_max(v, Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max.load(Ordering::Relaxed)
+    }
+
+    /// `p` in 0..=100 against the accumulated distribution.
+    pub fn percentile(&self, p: f64) -> u64 {
+        let counts = self.counts.lock().unwrap();
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0;
+        }
+        let target = (((p / 100.0) * total as f64).ceil() as u64).clamp(1, total);
+        let mut acc = 0u64;
+        for (idx, &c) in counts.iter().enumerate() {
+            acc += c;
+            if acc >= target {
+                return Self::bucket_value(idx);
+            }
+        }
+        Self::bucket_value(255)
+    }
+
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (self.percentile(50.0), self.percentile(99.0), self.percentile(99.9), self.max())
+    }
+}
