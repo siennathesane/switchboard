@@ -141,12 +141,12 @@ jobs:
       - name: conformance harness (builds the broker, boots 3 nodes)
         env:
           VENV_PY: ${{ runner.os == 'Windows' && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
-        run: "$VENV_PY" harness/run.py
+        run: $VENV_PY harness/run.py
 
       - name: scale test (load across 3->6->3 with hard-kill churn)
         env:
           VENV_PY: ${{ runner.os == 'Windows' && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
-        run: "$VENV_PY" harness/scale_test.py --seconds-per-phase 20
+        run: $VENV_PY harness/scale_test.py --seconds-per-phase 20
 
       - name: upload harness logs
         if: always()
