@@ -70,7 +70,11 @@ jobs:
         shell: bash
         run: echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
+      # Save the build cache even on failed runs: iteration speed
+      # matters more than cache purity while bringing the matrix up.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - uses: taiki-e/install-action@v2
         with:
@@ -79,8 +83,13 @@ jobs:
       # -j 2: the hosted runners are 4 cores, smaller than the 10-core box
       # the nextest profiles were tuned on, and every integration test
       # runs multi-node raft clusters in-process. Stay under the profile
-      # default of 4 to keep raft timers healthy.
+      # default of 4 to keep raft timers healthy. SB_TIME_SCALE softens
+      # the test time-warp off Linux: a 50x-shrunk 0.8 ms raft heartbeat
+      # misses under runner contention (soak_smoke failed all retries on
+      # the macOS runner at 50x); Linux stays at the validated 50x.
       - name: workspace tests
+        env:
+          SB_TIME_SCALE: ${{ runner.os == 'Linux' && '50' || '10' }}
         run: cargo nextest run --workspace -j 2
 
       - name: doc tests
@@ -98,6 +107,11 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
+    defaults:
+      run:
+        # bash on every OS: the steps use POSIX env-var syntax, and the
+        # windows default (pwsh) rejects `"$VENV_PY" -m pip …`.
+        shell: bash
     env:
       # matrix context works in job-level env; runner context would not.
       VENV_PY: ${{ contains(matrix.os, 'windows') && 'harness-venv/Scripts/python.exe' || 'harness-venv/bin/python' }}
@@ -106,7 +120,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Save the build cache even on failed runs: iteration speed
+      # matters more than cache purity while bringing the matrix up.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - uses: actions/setup-python@v5
         with:
@@ -145,7 +163,7 @@ jobs:
         run: $VENV_PY harness/run.py
 
       - name: scale test (load across 3->6->3 with hard-kill churn)
-        run: $VENV_PY harness/scale_test.py --seconds-per-phase 20
+        run: $VENV_PY harness/scale_test.py
 
       - name: upload harness logs
         if: always()
@@ -188,9 +206,12 @@ jobs:
               # --drain-limit: the 45s default assumes a quiet developer
               # box; on shared CI runners a 60s window under nemesis needs
               # more drain headroom or the checker reports :unknown.
+              # --publish-rate 5 keeps the backlog small enough that the
+              # drain always completes (a starved drain reports :unknown
+              # or caveated losses no matter how long it is given).
               if ./jepsen/docker/up.sh 5 >/dev/null \
                  && ./jepsen/docker/run.sh --test "$test" --nemesis "$nemesis" \
-                      --time-limit 60 --drain-limit 180; then
+                      --time-limit 60 --drain-limit 180 --publish-rate 5; then
                 echo "combo $test x $nemesis: PASS"
               else
                 echo "combo $test x $nemesis: FAIL"

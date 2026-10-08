@@ -844,3 +844,35 @@ fn unbind_to_missing_destination_is_not_found() {
     }).unwrap_err();
     assert!(format!("{e:?}").contains("no binding"), "{e:?}");
 }
+
+#[test]
+fn fanout_done_moves_the_id_to_recent_and_out_of_pending() {
+    let mut s = state();
+    let id = uuid::Uuid::new_v4();
+    let (r, _) = s.apply(&MetaCmd::FanoutBegin {
+        id,
+        vhost: "/".into(),
+        message: crate::model::StoredMessage {
+            properties: Default::default(),
+            body: b"m".to_vec(),
+            exchange: "amq.direct".into(),
+            routing_key: "rk".into(),
+            persistent: false,
+        },
+        queues: vec!["q1".into(), "q2".into()],
+    })
+    .unwrap();
+    assert!(matches!(r, MetaReply::FanoutBegun), "{r:?}");
+    assert_eq!(s.pending_fanouts.len(), 1);
+    assert!(!s.recent_fanouts.contains(&id));
+
+    let (r, _) = s.apply(&MetaCmd::FanoutDone { id }).unwrap();
+    assert!(matches!(r, MetaReply::FanoutDone), "{r:?}");
+    assert!(s.pending_fanouts.is_empty());
+    // The completion signal is monotone: once recorded it survives, which
+    // is what lets a publisher distinguish "done" from "not yet locally
+    // visible" when waiting for its confirm.
+    assert!(s.recent_fanouts.contains(&id));
+    assert_eq!(s.apply(&MetaCmd::FanoutDone { id }).unwrap().0, MetaReply::FanoutDone);
+    assert!(s.recent_fanouts.contains(&id));
+}

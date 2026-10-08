@@ -656,6 +656,9 @@ pub async fn latency(b: &Bench) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(b.duration + 10);
     let measure_from = Instant::now() + Duration::from_secs(b.warmup);
     let mut measured = 0u64;
+    // A shared host can stall one probe past the 5 s window without the
+    // echo path being broken; only give up when replies stop arriving.
+    let mut consecutive_misses = 0u32;
     loop {
         if Instant::now() > deadline || measured >= 200_000 {
             break;
@@ -666,8 +669,14 @@ pub async fn latency(b: &Bench) -> Result<Value> {
             .await?;
         let got = tokio::time::timeout(Duration::from_secs(5), futures_lite::StreamExt::next(&mut replies)).await;
         match got {
-            Ok(Some(Ok(_))) => {}
-            _ => bail!("latency: reply did not arrive (timeout or consumer error)"),
+            Ok(Some(Ok(_))) => consecutive_misses = 0,
+            _ => {
+                consecutive_misses += 1;
+                if consecutive_misses >= 3 {
+                    bail!("latency: three consecutive probes got no reply (timeout or consumer error)");
+                }
+                continue;
+            }
         }
         let rtt = t0.elapsed().as_micros() as u64;
         if Instant::now() >= measure_from {

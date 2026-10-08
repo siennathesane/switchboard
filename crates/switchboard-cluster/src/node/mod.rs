@@ -1124,10 +1124,27 @@ impl ClusterNode {
         // meta leader, drive the execution directly — the background loop
         // shares the lock and FIFO order, so this is the same work without
         // a wakeup round trip.
+        //
+        // Completion is judged on monotone state only. The old shortcut —
+        // "pending entry absent, therefore done" — raced the local meta
+        // apply: `write()` resolves at quorum commit, but this replica's
+        // apply of the FanoutBegin can lag a beat, and the first poll then
+        // saw the entry absent, confirmed the publish, and let the next
+        // publish's single-destination direct write race the executor's
+        // leg into the same shard group — inverting per-queue FIFO.
         let deadline = tokio::time::Instant::now()
             + switchboard_core::tempo::scale(self.cfg.timeouts.fanout_budget);
+        let mut seen_pending = false;
         loop {
-            if !self.topology().pending_fanouts.iter().any(|f| f.id == id) {
+            let topo = self.topology();
+            if topo.recent_fanouts.contains(&id) {
+                return Ok(());
+            }
+            let pending_now = topo.pending_fanouts.iter().any(|f| f.id == id);
+            if pending_now {
+                seen_pending = true;
+            } else if seen_pending {
+                // Appeared locally, then cleared: FanoutDone applied.
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {

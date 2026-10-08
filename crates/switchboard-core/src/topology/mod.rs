@@ -67,7 +67,18 @@ pub struct MetaState {
     /// destination group receive concurrent fanouts in one global order;
     /// replication through meta makes that order survive leader failover.
     pub pending_fanouts: Vec<PendingFanout>,
+    /// Recently completed fanout ids, oldest-dropped past the cap. The
+    /// `FanoutDone` apply moves the id here, giving every meta replica a
+    /// monotone "this fanout finished" signal: a pending entry can be
+    /// temporarily invisible on a replica whose local apply lags the
+    /// quorum commit, but a recorded completion never un-happens.
+    #[serde(default)]
+    pub recent_fanouts: std::collections::VecDeque<uuid::Uuid>,
 }
+
+/// Cap on [`MetaState::recent_fanouts`]: only in-flight detection windows
+/// matter, and those live for milliseconds.
+pub const RECENT_FANOUTS_CAP: usize = 4096;
 
 /// One accepted-but-unfinished fanout publish.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +196,10 @@ impl MetaState {
 
             MetaCmd::FanoutDone { id } => {
                 self.pending_fanouts.retain(|f| &f.id != id);
+                self.recent_fanouts.push_back(*id);
+                while self.recent_fanouts.len() > RECENT_FANOUTS_CAP {
+                    self.recent_fanouts.pop_front();
+                }
                 Ok((MetaReply::FanoutDone, vec![]))
             }
 

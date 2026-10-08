@@ -31,8 +31,13 @@ pub fn init_tracing() {
     static LOG: std::sync::Once = std::sync::Once::new();
     LOG.call_once(|| {
     // Test tempo: shrink fixed delays (raft elections, ticks, join
-    // deadlines) 50x. Uniform time-warp — ordering unchanged.
-    unsafe { std::env::set_var("SB_TIME_SCALE", "50"); }
+    // deadlines) 50x. Uniform time-warp — ordering unchanged. A preset
+    // SB_TIME_SCALE wins: CI exports a softer warp (10x) on macOS/Windows
+    // runners, whose 4 cores cannot reliably meet a 0.8 ms raft
+    // heartbeat once a second cluster test runs alongside.
+    if std::env::var("SB_TIME_SCALE").is_err() {
+        unsafe { std::env::set_var("SB_TIME_SCALE", "50"); }
+    }
 
         tracing_subscriber::fmt()
             .with_env_filter(

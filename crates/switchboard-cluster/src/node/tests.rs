@@ -503,17 +503,27 @@ async fn call_rejects_a_request_shaped_reply() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut conn = crate::transport::accept(tcp, None).await.unwrap();
-        let _frame = conn.read_frame_full().await.unwrap();
-        let ping = InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping));
-        conn.write_frame(&bincode::serialize(&ping).unwrap()).await.unwrap();
+        // Serve every connection the client opens: a transport-level retry
+        // over a fresh dial must meet the same request-shaped reply, or a
+        // loaded runner turns the codec assertion into a timeout.
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = match crate::transport::accept(tcp, None).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let ping = InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping));
+            if conn.read_frame_full().await.is_ok() {
+                let _ = conn.write_frame(&bincode::serialize(&ping).unwrap()).await;
+            }
+        }
     });
     node.reroute_peer(30, addr).await;
-    assert!(matches!(
-        node.call(30, InternalRequest::Admin(AdminRequest::Ping)).await,
-        Err(ClusterError::Codec(m)) if m.contains("unexpected")
-    ));
+    let r = node.call(30, InternalRequest::Admin(AdminRequest::Ping)).await;
+    assert!(
+        matches!(&r, Err(ClusterError::Codec(m)) if m.contains("unexpected")),
+        "expected a codec rejection of the request-shaped reply, got {r:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -727,9 +737,24 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
             break;
         }
     }
-    // Poison node1's address in node2's directory: every forward dials a
-    // dead socket. (One poisoned entry is enough for a single-shot
-    // attempt; long-running loops would refresh the directory from meta.)
+    // Poison node1's address in META itself, not just node2's directory:
+    // the reconcile loop re-asserts every directory address from meta each
+    // tick, so a directory-only poison races the tick — a slow runner can
+    // heal the address mid-attempt (the multi-second stale-hint fallback)
+    // and the write then succeeds over the healed route. With meta
+    // poisoned, directory and reconcile agree on the dead address for the
+    // whole attempt.
+    let dead = switchboard_core::topology::NodeInfo {
+        client_addr: "127.0.0.1:1".into(),
+        internal_addr: "127.0.0.1:1".into(),
+    };
+    node2.try_write_depth(
+        crate::META_GROUP,
+        &BrokerCommand::Meta(MetaCmd::RegisterNode { node: 1, info: dead }),
+        0,
+    )
+    .await
+    .expect("meta poison write itself must land (node1 still reachable)");
     node2.reroute_peer(1, "127.0.0.1:1".into()).await;
     let cmd = BrokerCommand::Meta(MetaCmd::DeclareQueue {
         vhost: "/".into(),
