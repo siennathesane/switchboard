@@ -23,7 +23,8 @@ from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent
 REPO = HARNESS.parent
-VENV_PY = HARNESS.parent / "harness-venv" / "bin" / "python"
+VENV_PY = HARNESS.parent / "harness-venv" / (
+    "Scripts/python.exe" if os.name == "nt" else "bin/python")
 sys.path.insert(0, str(HARNESS))
 import support  # noqa: E402
 

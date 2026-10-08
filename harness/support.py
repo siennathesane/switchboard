@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -25,7 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-BIN = REPO / "target" / "debug" / "switchboard"
+BIN = REPO / "target" / "debug" / (
+    "switchboard.exe" if os.name == "nt" else "switchboard")
 
 
 def free_port() -> int:
@@ -169,7 +169,7 @@ def wait_broker_ready(cluster: Cluster, timeout: float = 180.0) -> None:
 def stop_cluster(cluster: Cluster, wipe: bool = True) -> None:
     for p in cluster.processes:
         if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
+            p.terminate()
     deadline = time.time() + 15
     for p in cluster.processes:
         remaining = max(0.1, deadline - time.time())
@@ -187,7 +187,7 @@ def restart_cluster(cluster: Cluster) -> None:
     """Stop every node and restart it on the SAME ports and data."""
     for p in cluster.processes:
         if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
+            p.terminate()
     deadline = time.time() + 15
     for p in cluster.processes:
         try:
