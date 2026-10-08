@@ -20,6 +20,27 @@ impl RocksKv {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_manual_wal_flush(false);
+        // Memory bounds: RocksDB's defaults (64 MiB memtable + WAL + an
+        // effectively unbounded block cache per instance) multiply out
+        // to hundreds of MiB per broker under churn-write load, which
+        // exhausted small hosts running several brokers side by side.
+        // Env-tunable so a dedicated large host can raise them.
+        let mb = |var: &str, default: u64| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+                * 1024
+                * 1024
+        };
+        let write_buffer = mb("SWITCHBOARD_ROCKS_WRITE_BUFFER_MB", 16);
+        let wal_total = mb("SWITCHBOARD_ROCKS_WAL_TOTAL_MB", 64);
+        let block_cache = mb("SWITCHBOARD_ROCKS_BLOCK_CACHE_MB", 32);
+        opts.set_write_buffer_size(write_buffer as usize);
+        opts.set_max_total_wal_size(wal_total as u64);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache as usize));
+        opts.set_block_based_table_factory(&block_opts);
         let db = DB::open(&opts, path)?;
         Ok(RocksKv { db: Arc::new(db) })
     }
@@ -119,6 +140,26 @@ impl RocksKv {
             out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
+    }
+
+    /// The last (highest-ordered) key-value pair under `prefix`.
+    pub fn last_pair(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>, rocksdb::Error> {
+        let mut it = self.db.raw_iterator();
+        // Seek to the prefix's upper bound (prefix + 0xFF): every key
+        // under the prefix sorts strictly below it, so the previous
+        // position is the prefix's last entry.
+        let mut upper = prefix.to_vec();
+        upper.push(0xFF);
+        it.seek_for_prev(upper);
+        if it.valid() {
+            if let Some(k) = it.key() {
+                if k.starts_with(prefix) {
+                    let v = it.value().unwrap_or_default().to_vec();
+                    return Ok(Some((k.to_vec(), v)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Put many pairs atomically.

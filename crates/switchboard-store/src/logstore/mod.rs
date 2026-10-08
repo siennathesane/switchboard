@@ -88,9 +88,8 @@ impl LogStore {
             .and_then(|b| de::<LogId<NodeId>>(&b).ok());
         let last = self
             .kv
-            .prefix_pairs(&logs_prefix(&self.prefix))
-            .map_err(|e| io_fail(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e))?
-            .pop()
+            .last_pair(&logs_prefix(&self.prefix))
+            .map_err(|e| io_fail(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e))?
             .and_then(|(_, v)| de::<openraft::Entry<SwitchboardTypeConfig>>(&v).ok())
             .map(|e| e.log_id);
         Ok((purged, last))

@@ -60,6 +60,12 @@ pub enum BrokerCommand {
     /// request a no-op that replays the first reply. The variant is last
     /// so existing log indices are unchanged.
     Idempotent { id: RequestId, command: Box<BrokerCommand> },
+    /// Several [`BrokerCommand`]s committed as one raft entry (group
+    /// commit on the shard groups' hot path). Commands are applied in
+    /// order; each element is individually `Idempotent`-wrapped, so a
+    /// retried batch applies exactly once per element. Replies come back
+    /// as [`BrokerReply::Batch`] in the same order.
+    Batch { commands: Vec<BrokerCommand> },
 }
 
 /// Cluster-unique identity for one logical write, stamped by `write()` and
@@ -106,6 +112,8 @@ pub enum BrokerReply {
     Error(switchboard_core::error::BrokerError),
     Meta(MetaReply),
     Shard(ShardReply),
+    /// Per-command replies for a [`BrokerCommand::Batch`], in order.
+    Batch(Vec<BrokerReply>),
 }
 
 /// Side-channel effects emitted by state-machine applies. The group leader
@@ -163,6 +171,23 @@ impl BrokerState {
             BrokerCommand::Shard(s) => {
                 let (r, effs) = self.shard.apply(s)?;
                 Ok((BrokerReply::Shard(r), effs.into_iter().map(Effect::Shard).collect()))
+            }
+            BrokerCommand::Batch { commands } => {
+                let mut replies = Vec::with_capacity(commands.len());
+                let mut effects = Vec::new();
+                for c in commands {
+                    // Per-element error semantics match single writes: a
+                    // rejected element folds into an Error reply and the
+                    // rest of the batch still applies.
+                    match self.apply(c) {
+                        Ok((r, effs)) => {
+                            effects.extend(effs);
+                            replies.push(r);
+                        }
+                        Err(e) => replies.push(BrokerReply::Error(e)),
+                    }
+                }
+                Ok((BrokerReply::Batch(replies), effects))
             }
         }
     }
