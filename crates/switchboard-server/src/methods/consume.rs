@@ -60,12 +60,7 @@ impl Channel {
         };
         let node_id = self.inner.lock().unwrap().node_id;
 
-        let sub = SubscriptionId {
-            node: node_id,
-            sub: self
-                .sub_counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        };
+        let sub = node.next_subscription_id();
         let conn: ConnectionId = self.inner.lock().unwrap().conn;
         let queue_owned = queue.to_string();
 
@@ -182,13 +177,19 @@ impl Channel {
 
 /// The delivery pump: shard effects → basic.deliver frames for one
 /// consumer, plus consumer-cancellation notifications.
-async fn delivery_pump(
+pub(crate) async fn delivery_pump(
     channel: Channel,
-    _node: Arc<ClusterNode>,
+    node: Arc<ClusterNode>,
     consumer: LocalConsumer,
     mut rx: mpsc::UnboundedReceiver<Delivery>,
     mut cancelled: mpsc::UnboundedReceiver<String>,
 ) {
+    // No-ack consumers never ack, so their credit only comes back from
+    // here: refund it as deliveries leave for the wire (RabbitMQ's
+    // unlimited-flow semantics for `no-ack`). Refunded in batches so the
+    // pump's write rate is per-chunk, not per-message.
+    let mut uncredited: u32 = 0;
+    let credit_chunk = 64u32;
     loop {
         tokio::select! {
             d = rx.recv() => {
@@ -226,6 +227,26 @@ async fn delivery_pump(
                 for f in frames {
                     if send_frame(&channel, f).is_err() {
                         return;
+                    }
+                }
+                if consumer.no_ack {
+                    uncredited += 1;
+                    if uncredited >= credit_chunk {
+                        // Fire and forget: a lost refund only delays the
+                        // next chunk (the consumer's window absorbs it);
+                        // the consumer is gone if this fails repeatedly.
+                        let node = node.clone();
+                        let sub = consumer.sub;
+                        let shard = consumer.shard;
+                        tokio::spawn(async move {
+                            let _ = shard_call(
+                                &node,
+                                shard,
+                                ShardCmd::Credit { sub, count: credit_chunk },
+                            )
+                            .await;
+                        });
+                        uncredited = 0;
                     }
                 }
             }
