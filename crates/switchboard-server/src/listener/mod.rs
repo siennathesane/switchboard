@@ -39,6 +39,11 @@ pub async fn run(
         let Ok((socket, _peer)) = listener.accept().await else {
             continue;
         };
+        // Per-frame writes (a Deliver method frame followed by its body)
+        // must not sit in Nagle's single-unacked-small-segment queue: with
+        // a delayed-ACKing client each pair of frames stalls ~40 ms. Set
+        // before the gateway splits the socket into protocol halves.
+        socket.set_nodelay(true).ok();
         let node = node.clone();
         let limits = limits.clone();
         let protocols = protocols.clone();

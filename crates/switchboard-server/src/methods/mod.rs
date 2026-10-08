@@ -366,7 +366,6 @@ impl Channel {
 
             // ---- tx ----
             Method::TxSelect {} => {
-                eprintln!("[tx-probe] TxSelect on ch={}", self.id);
                 let in_confirm = self.inner.lock().unwrap().confirm.is_some();
                 if in_confirm {
                     return Err(BrokerError::precondition_failed(

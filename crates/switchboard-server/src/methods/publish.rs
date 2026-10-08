@@ -57,7 +57,7 @@ impl Channel {
 
         if destinations.is_empty() {
             if mandatory {
-                self.return_message(404, "NO_ROUTE", &exchange, &routing_key, props, body)
+                self.return_message(312, "NO_ROUTE", &exchange, &routing_key, props, body)
                     .await?;
                 self.confirm_fire(confirm_seq);
                 return Ok(());
@@ -104,7 +104,6 @@ impl Channel {
         // In tx mode the publishes join the transaction buffer (§2.2.9);
         // confirms fire at commit.
         let in_tx = self.inner.lock().unwrap().tx.is_some();
-        eprintln!("[pub-probe] ch={} rk={} in_tx={in_tx} confirm_seq={confirm_seq}", self.id, message.routing_key);
         if in_tx {
             let mut inner = self.inner.lock().unwrap();
             let Some(tx) = inner.tx.as_mut() else { return Ok(()) };
