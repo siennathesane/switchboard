@@ -149,7 +149,7 @@
         pub?   #(not= % poller-thread)
         poll?  #(= % poller-thread)
         nem    (nemesis-spec opts)
-        pub-rate (:publish-rate opts 10)]
+        pub-rate (or (:publish-rate opts) 10)]
     (assoc (base-test "sb-fifo" opts)
            :client (sclient/client
                      {:conn-opts      (select-keys opts [:username :password :vhost])
@@ -194,7 +194,7 @@
         pub?   (set (range pubs))
         poll?  (set (range pubs n))
         nem    (nemesis-spec opts)
-        pub-rate (:publish-rate opts 8)]
+        pub-rate (or (:publish-rate opts) 8)]
     (assoc (base-test "sb-fanout" opts)
            :client (sclient/client
                      {:conn-opts      (select-keys opts [:username :password :vhost])
@@ -226,7 +226,7 @@
   [opts]
   (let [nodes (:nodes opts)
         nem   (nemesis-spec opts)
-        rate  (:rate opts 5)
+        rate  (or (:rate opts) 5)
         dcl   {:type :invoke, :f :declare}
         del   {:type :invoke, :f :delete}
         exs   {:type :invoke, :f :exists}]
