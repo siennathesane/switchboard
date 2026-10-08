@@ -169,10 +169,21 @@ fn consider(
     if normalize_addr(&node.cfg.internal_addr, 0) == addr {
         return;
     }
-    // Already a registered member? Then there is nothing to introduce.
-    if peer.node_id.is_none() && node.topology().nodes.iter().any(|(id, info)| {
-        *id != node.id && normalize_addr(&info.internal_addr, 0) == addr
-    }) {
+    // Already a joined member seeing a peer that is also registered?
+    // Then there is nothing to introduce. The membership check is on
+    // THIS node's own presence: a *pending* node pulls the seed's
+    // topology to fill its routing view, and that fetched view lists
+    // the seed as a member — reading it as "already introduced" would
+    // deadlock the pending node outside the cluster forever (it must
+    // keep introducing itself until its own id shows up in the
+    // directory).
+    let joined = node.topology().nodes.contains_key(&node.id);
+    if joined
+        && peer.node_id.is_none()
+        && node.topology().nodes.iter().any(|(id, info)| {
+            *id != node.id && normalize_addr(&info.internal_addr, 0) == addr
+        })
+    {
         return;
     }
     let now = tokio::time::Instant::now();

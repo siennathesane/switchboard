@@ -52,6 +52,7 @@ use openraft::error::RaftError;
 use openraft::Config;
 use openraft::Raft;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -158,6 +159,13 @@ pub struct Timeouts {
     /// pause between attempts.
     pub deliver_release_retries: u32,
     pub deliver_release_interval: Duration,
+    /// How many consecutive refused liveness probes (controller tick)
+    /// before a registered node is reaped from the directory. Only
+    /// ECONNREFUSED counts — the definitive "nothing listens" — so
+    /// partitions and load fail open. Long enough to ride out a
+    /// container restart, short enough to heal a SIGKILLed member
+    /// before the next churn wave.
+    pub reap_dead_after: u32,
 }
 
 impl Default for Timeouts {
@@ -176,6 +184,7 @@ impl Default for Timeouts {
             janitor_dead_after: 3,
             deliver_release_retries: 10,
             deliver_release_interval: Duration::from_millis(200),
+            reap_dead_after: 25,
         }
     }
 }
@@ -206,6 +215,23 @@ struct GroupHandle {
     raft: Raft<SwitchboardTypeConfig>,
     sm: StateMachine,
     _effects: tokio::task::JoinHandle<()>,
+}
+
+impl ClusterError {
+    /// A per-waiter copy of this error for fanned-out batch replies
+    /// (`ClusterError` is not `Clone`: `Io`/`Storage` hold native errors).
+    fn for_waiter(&self, group: GroupId) -> ClusterError {
+        match self {
+            ClusterError::Broker(e) => ClusterError::Broker(e.clone()),
+            ClusterError::Raft { group, message } => {
+                ClusterError::Raft { group: *group, message: message.clone() }
+            }
+            ClusterError::Transient => ClusterError::Unreachable { group },
+            ClusterError::Unreachable { group } => ClusterError::Unreachable { group: *group },
+            ClusterError::NotJoined => ClusterError::NotJoined,
+            other => ClusterError::Codec(format!("{other}")),
+        }
+    }
 }
 
 /// A message handed to a locally-hosted consumer channel. An empty `queue`
@@ -243,6 +269,18 @@ pub struct ClusterNode {
     /// transient connect errors (ephemeral-port exhaustion, backlog)
     /// would otherwise eat live consumers.
     peer_probe_fails: std::sync::Mutex<HashMap<NodeId, u32>>,
+    /// Consecutive refused probes per registered peer (dead-node reaping
+    /// in the controller). Same fail-open discipline as the consumer
+    /// janitor; ECONNREFUSED is the only counting signal.
+    reap_fails: std::sync::Mutex<HashMap<NodeId, u32>>,
+    /// When this node started (uptime reporting via `GET /stats`).
+    started: std::time::Instant,
+    /// Node-global subscription-id counter. SubscriptionId is keyed
+    /// node-global in the consumer-sink map, so this must be unique
+    /// across every connection and channel on this node — a per-channel
+    /// counter collides on the first consumer of every channel and
+    /// delivers one session's messages into another.
+    next_sub: std::sync::atomic::AtomicU64,
     /// Latest applied meta state (topology + shard map).
     topology_tx: tokio::sync::watch::Sender<Arc<MetaState>>,
     /// Local consumers awaiting deliveries, keyed by subscription.
@@ -251,6 +289,20 @@ pub struct ClusterNode {
     /// publishes execute one at a time on the meta leader so every
     /// destination shard group receives them in one global order.
     fanout_lock: tokio::sync::Mutex<()>,
+    /// Wakes the fanout executor when a fanout becomes pending, so
+    /// execution starts at once instead of on the next tick.
+    fanout_wake: Arc<tokio::sync::Notify>,
+    /// Per-group write coalescers (group commit on the shard groups' hot
+    /// path: concurrent writes leave as one raft entry).
+    coalescers: std::sync::Mutex<HashMap<GroupId, tokio::sync::mpsc::UnboundedSender<CoalesceReq>>>,
+}
+
+/// One write waiting for a batched commit.
+struct CoalesceReq {
+    /// Already `Idempotent`-wrapped: every retry of a batch re-applies
+    /// each element exactly once through the dedup log.
+    command: BrokerCommand,
+    reply: tokio::sync::oneshot::Sender<Result<BrokerReply, ClusterError>>,
 }
 
 impl ClusterNode {
@@ -282,7 +334,12 @@ impl ClusterNode {
             topology_tx,
             consumer_sinks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             peer_probe_fails: std::sync::Mutex::new(HashMap::new()),
+            reap_fails: std::sync::Mutex::new(HashMap::new()),
+            started: std::time::Instant::now(),
+            next_sub: std::sync::atomic::AtomicU64::new(1),
             fanout_lock: tokio::sync::Mutex::new(()),
+            fanout_wake: Arc::new(tokio::sync::Notify::new()),
+            coalescers: std::sync::Mutex::new(HashMap::new()),
             cfg: cfg.clone(),
         });
 
@@ -292,7 +349,7 @@ impl ClusterNode {
         // refused; the spawned task only runs the accept loop.
         let internal_listener = tokio::net::TcpListener::bind(&cfg.internal_addr)
             .await
-            .map_err(ClusterError::Io)?;
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
         {
             let n = node.clone();
             let rx = shutdown_rx.clone();
@@ -354,6 +411,9 @@ impl ClusterNode {
             let n = node.clone();
             let rx = shutdown_rx.clone();
             tokio::spawn(async move { n.controller_loop(rx).await });
+            let n = node.clone();
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move { n.meta_recovery_loop(rx).await });
         }
         {
             let n = node.clone();
@@ -392,6 +452,21 @@ impl ClusterNode {
     }
 
     /// The meta group's current raft voter set (for admin/inspection).
+    /// Current meta-group voter ids (sync, from raft metrics). Exposed
+    /// via `GET /stats` so orchestrators can protect voters from churn.
+    pub fn meta_voter_ids(&self) -> Vec<NodeId> {
+        let groups = self.groups.read().expect("groups lock");
+        match groups.get(&META_GROUP) {
+            Some(h) => {
+                let mut v: Vec<NodeId> =
+                    h.raft.metrics().borrow().membership_config.voter_ids().collect();
+                v.sort();
+                v
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub async fn meta_voters(&self) -> Option<std::collections::BTreeSet<NodeId>> {
         let handle = self.groups.read().expect("groups lock").get(&META_GROUP).cloned()?;
         Some(handle.raft.metrics().borrow().membership_config.voter_ids().collect())
@@ -399,6 +474,53 @@ impl ClusterNode {
 
     pub fn shutting_down(&self) -> bool {
         *self.shutdown_tx.subscribe().borrow()
+    }
+
+    /// Seconds since this node started (exposed via `GET /stats`).
+    pub fn uptime_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    /// Aggregate message-lifecycle counters across every group this node
+    /// hosts, plus per-queue (ready, held) for queues holding messages.
+    /// Surfaced via `GET /stats` so a live cluster can prove where its
+    /// messages went — the soak's message-conservation triage tool.
+    pub fn message_accounting(&self) -> serde_json::Value {
+        let groups = self.groups.read().expect("groups lock");
+        let mut total: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut queues: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+        for h in groups.values() {
+            let c = &h.sm.counters;
+            for (k, n) in c.snapshot_u64() {
+                *total.entry(k.to_string()).or_default() += n;
+            }
+            for (name, ready, held) in h.sm.account_queues() {
+                let e = queues.entry(name).or_default();
+                e.0 += ready;
+                e.1 += held;
+            }
+        }
+        let mut list: Vec<(String, u64, u64)> = queues
+            .into_iter()
+            .map(|(q, (ready, held))| (q, ready, held))
+            .collect();
+        list.sort_by_key(|(_, r, h)| std::cmp::Reverse(r + h));
+        list.truncate(24);
+        serde_json::json!({
+            "totals": total,
+            "queues": list.into_iter().map(|(q, ready, held)| {
+                serde_json::json!({"queue": q, "ready": ready, "held": held})
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    /// A fresh, node-unique subscription id.
+    pub fn next_subscription_id(&self) -> switchboard_core::model::SubscriptionId {
+        use std::sync::atomic::Ordering;
+        switchboard_core::model::SubscriptionId {
+            node: self.id,
+            sub: self.next_sub.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     /// Leave the cluster: announce the departure through meta (Forgetter
@@ -628,6 +750,12 @@ impl ClusterNode {
                 .max(scaled(&self.cfg.timeouts.raft_heartbeat) * 2)
                 * 2)
             .max(scaled(&self.cfg.timeouts.raft_election_max)),
+            // Building a snapshot serializes the group's whole message
+            // store; at the 10k-entry default a busy group pays that tax
+            // every few seconds of load. Keep logs longer so snapshots
+            // are rare and large instead of frequent and stall-y.
+            max_in_snapshot_log_to_keep: 100_000,
+            purge_batch_size: 50_000,
             ..Default::default()
         };
         let config = Arc::new(
@@ -720,16 +848,20 @@ impl ClusterNode {
                 let group_for_effect = group;
                 // Only the leader acts on effects; followers produce the
                 // same effects applying the same entries and drop them.
-                // An unknown leader (transient metrics lag on a busy
-                // node) counts as leader: dropping here would strand an
-                // already-committed delivery forever.
+                // The check must be THIS node's own raft role — a
+                // follower's role is never Leader, even while the remote
+                // leader *hint* (current_leader) transiently reads None
+                // under load. Treating an unknown hint as "I lead" made
+                // busy followers ship deliveries too, and remote
+                // consumers received every message twice. (A leader
+                // deposed in the instant between applying an entry and
+                // shipping its effect drops it; the client lifecycle —
+                // channel close, consumer cancel, node restart —
+                // requeues such hand-outs.)
                 let leader_is_someone_else = {
                     let handle = node.groups.read().expect("groups lock").get(&group).cloned();
                     match handle {
-                        Some(h) => {
-                            let leader = h.raft.current_leader().await;
-                            leader.is_some() && leader != Some(node.id)
-                        }
+                        Some(h) => h.raft.metrics().borrow().state != openraft::ServerState::Leader,
                         None => true,
                     }
                 };
@@ -771,9 +903,10 @@ impl ClusterNode {
                 // gone, owner unknown) releases the hold so the pump
                 // redelivers — never strand a confirmed message.
                 let target = self.owner_node_of(sub);
-                let delivered = match target {
-                    Some(peer) => matches!(
-                        self.call(
+                let t_del = std::time::Instant::now();
+                let response = match target {
+                    Some(peer) => self
+                        .call(
                             peer,
                             InternalRequest::Admin(AdminRequest::Deliver {
                                 sub,
@@ -785,42 +918,74 @@ impl ClusterNode {
                             }),
                         )
                         .await,
-                        Ok(InternalResponse::Admin(AdminResponse::Delivered))
-                    ),
-                    None => false,
+                    _ => Err(ClusterError::Unreachable { group }),
                 };
-                if !delivered {
-                    // Release off-pump: the pump must never block on a
-                    // write (its 30 s retry budget would stall every
-                    // subsequent delivery). Retry here until it lands.
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        for _ in 0..node.cfg.timeouts.deliver_release_retries {
-                            match node
-                                .write(
-                                    group,
-                                    BrokerCommand::Shard(
-                                        switchboard_core::shard::ShardCmd::Release {
-                                            queue: queue.clone(),
-                                            sub: Some(sub),
-                                            seqs: vec![seq],
-                                            dead: false,
-                                        },
-                                    ),
-                                )
-                                .await
-                            {
-                                Ok(_) => return,
-                                Err(ClusterError::Transient) => {
-                                    tokio::time::sleep(switchboard_core::tempo::scale(
-                                        node.cfg.timeouts.deliver_release_interval,
-                                    ))
-                                    .await
+                if std::env::var("SB_TIMING").is_ok() {
+                    eprintln!("[timing] deliver rpc took {:?} peer={:?}", t_del.elapsed(), target);
+                }
+                match response {
+                    Ok(InternalResponse::Admin(AdminResponse::Delivered)) => {}
+                    // The hold must not outlive the delivery path. Two
+                    // failure shapes:
+                    // * owner answered NotFound — its sink is gone (the
+                    //   consumer session died without unregistering).
+                    //   Releasing alone leaves a credit-carrying zombie
+                    //   sub that the pump re-fills every tick: a
+                    //   hand-out → failed-Deliver → release wheel that
+                    //   burned hundreds of thousands of raft applies and
+                    //   stranded messages once release retries ran out.
+                    //   Unregister the zombie instead — that releases its
+                    //   holds and lets live consumers take over.
+                    // * owner unreachable / unknown — release and retry
+                    //   until it lands (at-least-once): a stranded hold
+                    //   is never acked by anyone.
+                    Ok(InternalResponse::Admin(AdminResponse::NotFound)) => {
+                        let node = self.clone();
+                        tokio::spawn(async move {
+                            let cmd = BrokerCommand::Shard(
+                                switchboard_core::shard::ShardCmd::UnregisterSubscription {
+                                    sub,
+                                },
+                            );
+                            for _ in 0..node.cfg.timeouts.deliver_release_retries {
+                                match node.write(group, cmd.clone()).await {
+                                    Ok(_) => return,
+                                    Err(ClusterError::Transient) => {
+                                        tokio::time::sleep(switchboard_core::tempo::scale(
+                                            node.cfg.timeouts.deliver_release_interval,
+                                        ))
+                                        .await
+                                    }
+                                    Err(_) => return,
                                 }
-                                Err(_) => return,
                             }
-                        }
-                    });
+                        });
+                    }
+                    _ => {
+                        let node = self.clone();
+                        tokio::spawn(async move {
+                            let cmd = BrokerCommand::Shard(
+                                switchboard_core::shard::ShardCmd::Release {
+                                    queue: queue.clone(),
+                                    sub: Some(sub),
+                                    seqs: vec![seq],
+                                    dead: false,
+                                },
+                            );
+                            for _ in 0..node.cfg.timeouts.deliver_release_retries {
+                                match node.write(group, cmd.clone()).await {
+                                    Ok(_) => return,
+                                    Err(ClusterError::Transient) => {
+                                        tokio::time::sleep(switchboard_core::tempo::scale(
+                                            node.cfg.timeouts.deliver_release_interval,
+                                        ))
+                                        .await
+                                    }
+                                    Err(_) => return,
+                                }
+                            }
+                        });
+                    }
                 }
             }
             Effect::Shard(ShardEffect::DeadLettered { message, dlx, .. }) => {
@@ -899,8 +1064,8 @@ impl ClusterNode {
     /// from the owning shard's state machine when hosted here.
     fn owner_node_of(&self, sub: SubscriptionId) -> Option<NodeId> {
         for handle in self.groups.read().expect("groups lock").values() {
-            if let Some(s) = handle.sm.read_state().shard.subs.get(&sub) {
-                return Some(s.node);
+            if let Some(node) = handle.sm.sub_owner(sub) {
+                return Some(node);
             }
         }
         None
@@ -951,8 +1116,14 @@ impl ClusterNode {
                 e
             }
         })?;
+        // The pending entry is live: wake the (possibly local) executor
+        // instead of waiting for its tick.
+        self.fanout_wake.notify_one();
         // The executor clears the pending entry once every leg has
-        // quorum-applied; that moment is the publisher confirm.
+        // quorum-applied; that moment is the publisher confirm. On the
+        // meta leader, drive the execution directly — the background loop
+        // shares the lock and FIFO order, so this is the same work without
+        // a wakeup round trip.
         let deadline = tokio::time::Instant::now()
             + switchboard_core::tempo::scale(self.cfg.timeouts.fanout_budget);
         loop {
@@ -962,7 +1133,11 @@ impl ClusterNode {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClusterError::Unreachable { group: META_GROUP });
             }
-            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(20))).await;
+            if self.leader_hint_of(META_GROUP).await == Some(self.id) {
+                self.execute_pending_fanouts().await?;
+            } else {
+                tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(3))).await;
+            }
             self.refresh_topology().await;
         }
     }
@@ -978,10 +1153,15 @@ impl ClusterNode {
 
     /// Background executor: while this node leads the meta group, apply
     /// pending fanouts strictly in meta-log order, one at a time, then
-    /// mark them done.
+    /// mark them done. Woken the moment a fanout becomes pending (the
+    /// `FanoutBegin` apply lands on the leader — locally or via forward);
+    /// the interval is only a fallback for failovers.
     async fn fanout_executor_loop(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(25))).await;
+            tokio::select! {
+                _ = self.fanout_wake.notified() => {}
+                _ = tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))) => {}
+            }
             match self.leader_hint_of(META_GROUP).await {
                 Some(l) if l == self.id => {
                     if let Err(e) = self.execute_pending_fanouts().await {
@@ -995,7 +1175,10 @@ impl ClusterNode {
 
     /// Execute every pending fanout, FIFO, under the fanout lock. Legs are
     /// idempotent (`fanout_leg_id`), so a fanout half-executed by a
-    /// deposed predecessor finishes exactly-once here.
+    /// deposed predecessor finishes exactly-once here. Strictly one fanout
+    /// per pass: cross-queue order is pinned to the meta log, and keeping
+    /// a pass short shrinks the window where a deposed leader's stale
+    /// pass could submit a competing order against the real leader's.
     async fn execute_pending_fanouts(self: &Arc<Self>) -> Result<(), ClusterError> {
         let _guard = self.fanout_lock.lock().await;
         loop {
@@ -1005,24 +1188,34 @@ impl ClusterNode {
             };
             let topo = self.topology();
             let vhost = topo.vhosts.get(&pending.vhost).cloned();
-            for (leg, q) in pending.queues.iter().enumerate() {
-                let Some(group) = vhost.as_ref().and_then(|vh| vh.queues.get(q).map(|qi| qi.shard))
-                else {
-                    // Vanished between acceptance and execution: skip,
-                    // mirroring the direct path's treatment of unrouted
-                    // destinations.
-                    continue;
-                };
-                self.write_idempotent(
-                    group,
-                    BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
-                        queue: q.clone(),
-                        message: pending.message.clone(),
-                        at_ms: now_ms(),
-                    }),
-                    Self::fanout_leg_id(pending.id, leg),
-                )
-                .await?;
+            let legs = futures::future::join_all(pending.queues.iter().enumerate().map(|(leg, q)| {
+                let group = vhost.as_ref().and_then(|vh| vh.queues.get(q).map(|qi| qi.shard));
+                let q = q.clone();
+                let message = pending.message.clone();
+                let leg_id = Self::fanout_leg_id(pending.id, leg);
+                async move {
+                    let Some(group) = group else {
+                        // Vanished between acceptance and execution: skip,
+                        // mirroring the direct path's treatment of unrouted
+                        // destinations.
+                        return Ok(());
+                    };
+                    self.write_idempotent(
+                        group,
+                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
+                            queue: q,
+                            message,
+                            at_ms: now_ms(),
+                        }),
+                        leg_id,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }))
+            .await;
+            for r in legs {
+                r?;
             }
             self.write(
                 META_GROUP,
@@ -1035,10 +1228,12 @@ impl ClusterNode {
 
     pub async fn refresh_topology(self: &Arc<Self>) {
         // Bind the local (sync) read result, then drop the lock before any
-        // await — std guards are not Send.
+        // await — std guards are not Send. Meta-only clone: this runs on
+        // every reconcile tick and fanout poll, and the shard half holds
+        // the message store.
         let local_meta: Option<switchboard_core::topology::MetaState> = {
             let groups = self.groups.read().expect("groups lock");
-            groups.get(&META_GROUP).map(|h| h.sm.read_state().meta)
+            groups.get(&META_GROUP).map(|h| h.sm.read_meta())
         };
         // A local replica is authoritative once the bootstrap entities have
         // been applied to it. Before that (fresh joiner with an empty meta
@@ -1139,6 +1334,13 @@ impl ClusterNode {
             id,
             command: Box::new(command),
         };
+        // Shard groups coalesce (group commit): concurrent writes leave as
+        // one raft entry, amortizing the commit across the batch. Meta
+        // writes stay direct — fanout ordering and the membership
+        // controller depend on their individual commit points.
+        if group != META_GROUP && Self::commit_batch_max() > 1 {
+            return self.coalesced_write(group, command).await;
+        }
         let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
         loop {
             match self.try_write_depth(group, &command, 0).await {
@@ -1150,6 +1352,121 @@ impl ClusterNode {
                     tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))).await;
                 }
                 Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Env-tunable batch ceiling for group commit; `0` or `1` disables
+    /// coalescing (every write commits alone).
+    fn commit_batch_max() -> usize {
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MAX.get_or_init(|| {
+            std::env::var("SWITCHBOARD_COMMIT_BATCH_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256)
+        })
+    }
+
+    /// Hand a write to the group's coalescer and wait for the batch's
+    /// commit.
+    async fn coalesced_write(
+        self: &Arc<Self>,
+        group: GroupId,
+        command: BrokerCommand,
+    ) -> Result<BrokerReply, ClusterError> {
+        let tx = self.coalescer_for(group).await;
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.send(CoalesceReq { command, reply: rtx })
+            .map_err(|_| ClusterError::Unreachable { group })?;
+        rrx.await.map_err(|_| ClusterError::Unreachable { group })?
+    }
+
+    /// The group's coalescer channel, spawning its loop on first use.
+    async fn coalescer_for(
+        self: &Arc<Self>,
+        group: GroupId,
+    ) -> tokio::sync::mpsc::UnboundedSender<CoalesceReq> {
+        if let Some(tx) = self.coalescers.lock().expect("coalescers lock").get(&group) {
+            return tx.clone();
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut m = self.coalescers.lock().expect("coalescers lock");
+            if let Some(existing) = m.get(&group) {
+                return existing.clone();
+            }
+            m.insert(group, tx.clone());
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(Self::coalescer_loop(weak, group, rx));
+        tx
+    }
+
+    /// Group commit: take everything queued, submit it as ONE raft entry,
+    /// hand every caller its reply. Transient failures retry the whole
+    /// batch — each element is `Idempotent`-wrapped, so retries and
+    /// re-forwards apply exactly once — until the write budget expires.
+    /// Holds only a `Weak` back-reference so a dropped node (tests) is
+    /// never kept alive by its own coalescers.
+    async fn coalescer_loop(
+        weak: std::sync::Weak<ClusterNode>,
+        group: GroupId,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<CoalesceReq>,
+    ) {
+        let max = Self::commit_batch_max().max(1);
+        while let Some(first) = rx.recv().await {
+            let Some(node) = weak.upgrade() else { break };
+            let mut batch = vec![first];
+            while batch.len() < max {
+                match rx.try_recv() {
+                    Ok(r) => batch.push(r),
+                    Err(_) => break,
+                }
+            }
+            let deadline =
+                tokio::time::Instant::now() + switchboard_core::tempo::scale(node.cfg.timeouts.write_budget);
+            loop {
+                let commands =
+                    BrokerCommand::Batch { commands: batch.iter().map(|r| r.command.clone()).collect() };
+                match node.try_write_depth(group, &commands, 0).await {
+                    Ok(BrokerReply::Batch(replies)) if replies.len() == batch.len() => {
+                        for (req, reply) in batch.drain(..).zip(replies) {
+                            let _ = req.reply.send(Ok(reply));
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        for req in batch.drain(..) {
+                            let _ = req.reply.send(Err(ClusterError::Codec(
+                                "batch reply arity mismatch".into(),
+                            )));
+                        }
+                        break;
+                    }
+                    Err(ClusterError::Transient) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            for req in batch.drain(..) {
+                                let _ = req.reply.send(Err(ClusterError::Unreachable { group }));
+                            }
+                            break;
+                        }
+                        // Fold in anything that queued up while retrying.
+                        while batch.len() < max {
+                            match rx.try_recv() {
+                                Ok(r) => batch.push(r),
+                                Err(_) => break,
+                            }
+                        }
+                        tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))).await;
+                    }
+                    Err(e) => {
+                        for req in batch.drain(..) {
+                            let _ = req.reply.send(Err(e.for_waiter(group)));
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1466,16 +1783,53 @@ impl ClusterNode {
                 continue;
             }
 
-            // 1. Grow (or shrink) meta membership to the first
-            //    min(3, registered) node ids, driven through the same
-            //    ReconfigureGroup machinery as shard groups: learners are
-            //    added, then the voter set is replaced. Safe now that
-            //    forwarding is one-shot; retried on later ticks.
+            // 1. Grow (or shrink) meta membership, driven through the
+            //    same ReconfigureGroup machinery as shard groups.
+            //    Voter-set sizes of 2 are forbidden: one unclean loss in
+            //    a 2-voter meta group permanently destroys its quorum
+            //    (1 of 2 alive), and raft cannot re-vote without
+            //    quorum — every meta write (joins, fanout, topology,
+            //    transactions) would freeze forever. Target 3 voters
+            //    whenever ≥3 nodes are registered, 1 when exactly 1 is,
+            //    and leave the current set alone at 2 registered (it is
+            //    either {1} — fine — or a 3-voter set with one member
+            //    gone, which still has quorum).
             {
-                let target: Vec<NodeId> =
-                    nodes.iter().take(MAX_VOTERS).copied().collect();
-                let _ = self.reconfigure_group(META_GROUP, target).await;
+                // Voter set 3 or 1 — never 2 (one unclean loss in a
+                // 2-voter meta group permanently destroys quorum). At
+                // exactly 2 registered, the second node is a LEARNER: it
+                // sees the leader and keeps its meta warm for the
+                // 3-voter upgrade, without ever holding a deciding vote
+                // in a configuration that one loss freezes.
+                if nodes.len() >= MAX_VOTERS {
+                    let voters: Vec<NodeId> = nodes.iter().take(MAX_VOTERS).copied().collect();
+                    let learners: Vec<NodeId> = nodes.iter().skip(MAX_VOTERS).copied().collect();
+                    let _ = self
+                        .reconfigure_group_with_learners(META_GROUP, voters, learners)
+                        .await;
+                } else if nodes.len() == 2 {
+                    let _ = self
+                        .reconfigure_group_with_learners(
+                            META_GROUP,
+                            vec![nodes[0]],
+                            vec![nodes[1]],
+                        )
+                        .await;
+                } else if nodes.len() == 1 {
+                    let _ = self.reconfigure_group(META_GROUP, vec![nodes[0]]).await;
+                }
             }
+
+            // 1b. Reap registered nodes whose internal port refuses
+            //     connections. ECONNREFUSED is definitive — the peer's
+            //     listener is gone — while timeouts and unreachable
+            //     errors fail open (a partitioned or loaded node still
+            //     answers). Thresholded so a restarting member rides it
+            //     out. Without this, a SIGKILLed member (OOM kill,
+            //     eviction, force deletion) stays registered forever,
+            //     and the meta voter set / group member lists keep
+            //     counting a node that is never coming back.
+            self.reap_dead_nodes(&nodes).await;
 
             // 2c. Heal groups hit by a departure: drop lost members and
             //     refill with live nodes (deterministic round-robin keyed
@@ -1550,6 +1904,194 @@ impl ClusterNode {
                     let _ = self.initialize_group_if_fresh(*g, members.clone()).await;
                 }
             }
+        }
+    }
+
+    /// Meta-quorum self-healing. If the meta group's voter set lost
+    /// quorum (unclean loss of 2 of 3 voters in one churn window), raft
+    /// cannot re-vote and every meta write — joins, fanout, topology,
+    /// transactions — freezes forever. Each node holds the full applied
+    /// meta state, so the smallest live registered node can rebuild the
+    /// group: claim a fresh term with itself as sole voter at the applied
+    /// index (a snapshot-only single-voter group — the standard openraft
+    /// shape), and let the normal learner catch-up + snapshot path bring
+    /// everyone else back in.
+    async fn meta_recovery_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let window = switchboard_core::tempo::scale(Duration::from_secs(30));
+        let mut leaderless_since: Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = shutdown.changed() => break,
+            }
+            let Some(handle) = self.groups.read().expect("groups lock").get(&META_GROUP).cloned() else {
+                leaderless_since = None;
+                continue;
+            };
+            let metrics = handle.raft.metrics();
+            let is_registered = self.topology().nodes.contains_key(&self.id);
+            let leaderless = metrics.borrow().current_leader.is_none();
+            if !is_registered || !leaderless {
+                leaderless_since = None;
+                continue;
+            }
+            let since = *leaderless_since.get_or_insert(tokio::time::Instant::now());
+            if since.elapsed() < window {
+                continue;
+            }
+            // Determinism: only the smallest registered id heals. The
+            // directory is shared replicated state, so every surviving
+            // node computes the same smallest — a single initiator.
+            let registered: Vec<NodeId> = {
+                let mut v: Vec<NodeId> = self.topology().nodes.keys().copied().collect();
+                v.sort();
+                v
+            };
+            if registered.first() != Some(&self.id) {
+                continue;
+            }
+            warn!(node = self.id, "meta group leaderless for {window:?}; rebuilding from applied state");
+            match self.rebuild_meta_from_applied().await {
+                Ok(()) => {
+                    leaderless_since = None;
+                    warn!(node = self.id, "meta group rebuilt; sole voter until peers rejoin");
+                }
+                Err(e) => {
+                    error!(node = self.id, err = ?e, "meta rebuild failed; retrying");
+                    // Keep the window open; retry next tick.
+                }
+            }
+        }
+    }
+
+    /// Storage surgery for meta rebuild: read the old term (must exceed
+    /// it), claim the applied index as purged-in-a-fresh-term with
+    /// sole-voter membership, and drop vote/log artifacts. The applied
+    /// state blob (`g0:sm`) and its applied index are kept verbatim.
+    async fn rebuild_meta_from_applied(self: &Arc<Self>) -> Result<(), ClusterError> {
+        let prefix = format!("g{META_GROUP}:").into_bytes();
+        let mut vote_key = prefix.clone();
+        vote_key.extend_from_slice(b"vote");
+        let mut purged_key = prefix.clone();
+        purged_key.extend_from_slice(b"last-purged");
+        let mut logs_prefix = prefix.clone();
+        logs_prefix.extend_from_slice(b"log/");
+
+        // Old term, to strictly exceed.
+        let old_term: u64 = self
+            .kv
+            .get(&vote_key)
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?
+            .and_then(|b| bincode::deserialize::<openraft::Vote<NodeId>>(&b).ok())
+            .map(|v| v.leader_id.term)
+            .unwrap_or(0);
+        let new_term = old_term + 100;
+        let last_applied: Option<openraft::LogId<NodeId>> = self
+            .kv
+            .get(&{
+                let mut k = prefix.clone();
+                k.extend_from_slice(b"last-applied");
+                k
+            })
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?
+            .and_then(|b| bincode::deserialize(&b).ok());
+        let applied_index = last_applied.as_ref().map(|l| l.index).unwrap_or(0);
+        let applied_log_id =
+            openraft::LogId::new(openraft::LeaderId::new(new_term, self.id), applied_index);
+
+        // Drop the live handle (its openraft core + IO tasks) first.
+        let handle = self.groups.write().expect("groups lock").remove(&META_GROUP);
+        if let Some(h) = handle {
+            let _ = h.raft.shutdown().await;
+        }
+
+        // Surgery: purge logs + purged marker + old vote; keep sm,
+        // last-applied. Then write the claimed state.
+        self.kv.delete(&vote_key).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        self.kv.delete(&purged_key).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        self.kv.delete_prefix(&logs_prefix).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        let new_vote = openraft::Vote::new_committed(new_term, self.id);
+        self.kv
+            .write_mixed(
+                [
+                    (vote_key.clone(), bincode::serialize(&new_vote).expect("vote serializes")),
+                    (
+                        purged_key.clone(),
+                        bincode::serialize(&applied_log_id).expect("purged serializes"),
+                    ),
+                ],
+                [],
+            )
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        // Membership {self} at the applied index.
+        let voters = std::iter::once(self.id).collect();
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(self.id, openraft::impls::BasicNode::default());
+        let stored_membership = openraft::Membership::new(vec![voters], members);
+        let stored =
+            openraft::StoredMembership::new(Some(applied_log_id), stored_membership);
+        let mut membership_key = prefix.clone();
+        membership_key.extend_from_slice(b"membership");
+        self.kv
+            .write_mixed(
+                [(membership_key, bincode::serialize(&stored).expect("membership serializes"))],
+                [],
+            )
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Fresh handle over the rebuilt state; it elects itself (sole
+        // voter) and serves meta writes immediately.
+        self.groups.write().expect("groups lock").remove(&META_GROUP);
+        self.ensure_group(META_GROUP).await?;
+        info!(node = self.id, applied_index, new_term, "meta group rebuilt from applied state");
+        Ok(())
+    }
+
+    /// Probe every registered peer's internal port; reap the ones whose
+    /// listener has been refusing for `reap_dead_after` consecutive
+    /// controller ticks. Runs on the meta leader (the same node that
+    /// owns directory writes). A reaped node rejoining later is safe:
+    /// it re-registers through the join protocol and its raft groups
+    /// catch up through the normal learner path.
+    async fn reap_dead_nodes(self: &Arc<Self>, nodes: &[NodeId]) {
+        let mut reaped = Vec::new();
+        for id in nodes.iter().copied() {
+            if id == self.id {
+                continue;
+            }
+            let Some(addr) = self.topology().nodes.get(&id).map(|i| i.internal_addr.clone())
+            else {
+                continue;
+            };
+            let refused = match tokio::time::timeout(
+                switchboard_core::tempo::scale(Duration::from_millis(800)),
+                tokio::net::TcpStream::connect(&addr),
+            )
+            .await
+            {
+                // Anything that connects (or times out / unreachable)
+                // fails open; only a live refusal counts.
+                Ok(Ok(_)) => false,
+                Ok(Err(e)) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+                Err(_) => false,
+            };
+            let mut fails = self.reap_fails.lock().expect("reap lock");
+            if !refused {
+                fails.remove(&id);
+                continue;
+            }
+            let n = fails.entry(id).or_insert(0);
+            *n += 1;
+            if *n >= self.cfg.timeouts.reap_dead_after {
+                reaped.push(id);
+                fails.remove(&id);
+            }
+        }
+        for id in reaped {
+            warn!(node = id, "reaping registered node: internal port refuses connections");
+            let _ = self
+                .write(META_GROUP, BrokerCommand::Meta(MetaCmd::ForgetNode { node: id }))
+                .await;
         }
     }
 
@@ -1644,10 +2186,7 @@ impl ClusterNode {
                             *n += 1;
                             let dead = *n >= dead_after;
                             if dead {
-                                eprintln!(
-                                    "[jan-probe] node {} declares peer {id} ({addr}) dead after {n} refusals",
-                                    self.id
-                                );
+                                info!(node = self.id, peer = id, addr = %addr, refusals = n, "declaring peer dead");
                             }
                             if !dead {
                                 live.insert(id);
@@ -1743,7 +2282,17 @@ impl ClusterNode {
                 // retry policy; chaining forwards could loop on stale
                 // mutual leader hints.
                 match self.try_write_depth(group, &command, 1).await {
-                    Ok(reply) => InternalResponse::Forward(reply),
+                    Ok(reply) => {
+                        // A fanout accepted through us just became pending
+                        // on this (leading) node: start executing now.
+                        if matches!(
+                            &command,
+                            BrokerCommand::Meta(MetaCmd::FanoutBegin { .. })
+                        ) {
+                            self.fanout_wake.notify_one();
+                        }
+                        InternalResponse::Forward(reply)
+                    }
                     Err(e) => InternalResponse::ForwardFailed(ForwardError::from(&e)),
                 }
             }
@@ -1751,7 +2300,7 @@ impl ClusterNode {
             InternalRequest::Admin(AdminRequest::Topology) => {
                 let groups = self.groups.read().expect("groups lock");
                 if let Some(h) = groups.get(&META_GROUP) {
-                    let meta = h.sm.read_state().meta;
+                    let meta = h.sm.read_meta();
                     InternalResponse::Admin(AdminResponse::Topology(TopologySnapshot { meta }))
                 } else {
                     let meta = (*self.topology()).clone();
@@ -1854,10 +2403,29 @@ impl ClusterNode {
         group: GroupId,
         voters: Vec<NodeId>,
     ) -> Result<(), ClusterError> {
+        self.reconfigure_group_with_learners(group, voters, Vec::new())
+            .await
+    }
+
+    /// Drive a group's membership to exactly `voters`, with `learners`
+    /// replicating (but never voting). Learners let a 2-node cluster's
+    /// non-voter see the leader and stay warm for the 3-voter upgrade.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconfigure_group_with_learners(
+        self: &Arc<Self>,
+        group: GroupId,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> Result<(), ClusterError> {
         let handle = self.groups.read().expect("groups lock").get(&group).cloned();
         let Some(handle) = handle else {
             return Err(ClusterError::Unreachable { group });
         };
+        // A membership change blocks until the (joint) config commits; when
+        // that can never happen — e.g. a voter whose address is unknown —
+        // the openraft call would park forever. Bound it: the controller
+        // retries on its next tick, so surfacing a timeout keeps liveness.
+        let change_budget = switchboard_core::tempo::scale(self.cfg.timeouts.reconfigure_budget);
         let target: std::collections::BTreeSet<NodeId> = voters.into_iter().collect();
         let current: std::collections::BTreeSet<NodeId> = handle
             .raft
@@ -1866,6 +2434,20 @@ impl ClusterNode {
             .membership_config
             .voter_ids()
             .collect();
+        // Learners are added even when the voter set already matches:
+        // the 2-node meta policy keeps the second node a learner, and
+        // this call is what introduces it to replication.
+        for l in &learners {
+            if !target.contains(l) {
+                let _ = tokio::time::timeout(
+                    change_budget,
+                    handle
+                        .raft
+                        .add_learner(*l, openraft::BasicNode::default(), false),
+                )
+                .await;
+            }
+        }
         if current == target {
             return Ok(());
         }
@@ -1893,6 +2475,17 @@ impl ClusterNode {
                     handle
                         .raft
                         .add_learner(*n, openraft::BasicNode::default(), false),
+                )
+                .await;
+            }
+        }
+        for l in &learners {
+            if !target.contains(l) {
+                let _ = tokio::time::timeout(
+                    change_budget,
+                    handle
+                        .raft
+                        .add_learner(*l, openraft::BasicNode::default(), false),
                 )
                 .await;
             }
