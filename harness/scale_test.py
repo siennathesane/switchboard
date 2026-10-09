@@ -20,6 +20,8 @@ Usage: harness-venv/bin/python harness/scale_test.py
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -184,10 +186,28 @@ def go_publisher(url: str, queue: str) -> int:
     path = Path("harness/clients/go/loadpub.go")
     path.write_text(GO_LOADPUB)
     try:
-        r = subprocess.run(["go", "run", "loadpub.go", url, queue],
-                           cwd="harness/clients/go",
-                           capture_output=True, text=True, timeout=60)
-        return int(r.stdout.strip().splitlines()[-1])
+        # Compile first, then run the binary in its own process group.
+        # `go run` under load can outlive its budget, and killing `go
+        # run` orphans the binary child — which inherits the captured
+        # pipes and keeps them open, so the parent's communicate() waits
+        # forever (all four CI harness jobs once parked in phase 2 on
+        # exactly this).
+        subprocess.run(["go", "build", "-o", "loadpub", "loadpub.go"],
+                       cwd="harness/clients/go",
+                       capture_output=True, text=True, timeout=180, check=True)
+        proc = subprocess.Popen(["./loadpub", url, queue],
+                                cwd="harness/clients/go",
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                text=True,
+                                start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            return 0
+        return int(out.strip().splitlines()[-1])
     except Exception:  # noqa: BLE001
         return 0
 
@@ -212,6 +232,11 @@ def main() -> int:
     ch = conn.channel()
     ch.queue_declare(queue, durable=True)
     conn.close()
+    # Settle one reconciliation tick before any publisher fires: a node
+    # whose meta snapshot predates the declaration routes the first
+    # publishes as unroutable and CONFIRMS them (non-mandatory), which
+    # the verdict would count as loss. Same warmup the jepsen suites do.
+    time.sleep(0.5)
 
     def wait_confirmed(n: int, floor: float) -> None:
         """End the phase after n more confirmed messages (min `floor`)."""
@@ -266,6 +291,13 @@ def main() -> int:
         print(f"[t+{time.time()-t0:5.1f}s] phase 5: steady load on {len(cluster.client_addrs)} nodes")
         wait_confirmed(args.msgs_per_phase, args.min_phase_secs)
 
+        # Freeze the confirmed set before draining: without this the
+        # publishers keep feeding the queue (STOP was only set in the
+        # finally), the drain chases a moving target until its deadline,
+        # and the residual basic_get loop can spin forever against live
+        # publishers. A two-second settle lets in-flight confirms land.
+        STOP.set()
+        time.sleep(2.0)
         print(f"[t+{time.time()-t0:5.1f}s] phase 6: drain (publishers stopped, consumers finish)")
         deadline = time.time() + 300
         last_progress = (time.time(), stats.consumed_total())
@@ -297,9 +329,13 @@ def main() -> int:
             import pika as _pika
             conn = support.blocking_connection(cluster.amqp_urls[0])
             ch = conn.channel()
-            while True:
+            pulls = 0
+            while pulls < 10_000:
+                pulls += 1
                 m = ch.basic_get(queue, auto_ack=True)
-                if not m:
+                # pika signals "empty queue" as (None, None, None) — a
+                # TRUTHY tuple; only method-frame None is the sentinel.
+                if not m or m[0] is None:
                     break
                 try:
                     body = (m[2] or b"").decode()

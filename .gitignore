@@ -36,3 +36,6 @@ node_modules/
 
 # Prebuilt binaries staged for the thin runtime image (built on the k3s host)
 /k8s/bin
+
+# Compiled go publisher from the scale test
+/harness/clients/go/loadpub
