@@ -93,7 +93,10 @@ jobs:
       # identity in a clean environment.
       - name: workspace tests
         env:
-          SB_TIME_SCALE: ${{ runner.os == 'Windows' && '1' || '50' }}
+          # Empty string off-Windows: set-but-unparseable reads as
+          # identity in tempo::scale, and the variable must not carry a
+          # real factor into tempo::tests::identity_without_env.
+          SB_TIME_SCALE: ${{ runner.os == 'Windows' && '1' || '' }}
         run: cargo nextest run --workspace -j 2 -E 'not test(soak_smoke)'
 
       - name: soak smoke (soft time-warp; 12 workloads vs a live 3-node cluster)

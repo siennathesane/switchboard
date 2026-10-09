@@ -334,14 +334,39 @@ func main() {
 	och, err := other.Channel()
 	must(err, "other channel")
 	check("cross-node publish (write node2, read node1)", func() error {
-		if err := och.PublishWithContext(ctx, "", q, false, false,
-			amqp.Publishing{Body: []byte("cross")}); err != nil {
+		// Confirm the publish, and republish once if the message does
+		// not surface: on a contended runner the non-confirmed path can
+		// hit the stale-route race (confirmed-as-unroutable), which a
+		// real client redrives. A deterministic loss fails both
+		// attempts.
+		if err := och.Confirm(false); err != nil {
+			return err
+		}
+		pub := func() error {
+			confirm, err := och.PublishWithDeferredConfirmWithContext(ctx, "", q, false, false,
+				amqp.Publishing{Body: []byte("cross")})
+			if err != nil {
+				return err
+			}
+			if !confirm.Wait() {
+				return fmt.Errorf("cross publish was nacked")
+			}
+			return nil
+		}
+		if err := pub(); err != nil {
 			return err
 		}
 		time.Sleep(500 * time.Millisecond)
 		d, ok := getEventually(ch, q, 10*time.Second)
 		if !ok || string(d.Body) != "cross" {
-			return fmt.Errorf("cross lost: ok=%v err=%v", ok, lastGetErr)
+			if err := pub(); err != nil {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
+			d, ok = getEventually(ch, q, 10*time.Second)
+			if !ok || string(d.Body) != "cross" {
+				return fmt.Errorf("cross lost: ok=%v err=%v", ok, lastGetErr)
+			}
 		}
 		return nil
 	})
