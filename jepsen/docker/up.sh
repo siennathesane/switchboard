@@ -26,6 +26,17 @@ for i in $(seq 1 "$N"); do
   docker run "${args[@]}" switchboard-jepsen-node:latest
 done
 
+# Broker environment for sshd-spawned starts (sshd does not inherit
+# container env; sb-start sources /var/run/sb-env). CI sets
+# SB_TIME_SCALE=0.25 to stretch the raft timers 4x: a contended 4-core
+# runner cannot hold 100ms heartbeats across five brokers, and the meta
+# group churns elections for the whole run.
+if [ -n "${SB_TIME_SCALE:-}" ]; then
+  for i in $(seq 1 "$N"); do
+    docker exec "sb$i" sh -c "printf 'SB_TIME_SCALE=%s\n' '$SB_TIME_SCALE' > /var/run/sb-env"
+  done
+fi
+
 docker build -f "$JEPSEN_DIR/docker/Dockerfile.control" \
   -t switchboard-jepsen-control:latest "$JEPSEN_DIR"
 

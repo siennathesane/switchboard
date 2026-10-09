@@ -209,7 +209,14 @@ jobs:
 
       # Fresh node containers per combo (up.sh recreates them; the control
       # image build inside up.sh is layer-cached after the first combo).
+      # SB_TIME_SCALE=0.25 stretches the lab brokers' raft timers 4x
+      # (up.sh writes /var/run/sb-env; sb-start sources it): a contended
+      # 4-core runner cannot hold 100ms heartbeats across five brokers —
+      # at identity tempo the meta group churned elections for whole
+      # combos and every publish timed out (run 5, fanout x chaos).
       - name: run 9-combo matrix
+        env:
+          SB_TIME_SCALE: "0.25"
         run: |
           set -euo pipefail
           failed=0

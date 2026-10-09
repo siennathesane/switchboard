@@ -12,6 +12,11 @@ advertise="$2"
 expected="$3"
 shift 3
 
+# Optional broker environment, written at lab creation (docker exec) so
+# sshd-spawned starts see it too — e.g. SB_TIME_SCALE=0.25 stretches the
+# raft timers 4x on contended CI runners.
+[ -f /var/run/sb-env ] && . /var/run/sb-env
+
 mkdir -p /var/lib/switchboard /var/log/switchboard
 
 nohup /usr/local/bin/switchboard \

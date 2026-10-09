@@ -225,6 +225,17 @@ impl TagStreams {
             .collect()
     }
 
+    /// In-order delivery cursor per tag: every sequence below it was
+    /// observed. The reconciler's loss gate is `cursor >= confirmed`.
+    pub fn cursor_by_tag(&self) -> BTreeMap<String, u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, s)| (k.clone(), s.next))
+            .collect()
+    }
+
     pub fn tags(&self) -> Vec<String> {
         self.inner.lock().unwrap().keys().cloned().collect()
     }
@@ -240,10 +251,19 @@ pub type Reconciler = Arc<dyn Fn() -> Vec<Check> + Send + Sync>;
 
 /// Reconcile checks comparing per-tag confirmed counts to per-tag FIFO
 /// streams. Shared by all tag-keyed workloads.
+///
+/// The loss gate is membership, not count equality: a publisher's
+/// sequences are contiguous from 0, so `cursor >= confirmed` proves
+/// every confirmed message was delivered in order. `delivered` may
+/// legitimately exceed `confirmed` by the ambiguity window — a publish
+/// whose confirm was lost (retired) but which the broker applied and
+/// delivered anyway is delayed, not lost. A cursor BELOW confirmed is a
+/// real hole and fails.
 pub fn tag_reconciler(name: &str, confirmed: Arc<TagCounts>, streams: Arc<TagStreams>) -> Reconciler {
     let name = name.to_string();
     Arc::new(move || {
         let conf = confirmed.snapshot();
+        let cursors = streams.cursor_by_tag();
         let st = streams.distinct_by_tag();
         let mut out = Vec::new();
         let mut total_conf = 0u64;
@@ -252,13 +272,27 @@ pub fn tag_reconciler(name: &str, confirmed: Arc<TagCounts>, streams: Arc<TagStr
             total_conf += want;
             let got = *st.get(tag).unwrap_or(&0);
             total_deliv += got;
-            if got != *want {
+            let cursor = *cursors.get(tag).unwrap_or(&0);
+            if cursor < *want {
                 out.push(Check {
                     name: format!("{name}/{tag}"),
                     expected: *want,
                     delivered: got,
                     ok: false,
-                    note: "confirmed != delivered".into(),
+                    note: format!(
+                        "confirmed messages missing from delivery: cursor={cursor} of {want}"
+                    ),
+                });
+            } else if got != *want {
+                out.push(Check {
+                    name: format!("{name}/{tag}"),
+                    expected: *want,
+                    delivered: got,
+                    ok: true,
+                    note: format!(
+                        "{} unconfirmed-but-landed (ambiguity window)",
+                        got - want
+                    ),
                 });
             }
         }
@@ -1150,4 +1184,55 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     last
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observe_seqs(streams: &TagStreams, tag: &str, seqs: &[u64]) {
+        let mut g = streams.inner.lock().unwrap();
+        let s = g.entry(tag.to_string()).or_insert_with(FifoStream::new);
+        for seq in seqs {
+            s.observe(*seq, false);
+        }
+    }
+
+    #[test]
+    fn reconciler_passes_when_every_confirmed_message_delivered() {
+        let confirmed = Arc::new(TagCounts::default());
+        confirmed.bump("p");
+        confirmed.bump("p");
+        confirmed.bump("p");
+        let streams = Arc::new(TagStreams::default());
+        observe_seqs(&streams, "p", &[0, 1, 2]);
+        let checks = tag_reconciler("w", confirmed, streams)();
+        assert!(checks.iter().all(|c| c.ok), "{checks:?}");
+    }
+
+    #[test]
+    fn reconciler_ambiguity_extra_landed_publish_is_ok_with_note() {
+        // Confirm was lost for seq 2 but the broker applied it: delivered
+        // exceeds confirmed while the cursor covers every confirmed seq.
+        let confirmed = Arc::new(TagCounts::default());
+        confirmed.bump("p");
+        confirmed.bump("p");
+        let streams = Arc::new(TagStreams::default());
+        observe_seqs(&streams, "p", &[0, 1, 2]);
+        let checks = tag_reconciler("w", confirmed, streams)();
+        assert!(checks.iter().all(|c| c.ok), "{checks:?}");
+        assert!(checks.iter().any(|c| c.note.contains("ambiguity")), "{checks:?}");
+    }
+
+    #[test]
+    fn reconciler_fails_when_a_confirmed_message_is_missing() {
+        // Seq 1 confirmed but never delivered: cursor stalls at 1.
+        let confirmed = Arc::new(TagCounts::default());
+        confirmed.bump("p");
+        confirmed.bump("p");
+        let streams = Arc::new(TagStreams::default());
+        observe_seqs(&streams, "p", &[0]);
+        let checks = tag_reconciler("w", confirmed, streams)();
+        assert!(checks.iter().any(|c| !c.ok), "{checks:?}");
+    }
 }
