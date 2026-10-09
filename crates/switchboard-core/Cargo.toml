@@ -14,6 +14,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
+argon2 = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

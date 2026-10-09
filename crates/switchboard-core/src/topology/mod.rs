@@ -48,10 +48,16 @@ pub struct Vhost {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetaState {
     pub vhosts: BTreeMap<String, Vhost>,
-    /// User name → plaintext password. Production deployments would store a
-    /// hash; the protocol layer (§2.2.4 PLAIN) sees credentials in the clear
-    /// either way, and TLS (aws-lc-rs) protects the wire.
+    /// User name → stored credential: an argon2 PHC hash, or legacy
+    /// plaintext from snapshots written before hashing existed (verified
+    /// as-is; re-set the password to upgrade it).
     pub users: BTreeMap<String, String>,
+    /// Per-user, per-vhost permissions (RabbitMQ-shaped: regexes matched
+    /// against resource names for the configure/write/read operations).
+    /// A user with no entry here is UNRESTRICTED — the legacy default —
+    /// so pre-ACL deployments keep working; the moment any entry exists
+    /// for a user, everything not granted is denied.
+    pub permissions: BTreeMap<String, BTreeMap<String, Permissions>>,
     pub nodes: BTreeMap<u64, NodeInfo>,
     /// Shard group map: group id → member node ids. Computed by the
     /// membership controller and applied through [`MetaCmd::SetGroups`].
@@ -89,13 +95,52 @@ pub struct PendingFanout {
     pub queues: Vec<String>,
 }
 
+/// Resource permissions for one user on one vhost. Patterns are
+/// full-matched regular expressions over resource names, mirroring
+/// RabbitMQ's model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Permissions {
+    pub configure: String,
+    pub write: String,
+    pub read: String,
+}
+
+/// Which class of operation an authorize check guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Perm {
+    Configure,
+    Write,
+    Read,
+}
+
+impl Permissions {
+    fn allows(&self, perm: Perm, resource: &str) -> bool {
+        use regex::Regex;
+        let (pattern, class) = match perm {
+            Perm::Configure => (&self.configure, "configure"),
+            Perm::Write => (&self.write, "write"),
+            Perm::Read => (&self.read, "read"),
+        };
+        if pattern.is_empty() {
+            return false;
+        }
+        match Regex::new(pattern) {
+            Ok(re) => re.is_match(resource),
+            Err(e) => {
+                tracing::warn!(%pattern, %class, %e, "invalid permission regex; denying");
+                false
+            }
+        }
+    }
+}
+
 /// Bootstrap state for a fresh cluster: default vhost, mandatory exchanges,
 /// default user (§3.1.3 "The server will create a set of exchanges...").
 pub fn bootstrap() -> MetaState {
     use switchboard_wire::constants::{DEFAULT_PASSWORD, DEFAULT_USER, DEFAULT_VHOST};
     let mut s = MetaState::default();
     s.declare_default_entities(DEFAULT_VHOST);
-    s.users.insert(DEFAULT_USER.into(), DEFAULT_PASSWORD.into());
+    s.users.insert(DEFAULT_USER.into(), crate::auth::hash_password(DEFAULT_PASSWORD));
     s
 }
 
@@ -122,6 +167,32 @@ impl MetaState {
         )))
     }
 
+    /// May `user` perform `perm` on `resource` in `vhost`? Users without
+    /// any permissions entry are unrestricted (legacy default); users
+    /// with entries are denied everything not explicitly granted.
+    pub fn authorize(&self, user: &str, vhost: &str, perm: Perm, resource: &str) -> bool {
+        let Some(per_vhost) = self.permissions.get(user) else {
+            return true;
+        };
+        match per_vhost.get(vhost) {
+            Some(p) => p.allows(perm, resource),
+            None => false,
+        }
+    }
+
+    /// Check credentials against the replicated user table.
+    /// Authentication is a pure READ: verification runs on the serving
+    /// node against its local view (refreshing once if the user is not
+    /// yet visible), never inside the meta raft critical section.
+    pub fn check_credentials(&self, user: &str, password: &str) -> Result<(), BrokerError> {
+        match self.users.get(user) {
+            Some(pw) if crate::auth::verify_password(password, pw) => Ok(()),
+            _ => Err(BrokerError::connection_access_refused(format!(
+                "authentication refused for user {user:?}"
+            ))),
+        }
+    }
+
     /// Assign a queue to a shard group: stable hash of the queue name over
     /// the sorted group ids (rendezvous-free but deterministic; groups
     /// change rarely and queue placement is fixed at declare time).
@@ -140,8 +211,38 @@ impl MetaState {
                 self.declare_default_entities(name);
                 Ok((MetaReply::Ok, vec![]))
             }
+            MetaCmd::SetPermissions { user, vhost, permissions } => {
+                if !self.users.contains_key(user) {
+                    return Err(BrokerError::access_refused(format!(
+                        "no user {user:?}"
+                    )));
+                }
+                let empty = permissions.configure.is_empty()
+                    && permissions.write.is_empty()
+                    && permissions.read.is_empty();
+                if empty {
+                    self.permissions
+                        .get_mut(user)
+                        .map(|m| m.remove(vhost));
+                } else {
+                    self.permissions
+                        .entry(user.clone())
+                        .or_default()
+                        .insert(vhost.clone(), permissions.clone());
+                }
+                Ok((MetaReply::Ok, vec![]))
+            }
+            MetaCmd::DeleteUser { name } => {
+                self.users.remove(name);
+                self.permissions.remove(name);
+                Ok((MetaReply::Ok, vec![]))
+            }
             MetaCmd::CreateUser { name, password } => {
-                self.users.insert(name.clone(), password.clone());
+                // At-rest credentials are hashed; the plaintext exists
+                // only in this command (and thus the raft log — rotate
+                // users rather than in-place password changes when that
+                // matters).
+                self.users.insert(name.clone(), crate::auth::hash_password(password));
                 Ok((MetaReply::Ok, vec![]))
             }
             MetaCmd::SetGroups { groups } => {
@@ -464,14 +565,6 @@ impl MetaState {
                 }
                 Ok((MetaReply::Ok, vec![]))
             }
-            MetaCmd::Authorize { user, password } => {
-                match self.users.get(user) {
-                    Some(pw) if pw == password => Ok((MetaReply::Authorized, vec![])),
-                    _ => Err(BrokerError::connection_access_refused(format!(
-                        "authentication refused for user {user:?}"
-                    ))),
-                }
-            }
         }
     }
 
@@ -575,8 +668,15 @@ pub enum MetaCmd {
         routing_key: String,
         arguments: FieldTable,
     },
-    /// Check credentials (Connection.Start-Ok handling).
-    Authorize { user: String, password: String },
+    /// Set (or, with all-empty patterns, clear) one user's permissions
+    /// on one vhost.
+    SetPermissions {
+        user: String,
+        vhost: String,
+        permissions: Permissions,
+    },
+    /// Remove a user and their permissions.
+    DeleteUser { name: String },
     /// Store (or clear, `message = None`) a retained MQTT message,
     /// replicated through meta so every node serves the same retained
     /// state. Keyed by vhost + MQTT topic.

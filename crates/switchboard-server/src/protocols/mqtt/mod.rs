@@ -104,7 +104,11 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 }
 
 /// Serve one MQTT connection to completion.
-pub async fn serve<S>(io: S, node: Arc<ClusterNode>) -> std::io::Result<()>
+pub async fn serve<S>(
+    io: S,
+    node: Arc<ClusterNode>,
+    limits: crate::channel::ConnectionLimits,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -120,7 +124,14 @@ where
         (Some(u), p) => (u.clone(), p.clone().unwrap_or_default()),
         _ => ("guest".into(), b"guest".to_vec()),
     };
-    let auth = shared::authorize(&node, &user, &String::from_utf8_lossy(&pass)).await;
+    let auth = shared::authorize(
+        &node,
+        &user,
+        &String::from_utf8_lossy(&pass),
+        limits.peer_ip,
+        limits.allow_remote_guest,
+    )
+    .await;
     if let Err(e) = auth {
         // 4 = bad user name or password.
         let nack = Out::ConnAck { session_present: false, code: 4 };

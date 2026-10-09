@@ -41,6 +41,7 @@ pub async fn serve<S>(
     pre: &[u8],
     node: std::sync::Arc<switchboard_cluster::ClusterNode>,
     protocols: super::shared::ProtocolConfig,
+    limits: crate::channel::ConnectionLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -49,7 +50,7 @@ where
     let head = read_head(&mut io, &[]).await?;
     if protocols.websocket && wants_upgrade(&head) {
         let head = head.clone();
-        return super::ws::serve_with_head(io, &head, node, protocols).await;
+        return super::ws::serve_with_head(io, &head, node, protocols, limits).await;
     }
     let first_line = String::from_utf8_lossy(head.split(|&b| b == b'\n').next().unwrap_or(&[]));
     let mut parts = first_line.split_whitespace();

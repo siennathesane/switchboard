@@ -433,6 +433,7 @@ pub async fn serve_with_head<S>(
     head: &[u8],
     node: Arc<ClusterNode>,
     protocols: ProtocolConfig,
+    limits: crate::channel::ConnectionLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -481,9 +482,9 @@ where
     };
     stream.unconsume(&sniff_buffer);
     match selected {
-        Some(Inner::Mqtt) if protocols.mqtt => super::mqtt::serve(stream, node).await,
-        Some(Inner::Stomp) if protocols.stomp => super::stomp::serve(stream, node).await,
-        Some(Inner::Amqp10) if protocols.amqp10 => super::amqp10::serve(stream, node).await,
+        Some(Inner::Mqtt) if protocols.mqtt => super::mqtt::serve(stream, node, limits).await,
+        Some(Inner::Stomp) if protocols.stomp => super::stomp::serve(stream, node, limits).await,
+        Some(Inner::Amqp10) if protocols.amqp10 => super::amqp10::serve(stream, node, limits).await,
         _ => Ok(()), // unrecognized or disabled inner protocol
     }
 }

@@ -149,6 +149,8 @@ pub struct ChannelInner {
     pub confirm: Option<ConfirmState>,
 
     pub vhost: String,
+    /// Authenticated user (authorization checks read this).
+    pub user: String,
     pub limits: ConnectionLimits,
 }
 
@@ -178,7 +180,13 @@ pub struct ConfirmState {
 }
 
 impl ChannelInner {
-    pub fn new(conn: ConnectionId, node_id: u64, vhost: String, limits: ConnectionLimits) -> Self {
+    pub fn new(
+        conn: ConnectionId,
+        node_id: u64,
+        user: String,
+        vhost: String,
+        limits: ConnectionLimits,
+    ) -> Self {
         ChannelInner {
             open: true,
             conn,
@@ -197,6 +205,7 @@ impl ChannelInner {
             flow_active: true,
             tx: None,
             confirm: None,
+            user,
             vhost,
             limits,
         }
@@ -246,6 +255,7 @@ impl Channel {
         id: u16,
         conn: ConnectionId,
         node_id: u64,
+        user: String,
         vhost: String,
         limits: ConnectionLimits,
         outbound: mpsc::UnboundedSender<OutboundFrame>,
@@ -254,7 +264,7 @@ impl Channel {
             id,
             outbound,
             inner: Arc::new(Mutex::new(ChannelInner::new(
-                conn, node_id, vhost, limits,
+                conn, node_id, user, vhost, limits,
             ))),
             sub_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
@@ -406,6 +416,7 @@ mod tests {
             1,
             ConnectionId { node: 1, conn: 1 },
             1,
+            "guest".into(),
             "/".into(),
             ConnectionLimits::default(),
             tx,

@@ -144,3 +144,110 @@ mod tests {
         assert_eq!(err.code, 403);
     }
 }
+
+fn hash_memo() -> &'static std::sync::Mutex<Option<(String, String)>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(String, String)>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Argon2 parameters for NEW hashes: OWASP baseline by default
+/// (m=19 MiB, t=2, p=1), tunable per deployment via
+/// `SWITCHBOARD_ARGON2_M_KIB` / `_T` / `_P`. CI test clusters use light
+/// parameters — dozens of brokers bootstrap and authenticate in parallel
+/// under tight test deadlines, and a 19 MiB memory-hard verify per
+/// handshake starved them (whole formation rounds timed out).
+/// Verification of an EXISTING credential always uses the parameters
+/// embedded in its PHC string, so tuning only affects new hashes.
+fn argon2_params() -> argon2::Params {
+    fn num(key: &str, default: u32) -> u32 {
+        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+    let m_kib = num("SWITCHBOARD_ARGON2_M_KIB", 19_456);
+    let t = num("SWITCHBOARD_ARGON2_T", 2);
+    let p = num("SWITCHBOARD_ARGON2_P", 1);
+    argon2::Params::new(m_kib, t, p, None).expect("argon2 params")
+}
+
+fn argon2_instance() -> argon2::Argon2<'static> {
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2_params())
+}
+
+/// Hash a password for at-rest storage: argon2id. The PHC string carries
+/// the random salt and parameters, so stored hashes are self-describing.
+///
+/// Identical passwords return the identical (memoized) hash: every node
+/// boot re-derives the bootstrap credential, and a fresh memory-hard
+/// hash per start measurably starved parallel test formation. Memoizing
+/// loses nothing at rest — repeat hashes of the same password would
+/// never coexist in the users map.
+pub fn hash_password(password: &str) -> String {
+    if let Some((pw, hash)) = hash_memo().lock().unwrap().as_ref() {
+        if pw == password {
+            return hash.clone();
+        }
+    }
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use rand::RngCore;
+    let mut salt_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes).expect("salt b64");
+    let hash = argon2_instance()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hash")
+        .to_string();
+    *hash_memo().lock().unwrap() = Some((password.to_string(), hash.clone()));
+    hash
+}
+
+/// Verify a password against a stored credential. Normal credentials are
+/// argon2 PHC strings — verified with the parameters embedded in the PHC
+/// string, so old hashes keep working after the deployment retunes —
+/// while plaintext survives from snapshots written before hashing
+/// existed and is matched as-is (re-set the password to upgrade it).
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        use argon2::password_hash::PasswordVerifier;
+        match argon2::password_hash::PasswordHash::new(stored) {
+            Ok(parsed) => {
+                let params = match argon2::Params::try_from(&parsed) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                };
+                let instance = argon2::Argon2::new(
+                    argon2::Algorithm::Argon2id,
+                    argon2::Version::V0x13,
+                    params,
+                );
+                instance.verify_password(password.as_bytes(), &parsed).is_ok()
+            }
+            Err(_) => false,
+        }
+    } else {
+        stored == password
+    }
+}
+
+#[cfg(test)]
+mod hashing_tests {
+    use super::*;
+
+    #[test]
+    fn hash_and_verify_roundtrip() {
+        let stored = hash_password("s3cret");
+        assert!(stored.starts_with("$argon2"), "{stored}");
+        assert!(verify_password("s3cret", &stored));
+        assert!(!verify_password("wrong", &stored));
+    }
+
+    #[test]
+    fn legacy_plaintext_still_verifies() {
+        assert!(verify_password("guest", "guest"));
+        assert!(!verify_password("guest", "not-guest"));
+    }
+
+    #[test]
+    fn repeated_hashes_are_memoized() {
+        assert_eq!(hash_password("memo-me"), hash_password("memo-me"));
+    }
+}

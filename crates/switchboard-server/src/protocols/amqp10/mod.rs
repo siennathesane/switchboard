@@ -148,7 +148,11 @@ fn encode_message(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
 type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
 
 /// Serve one AMQP 1.0 connection to completion.
-pub async fn serve<S>(io: S, node: Arc<ClusterNode>) -> std::io::Result<()>
+pub async fn serve<S>(
+    io: S,
+    node: Arc<ClusterNode>,
+    limits: crate::channel::ConnectionLimits,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -199,7 +203,10 @@ where
                 return Ok(());
             }
         };
-        if shared::authorize(&node, &user, &pass).await.is_err() {
+        if shared::authorize(&node, &user, &pass, limits.peer_ip, limits.allow_remote_guest)
+            .await
+            .is_err()
+        {
             writer.lock().await.write_all(&frames::sasl_outcome(1)).await?;
             writer.lock().await.flush().await?;
             return Ok(());

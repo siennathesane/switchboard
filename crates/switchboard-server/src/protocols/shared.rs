@@ -104,28 +104,40 @@ fn berr(e: switchboard_cluster::ClusterError) -> BrokerError {
     }
 }
 
-/// Check credentials through the meta group (same path AMQP uses).
+/// Check credentials against the replicated user table (same users the
+/// native AMQP path authenticates against; verification runs locally —
+/// see `MetaState::check_credentials`). `peer_ip` + `allow_remote_guest`
+/// drive the guest-loopback rule.
 pub async fn authorize(
     node: &Arc<ClusterNode>,
     user: &str,
     password: &str,
+    peer_ip: Option<std::net::IpAddr>,
+    allow_remote_guest: bool,
 ) -> BridgeResult<()> {
-    let reply = node
-        .write(
-            switchboard_cluster::META_GROUP,
-            BrokerCommand::Meta(MetaCmd::Authorize {
-                user: user.to_string(),
-                password: password.to_string(),
-            }),
+    if user == "guest"
+        && !allow_remote_guest
+        && peer_ip.map_or(false, |ip| !ip.is_loopback())
+    {
+        return Err(BrokerError::access_refused(
+            "guest is loopback-only; create a real user or set allow-remote-guest",
         )
-        .await
-        .map_err(berr)?;
-    match reply {
-        switchboard_cluster::BrokerReply::Meta(MetaReply::Authorized) => Ok(()),
-        other => Err(BrokerError::access_refused(format!(
-            "credentials rejected: {other:?}"
+        .channel_level());
+    }
+    let authed = match node.topology().check_credentials(user, password) {
+        Ok(()) => true,
+        Err(_) => {
+            node.refresh_topology().await;
+            node.topology().check_credentials(user, password).is_ok()
+        }
+    };
+    if authed {
+        Ok(())
+    } else {
+        Err(BrokerError::access_refused(format!(
+            "authentication refused for user {user:?}"
         ))
-        .channel_level()),
+        .channel_level())
     }
 }
 

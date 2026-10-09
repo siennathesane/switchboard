@@ -140,9 +140,9 @@ where
             let (r, w) = tokio::io::split(io);
             session::serve_rw(r, w, node, limits).await
         }
-        Detected::Mqtt => mqtt::serve(io, node).await,
-        Detected::Stomp => stomp::serve(io, node).await,
-        Detected::Amqp10 => amqp10::serve(io, node).await,
-        Detected::Http => http::serve(io, &io_prefix, node, protocols).await,
+        Detected::Mqtt => mqtt::serve(io, node, limits.clone()).await,
+        Detected::Stomp => stomp::serve(io, node, limits.clone()).await,
+        Detected::Amqp10 => amqp10::serve(io, node, limits.clone()).await,
+        Detected::Http => http::serve(io, &io_prefix, node, protocols, limits).await,
     }
 }

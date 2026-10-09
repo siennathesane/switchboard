@@ -38,6 +38,13 @@ pub fn init_tracing() {
     if std::env::var("SB_TIME_SCALE").is_err() {
         unsafe { std::env::set_var("SB_TIME_SCALE", "50"); }
     }
+    // Test-grade password hashing: parallel test processes bootstrap and
+    // authenticate dozens of clusters; the production-default 19 MiB
+    // memory-hard verify per handshake starved whole formation rounds.
+    if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048"); }
+        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_T", "1"); }
+    }
 
         tracing_subscriber::fmt()
             .with_env_filter(

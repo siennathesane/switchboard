@@ -416,19 +416,9 @@ fn fnv1a_is_deterministic() {
 
 #[test]
 fn auth_checks() {
-    let mut s = state();
-    let (r, _) = s
-        .apply(&MetaCmd::Authorize {
-            user: "guest".into(),
-            password: "guest".into(),
-        })
-        .unwrap();
-    assert_eq!(r, MetaReply::Authorized);
-    let e = s.apply(&MetaCmd::Authorize {
-        user: "guest".into(),
-        password: "wrong".into(),
-    })
-    .unwrap_err();
+    let s = state();
+    s.check_credentials("guest", "guest").unwrap();
+    let e = s.check_credentials("guest", "wrong").unwrap_err();
     assert_eq!(e.code, 403);
     assert_eq!(e.level, Level::Connection);
 }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::ClusterNode;
+use switchboard_core::topology::Perm;
 use switchboard_core::error::BrokerError;
 use switchboard_core::model::ExchangeKind;
 use switchboard_core::topology::MetaCmd;
@@ -51,6 +52,33 @@ async fn shard_call(
     let reply = node.write(shard, BrokerCommand::Shard(cmd)).await.map_err(ce)?;
     tracing::debug!(node = node.id, shard, reply = ?reply, "shard_call");
     Channel::shard_reply(reply)
+}
+
+/// Authorization gate for channel operations: consults the replicated
+/// permissions table (RabbitMQ-shaped configure/write/read regexes). A
+/// user with no permissions entry is unrestricted (legacy default); a
+/// user with entries is denied anything not granted on this vhost.
+pub(crate) fn authorize_ch(
+    ch: &Channel,
+    node: &Arc<ClusterNode>,
+    perm: switchboard_core::topology::Perm,
+    resource: &str,
+) -> ChannelResult<()> {
+    use switchboard_core::topology::Perm;
+    let inner = ch.inner.lock().unwrap();
+    if node
+        .topology()
+        .authorize(&inner.user, &inner.vhost, perm, resource)
+    {
+        return Ok(());
+    }
+    let user = inner.user.clone();
+    let vhost = inner.vhost.clone();
+    drop(inner);
+    Err(BrokerError::access_refused(format!(
+        "{perm:?} access to {resource:?} in vhost {vhost:?} refused for user {user:?}"
+    ))
+    .channel_level())
 }
 
 /// `shard_call` with a bounded retry for the declare race: between the
@@ -193,6 +221,7 @@ impl Channel {
                 arguments,
                 ..
             } => {
+                authorize_ch(self, node, Perm::Configure, &exchange)?;
                 let Some(kind) = ExchangeKind::from_str(&exchange_type) else {
                     return Err(if exchange_type.starts_with("x-") {
                         BrokerError::not_implemented(format!(
@@ -227,6 +256,7 @@ impl Channel {
                 Ok(())
             }
             Method::ExchangeDelete { exchange, if_unused, nowait, .. } => {
+                authorize_ch(self, node, Perm::Configure, &exchange)?;
                 meta_call(
                     node,
                     MetaCmd::DeleteExchange {
@@ -306,6 +336,7 @@ impl Channel {
                 } else {
                     queue
                 };
+                authorize_ch(self, node, Perm::Configure, &name)?;
                 let (name, depth, consumers) = self
                     .queue_declare(node, &name, passive, durable, exclusive, auto_delete, arguments)
                     .await?;
@@ -325,6 +356,7 @@ impl Channel {
                 arguments,
                 ..
             } => {
+                authorize_ch(self, node, Perm::Configure, &queue)?;
                 meta_call(
                     node,
                     MetaCmd::Bind {
@@ -348,6 +380,7 @@ impl Channel {
                 arguments,
                 ..
             } => {
+                authorize_ch(self, node, Perm::Configure, &queue)?;
                 meta_call(
                     node,
                     MetaCmd::Unbind {
@@ -364,6 +397,7 @@ impl Channel {
                 Ok(())
             }
             Method::QueuePurge { queue, nowait, .. } => {
+                authorize_ch(self, node, Perm::Read, &queue)?;
                 let count = self.queue_purge(node, &queue).await?;
                 if !nowait {
                     reply_method(self, Method::QueuePurgeOk { message_count: count });
@@ -377,6 +411,7 @@ impl Channel {
                 nowait,
                 ..
             } => {
+                authorize_ch(self, node, Perm::Configure, &queue)?;
                 let count = self.queue_delete(node, &queue, if_unused, if_empty).await?;
                 if !nowait {
                     reply_method(self, Method::QueueDeleteOk { message_count: count });

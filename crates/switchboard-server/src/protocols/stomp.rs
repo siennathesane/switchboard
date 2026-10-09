@@ -213,7 +213,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &SharedWriter<W>, f: &Frame) -> s
 }
 
 /// Serve one STOMP connection to completion.
-pub async fn serve<S>(io: S, node: Arc<ClusterNode>) -> std::io::Result<()>
+pub async fn serve<S>(
+    io: S,
+    node: Arc<ClusterNode>,
+    limits: crate::channel::ConnectionLimits,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -235,7 +239,15 @@ where
     let user = hello.header("login").unwrap_or("guest").to_string();
     let pass = hello.header("passcode").unwrap_or("guest").to_string();
     tracing::info!("stomp: authorizing");
-    if let Err(e) = shared::authorize(&node, &user, &pass).await {
+    if let Err(e) = shared::authorize(
+        &node,
+        &user,
+        &pass,
+        limits.peer_ip,
+        limits.allow_remote_guest,
+    )
+    .await
+    {
         tracing::info!("stomp: auth failed");
         let err = Frame {
             command: "ERROR".into(),

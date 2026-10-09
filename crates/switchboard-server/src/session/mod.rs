@@ -247,27 +247,36 @@ where
     else {
         return Err(HandshakeError::Rejected); // §2.2.4: close without data
     };
-    let Some((user, pass)) = auth::credentials(&mechanism, &response) else {
+    let Some((mut user, pass)) = auth::credentials(&mechanism, &response) else {
         return Err(HandshakeError::Rejected); // §2.2.4: close without data
     };
-    // §2.2.4: authentication is decided by the replicated reply; a
-    // broker-level refusal arrives as a BrokerReply::Error inside an Ok
-    // write, so the reply value — not the transport result — decides.
-    let authorized = node
-        .write(
-            META_GROUP,
-            BrokerCommand::Meta(MetaCmd::Authorize { user, password: pass }),
-        )
-        .await;
-    let authed = matches!(
-        &authorized,
-        Ok(switchboard_cluster::BrokerReply::Meta(
-            switchboard_core::topology::MetaReply::Authorized
-        ))
-    );
+    // The well-known `guest` user is loopback-only unless explicitly
+    // allowed — matching RabbitMQ, so a default-credential broker is not
+    // silently world-open.
+    if user == "guest"
+        && !limits.allow_remote_guest
+        && limits.peer_ip.map_or(false, |ip| !ip.is_loopback())
+    {
+        tracing::warn!(peer = ?limits.peer_ip, "refusing remote `guest` login (loopback-only; set allow-remote-guest to override)");
+        return Err(HandshakeError::Rejected);
+    }
+    // §2.2.4: authentication is a read against the replicated user
+    // table, decided on this node. A user not yet visible locally (fresh
+    // joiner) gets one refreshed look before the refusal. Verification
+    // never touches the meta raft critical section: a memory-hard hash
+    // per handshake stalled every declare on the node.
+    let mut authed_user = String::new();
+    let authed = match node.topology().check_credentials(&user, &pass) {
+        Ok(()) => true,
+        Err(_) => {
+            node.refresh_topology().await;
+            node.topology().check_credentials(&user, &pass).is_ok()
+        }
+    };
     if !authed {
         return Err(HandshakeError::Rejected);
     }
+    authed_user = user;
 
     // 3. Tune / Tune-Ok (client may only lower, §2.3.3).
     send_method(
@@ -313,6 +322,7 @@ where
         node: node.clone(),
         conn: conn_id,
         limits: session_limits,
+        user: authed_user,
         vhost: virtual_host,
         channels: HashMap::new(),
         outbound: mpsc::unbounded_channel().0,
@@ -340,6 +350,7 @@ pub struct Session {
     pub node: Arc<ClusterNode>,
     pub conn: ConnectionId,
     pub limits: ConnectionLimits,
+    pub user: String,
     pub vhost: String,
     pub channels: HashMap<u16, Channel>,
     pub outbound: mpsc::UnboundedSender<OutboundFrame>,
@@ -627,6 +638,7 @@ impl Session {
                     id,
                     self.conn,
                     self.node.id,
+                    self.user.clone(),
                     self.vhost.clone(),
                     self.limits.clone(),
                     self.outbound.clone(),

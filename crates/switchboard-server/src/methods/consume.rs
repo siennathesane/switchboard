@@ -11,7 +11,9 @@ use crate::channel::Channel;
 use crate::channel::ChannelResult;
 use crate::methods::inner_vhost;
 use crate::methods::send_frame;
+use crate::methods::authorize_ch;
 use crate::methods::shard_call;
+use switchboard_core::topology::Perm;
 use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
 
@@ -93,6 +95,7 @@ impl Channel {
             tag
         };
 
+        authorize_ch(self, node, Perm::Read, queue)?;
         shard_call_lenient(
             node,
             shard,
