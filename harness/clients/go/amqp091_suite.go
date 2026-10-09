@@ -291,7 +291,16 @@ func main() {
 	}
 	check("qos prefetch delivers all after acks", func() error {
 		if gotQ != 3 {
-			return fmt.Errorf("got %d", gotQ)
+			// Self-diagnosis: if the queue still holds messages, the
+			// consumer stream stalled with data present (a credit or
+			// pump problem); if it is empty, the publishes never
+			// became deliverable. Either way requeue what we see.
+			detail := "queue empty at check time"
+			if d, ok, _ := ch.Get(qq, false); ok {
+				detail = fmt.Sprintf("queue holds messages (head=%q) — consumer stream stalled", d.Body)
+				_ = ch.Nack(d.DeliveryTag, false, true)
+			}
+			return fmt.Errorf("got %d: %s", gotQ, detail)
 		}
 		return nil
 	})

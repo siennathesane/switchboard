@@ -97,7 +97,7 @@ def _spawn(node_id: int, client: int, internal: int, data: Path,
         "--advertise", f"127.0.0.1:{internal}",
         "--data", str(data),
         "--expected-nodes", str(expected),
-        "--log", "warn",
+        "--log", os.environ.get("SB_BROKER_LOG_LEVEL", "warn"),
     ]
     if bootstrap:
         cmd += ["--bootstrap"]
