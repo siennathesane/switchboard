@@ -53,6 +53,33 @@ async fn shard_call(
     Channel::shard_reply(reply)
 }
 
+/// `shard_call` with a bounded retry for the declare race: between the
+/// meta write applying and the creating node's shard-side
+/// `CreateQueueData` landing, the shard answers 404 "on this shard" for a
+/// queue that exists — and the plain call would close the caller's
+/// channel. Only that specific race is retried; a genuine missing-queue
+/// 404 surfaces immediately.
+async fn shard_call_lenient(
+    node: &Arc<ClusterNode>,
+    shard: GroupId,
+    cmd: ShardCmd,
+) -> ChannelResult<ShardReply> {
+    const TRIES: usize = 8;
+    for attempt in 0..TRIES {
+        match shard_call(node, shard, cmd.clone()).await {
+            Err(e)
+                if e.code == 404
+                    && e.text.contains("on this shard")
+                    && attempt + 1 < TRIES =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop always returns")
+}
+
 /// Apply one meta command. The local topology view is refreshed before the
 /// reply so the acting connection immediately observes its own change
 /// (§4.4 visibility guarantee); other nodes converge on their next

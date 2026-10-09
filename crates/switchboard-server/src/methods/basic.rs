@@ -14,6 +14,7 @@ use crate::channel::ChannelResult;
 use crate::methods::reply_method;
 use crate::methods::send_frame;
 use crate::methods::shard_call;
+use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
 
 use crate::channel::Unacked;
@@ -28,7 +29,7 @@ impl Channel {
             .sub_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let reply = shard_call(
+        let reply = shard_call_lenient(
             node,
             shard,
             ShardCmd::Get {

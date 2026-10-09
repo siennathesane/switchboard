@@ -30,6 +30,8 @@ async fn heartbeat_timeout_disconnects_silent_client() {
                     sock,
                     node,
                     switchboard_server::ConnectionLimits {
+                    peer_ip: None,
+                    allow_remote_guest: true,
                         channel_max: 2047,
                         frame_max: 131_072,
                         heartbeat: 3,
@@ -77,6 +79,8 @@ async fn server_sends_heartbeats_when_idle() {
                     sock,
                     node,
                     switchboard_server::ConnectionLimits {
+                    peer_ip: None,
+                    allow_remote_guest: true,
                         channel_max: 2047,
                         frame_max: 131_072,
                         // A wide margin between the server's heartbeat

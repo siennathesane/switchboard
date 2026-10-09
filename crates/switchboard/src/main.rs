@@ -84,6 +84,18 @@ pub struct Cli {
     #[arg(long, env = "SWITCHBOARD_LOG", default_value = "info")]
     pub log: String,
 
+    /// Allow the well-known `guest` user from non-loopback addresses
+    /// (production should create real users instead).
+    #[arg(long, env = "SWITCHBOARD_ALLOW_REMOTE_GUEST", default_value_t = false)]
+    pub allow_remote_guest: bool,
+
+    /// Seconds to spend announcing departure on SIGTERM before exiting
+    /// anyway. The controller's dead-node reaper heals membership
+    /// regardless, so a leaderless meta group must not park the pod in
+    /// Terminating.
+    #[arg(long, env = "SWITCHBOARD_LEAVE_TIMEOUT_SECS", default_value_t = 10)]
+    pub leave_timeout_secs: u64,
+
     /// Client protocols on the gateway port, comma-separated:
     /// amqp,amqp1,mqtt,stomp,ws,http (default: all; `amqp` cannot be off).
     #[arg(long, env = "SWITCHBOARD_PROTOCOLS", default_value = "amqp,amqp1,mqtt,stomp,ws,http")]
@@ -234,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
     // the membership on its own.
     {
         let node2 = node.clone();
+        let leave_budget = std::time::Duration::from_secs(cli.leave_timeout_secs);
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -254,7 +267,18 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(unix))]
             tokio::signal::ctrl_c().await.ok();
-            let _ = node2.leave().await;
+            // Bounded graceful leave: announcing ForgetNode needs a meta
+            // quorum, and a node that IS part of that quorum leaving
+            // simultaneously with its peers can wait out the entire
+            // election budget. The controller's dead-node reaper heals
+            // membership regardless, so cap the ceremony and exit.
+            match tokio::time::timeout(leave_budget, node2.leave()).await {
+                Ok(Ok(())) => tracing::info!("left the cluster cleanly"),
+                Ok(Err(e)) => tracing::warn!("leave errored: {e}; exiting anyway"),
+                Err(_) => tracing::warn!(
+                    "leave exceeded {leave_budget:?} (meta quorum unreachable?); exiting anyway"
+                ),
+            }
             std::process::exit(0);
         });
     }
@@ -282,7 +306,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let limits = ConnectionLimits { heartbeat: cli.heartbeat, ..ConnectionLimits::default() };
+    let limits = ConnectionLimits {
+        heartbeat: cli.heartbeat,
+        allow_remote_guest: cli.allow_remote_guest,
+        ..ConnectionLimits::default()
+    };
     let protocols = switchboard_server::ProtocolConfig::from_list(&cli.protocols)
         .map_err(|e| anyhow::anyhow!("bad --protocols: {e}"))?;
 

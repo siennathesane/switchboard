@@ -45,11 +45,22 @@ pub struct ConnectionLimits {
     pub channel_max: u16,
     pub frame_max: u32,
     pub heartbeat: u16,
+    /// The client's IP, stamped per connection by the listener; None for
+    /// transports that cannot see one. Drives the guest-loopback rule.
+    pub peer_ip: Option<std::net::IpAddr>,
+    /// Allow the well-known `guest` user from non-loopback addresses.
+    pub allow_remote_guest: bool,
 }
 
 impl Default for ConnectionLimits {
     fn default() -> Self {
-        ConnectionLimits { channel_max: 2047, frame_max: 131_072, heartbeat: 60 }
+        ConnectionLimits {
+            channel_max: 2047,
+            frame_max: 131_072,
+            heartbeat: 60,
+            peer_ip: None,
+            allow_remote_guest: false,
+        }
     }
 }
 

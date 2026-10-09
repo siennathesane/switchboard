@@ -36,6 +36,18 @@ if [ -n "${SB_TIME_SCALE:-}" ]; then
     docker exec "sb$i" sh -c "printf 'SB_TIME_SCALE=%s\n' '$SB_TIME_SCALE' > /var/run/sb-env"
   done
 fi
+for var in SWITCHBOARD_ARGON2_M_KIB SWITCHBOARD_ARGON2_T SWITCHBOARD_ARGON2_P SWITCHBOARD_ALLOW_REMOTE_GUEST; do
+  if [ -n "${!var:-}" ]; then
+    for i in $(seq 1 "$N"); do
+      docker exec "sb$i" sh -c "printf '%s=%s\n' '$var' '${!var}' >> /var/run/sb-env"
+    done
+  fi
+done
+# The lab's control container drives the brokers as `guest` from remote
+# IPs; the brokers' guest-loopback rule needs the explicit opt-out.
+for i in $(seq 1 "$N"); do
+  docker exec "sb$i" sh -c "grep -q ALLOW_REMOTE /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_ALLOW_REMOTE_GUEST=1\n' >> /var/run/sb-env"
+done
 
 docker build -f "$JEPSEN_DIR/docker/Dockerfile.control" \
   -t switchboard-jepsen-control:latest "$JEPSEN_DIR"

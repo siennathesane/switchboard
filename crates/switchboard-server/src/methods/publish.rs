@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use switchboard_cluster::ClusterNode;
 use switchboard_core::error::BrokerError;
@@ -10,6 +11,7 @@ use crate::channel::ChannelResult;
 use crate::methods::inner_vhost;
 use crate::methods::send_frame;
 use crate::methods::shard_call;
+use crate::methods::shard_call_lenient;
 use crate::methods::take_confirm_seq;
 use crate::outbound::OutboundFrame;
 
@@ -49,11 +51,32 @@ impl Channel {
 
         let confirm_seq = take_confirm_seq(self)?;
         let topo = node.topology();
-        let Some(vhost) = topo.vhosts.get(&inner_vhost(self)).cloned() else {
+        let Some(mut vhost) = topo.vhosts.get(&inner_vhost(self)).cloned() else {
             return Err(BrokerError::invalid_path("vhost vanished").channel_level());
         };
-        let view = VhostView { vhost: &vhost };
-        let destinations = route(&view, &exchange, &routing_key, &props);
+        // The local topology view can lag a just-replicated declare: the
+        // queue/binding lands in the meta log before this node's cached
+        // view applies it, so an empty route refreshes the view and
+        // retries within a bounded window before concluding "unroutable".
+        // Treating that window as unroutable confirmed-and-dropped
+        // messages (the first-publish loss the scale test caught).
+        let deadline = tokio::time::Instant::now()
+            + switchboard_core::tempo::scale(Duration::from_millis(750));
+        let (vhost, destinations) = loop {
+            let destinations =
+                route(&VhostView { vhost: &vhost }, &exchange, &routing_key, &props);
+            if !destinations.is_empty() || tokio::time::Instant::now() >= deadline {
+                break (vhost, destinations);
+            }
+            node.refresh_topology().await;
+            match node.topology().vhosts.get(&inner_vhost(self)).cloned() {
+                Some(vh) => vhost = vh,
+                None => {
+                    return Err(BrokerError::invalid_path("vhost vanished").channel_level());
+                }
+            }
+            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(25))).await;
+        };
 
         if destinations.is_empty() {
             if mandatory {
@@ -157,7 +180,7 @@ impl Channel {
             let Some(shard) = vhost.queues.get(q).map(|qi| qi.shard) else {
                 continue;
             };
-            shard_call(
+            shard_call_lenient(
                 node,
                 shard,
                 ShardCmd::Enqueue {

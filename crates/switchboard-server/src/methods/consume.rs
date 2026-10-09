@@ -12,6 +12,7 @@ use crate::channel::ChannelResult;
 use crate::methods::inner_vhost;
 use crate::methods::send_frame;
 use crate::methods::shard_call;
+use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
 
 use crate::channel::LocalConsumer;
@@ -92,7 +93,7 @@ impl Channel {
             tag
         };
 
-        shard_call(
+        shard_call_lenient(
             node,
             shard,
             ShardCmd::RegisterSubscription {

@@ -1022,28 +1022,33 @@ impl ClusterNode {
         routing_key: &str,
         message: &StoredMessage,
     ) {
-        let topo = self.topology();
-        let Some(vh) = topo.vhosts.get(vhost) else { return };
-        let view = switchboard_core::topology::VhostView { vhost: vh };
-        let destinations = switchboard_core::routing::route(&view, exchange, routing_key, &message.properties);
         // This node's cached topology may lag a just-replicated declare
         // (bindings arrive via the meta log; the cache refreshes on this
-        // node's own writes). A route that comes up empty against a
-        // possibly-stale view gets one refreshed retry before the
-        // message is treated as genuinely unroutable.
-        let (vh, destinations) = if destinations.is_empty() {
-            self.refresh_topology().await;
+        // node's own writes). An empty route refreshes the view and
+        // re-resolves within a bounded window before the message is
+        // treated as genuinely unroutable — one refresh raced the declare
+        // in the scale test and silently dropped a confirmed message.
+        let deadline = tokio::time::Instant::now()
+            + switchboard_core::tempo::scale(std::time::Duration::from_millis(750));
+        let (vh, destinations) = loop {
             let topo = self.topology();
-            match topo.vhosts.get(vhost).cloned() {
-                Some(vh) => {
-                    let view = switchboard_core::topology::VhostView { vhost: &vh };
-                    let d = switchboard_core::routing::route(&view, exchange, routing_key, &message.properties);
-                    (std::borrow::Cow::Owned(vh), d)
-                }
-                None => return,
+            let Some(vh) = topo.vhosts.get(vhost).cloned() else { return };
+            let view = switchboard_core::topology::VhostView { vhost: &vh };
+            let d = switchboard_core::routing::route(
+                &view,
+                exchange,
+                routing_key,
+                &message.properties,
+            );
+            if !d.is_empty() || tokio::time::Instant::now() >= deadline {
+                break (vh, d);
             }
-        } else {
-            (std::borrow::Cow::Borrowed(vh), destinations)
+            drop(topo);
+            self.refresh_topology().await;
+            tokio::time::sleep(
+                switchboard_core::tempo::scale(std::time::Duration::from_millis(25)),
+            )
+            .await;
         };
         for q in destinations {
             let Some(shard) = vh.queues.get(&q).map(|qi| qi.shard) else { continue };

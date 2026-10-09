@@ -108,6 +108,8 @@ jobs:
           # unflagged). Identity was the old default; 0.25 is the same
           # headroom the jepsen lab gets.
           SB_TIME_SCALE: "0.25"
+          SWITCHBOARD_ARGON2_M_KIB: "2048"
+          SWITCHBOARD_ARGON2_T: "1"
         run: cargo nextest run -p switchboard-server --test soak_smoke -j 1
 
       - name: doc tests
@@ -136,6 +138,10 @@ jobs:
       # Windows stdio defaults to cp1252 and the suites print arrows
       # (U+2192); without this the first check name crashes the process.
       PYTHONUTF8: "1"
+      # Test-grade password hashing for the spawned brokers (same
+      # rationale as the rust-tests job).
+      SWITCHBOARD_ARGON2_M_KIB: "2048"
+      SWITCHBOARD_ARGON2_T: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -229,6 +235,11 @@ jobs:
       - name: run 9-combo matrix
         env:
           SB_TIME_SCALE: "0.25"
+          # The lab control container drives the brokers as `guest` from
+          # remote pod IPs; the brokers' guest-loopback rule needs this.
+          SWITCHBOARD_ALLOW_REMOTE_GUEST: "1"
+          SWITCHBOARD_ARGON2_M_KIB: "2048"
+          SWITCHBOARD_ARGON2_T: "1"
         run: |
           set -euo pipefail
           failed=0

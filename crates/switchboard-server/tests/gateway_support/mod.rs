@@ -145,16 +145,18 @@ pub async fn start_gateway_tagged(
     tokio::spawn(async move {
         let node = node2;
         loop {
-            let Ok((sock, _)) = listener.accept().await else {
+            let Ok((mut sock, _)) = listener.accept().await else {
                 continue;
             };
             let node2 = node.clone();
             let protocols = protocols.clone();
+            let mut limits = switchboard_server::ConnectionLimits::default();
+            limits.peer_ip = sock.peer_addr().ok().map(|a| a.ip());
             tokio::spawn(async move {
                 let _ = switchboard_server::protocols::serve_client(
                     sock,
                     node2,
-                    Default::default(),
+                    limits,
                     protocols,
                 )
                 .await;
