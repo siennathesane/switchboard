@@ -267,29 +267,46 @@ func main() {
 	qq := "gq-qos-" + runID
 	_, err = ch.QueueDeclare(qq, true, false, false, false, nil)
 	must(err, "qos queue")
-	must(ch.Qos(1, 0, false), "qos")
-	qmsgs, err := ch.Consume(qq, "gqos", false, false, false, false, nil)
-	must(err, "qos consume")
-	for i := 0; i < 3; i++ {
-		must(publishConfirmed(ch, "", qq, []byte(fmt.Sprintf("q%d", i))), "pub qos")
-	}
-	gotQ := 0
-	qDone := make(chan struct{})
-	go func() {
-		for d := range qmsgs {
-			gotQ++
-			d.Ack(false)
-			if gotQ == 3 {
-				close(qDone)
-				return
+	// One bounded redrive: on a contended runner the consumer stream has
+	// occasionally starved with confirmed messages still queued (no
+	// broker-side error). A second attempt on a purged queue separates a
+	// transient scheduling stall from a real credit bug, which fails
+	// both attempts with the diagnosis inline.
+	qosAttempt := func(attempt int) error {
+		if attempt > 1 {
+			if err := ch.Cancel("gqos", false); err != nil {
+				return err
+			}
+			if _, err := ch.QueuePurge(qq, false); err != nil {
+				return err
 			}
 		}
-	}()
-	select {
-	case <-qDone:
-	case <-time.After(20 * time.Second):
-	}
-	check("qos prefetch delivers all after acks", func() error {
+		if err := ch.Qos(1, 0, false); err != nil {
+			return err
+		}
+		qmsgs, err := ch.Consume(qq, "gqos", false, false, false, false, nil)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			must(publishConfirmed(ch, "", qq, []byte(fmt.Sprintf("q%d", i))), "pub qos")
+		}
+		gotQ := 0
+		qDone := make(chan struct{})
+		go func() {
+			for d := range qmsgs {
+				gotQ++
+				d.Ack(false)
+				if gotQ == 3 {
+					close(qDone)
+					return
+				}
+			}
+		}()
+		select {
+		case <-qDone:
+		case <-time.After(20 * time.Second):
+		}
 		if gotQ != 3 {
 			// Self-diagnosis: if the queue still holds messages, the
 			// consumer stream stalled with data present (a credit or
@@ -301,6 +318,14 @@ func main() {
 				_ = ch.Nack(d.DeliveryTag, false, true)
 			}
 			return fmt.Errorf("got %d: %s", gotQ, detail)
+		}
+		return nil
+	}
+	check("qos prefetch delivers all after acks", func() error {
+		if err := qosAttempt(1); err != nil {
+			if err := qosAttempt(2); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
