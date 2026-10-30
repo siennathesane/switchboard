@@ -82,9 +82,10 @@
 //! Embedded clients are ordinary loopback clients: PLAIN credentials, the
 //! guest-loopback rule, and the replicated permission regexes all apply.
 //! The documented coverage of `authorize_ch` gates is inherited
-//! *including its gaps* (publish and exchange-bind are ungated today;
-//! that belongs to a separate `fix(broker):` hardening track) — no
-//! bypass, no divergence.
+//! *including its gaps* (publish gained its `write`-on-exchange gate with
+//! the control-plane hardening — methods/publish.rs:54-69; exchange-bind
+//! is still ungated today and remains on the separate `fix(broker):`
+//! hardening track) — no bypass, no divergence.
 //!
 //! One further inherited behavior to know about: the broker's janitor
 //! expires prepared transactions on every tick and the shard state

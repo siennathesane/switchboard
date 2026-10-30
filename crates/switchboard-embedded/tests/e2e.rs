@@ -445,17 +445,41 @@ async fn authz_errors_and_gates() {
         "queue_delete gate (Configure), got {err:?}"
     );
 
-    // GAP PINNING (embedded design §6/§7-5): publish is UNGATED today —
-    // Channel::publish never calls authorize_ch (the import at
-    // methods/publish.rs:13 is unused). The restricted user's publish to a
-    // denied-* queue SUCCEEDS. This test asserts current behavior so a
-    // future authz hardening change lands as a visible diff here.
+    // GAP FLIPPED (embedded design §6/§7-5): the publish gap this test
+    // used to pin landed in the control-plane hardening — Basic.Publish
+    // now requires `write` on the exchange resource
+    // (methods/publish.rs:54-69, `authorize_ch(.., Perm::Write, &exchange)`).
+    // The restricted user's write regex (`^allowed-.*`) does not match the
+    // default exchange `""`, so the publish to a denied-* queue is refused
+    // before any routing work and nothing enqueues.
+    //
+    // Basic.Publish itself is fire-and-forget, so the gate is observed
+    // through `publish_confirmed`: the 403 Channel.Close fails the
+    // outstanding confirm waiter with the decoded close error
+    // (driver.rs `fail_channel_waiters`; error.rs `decode_channel_close`
+    // maps 403 to OpError::AccessRefused). That resolution is race-free:
+    // the waiter is registered before the publish frames are written.
     let rch = rconn.open_channel().await.expect("channel");
-    rch.publish("", "denied-q", MessageProperties::default(), b"gap".to_vec())
+    let err = rch
+        .publish_confirmed(
+            "",
+            "denied-q",
+            MessageProperties::default(),
+            b"gap".to_vec(),
+        )
         .await
-        .expect("publish is not gated today (see methods/publish.rs:13; flip this when the hardening change lands)");
-    let got = gch.get("denied-q", true).await.expect("guest get");
-    assert_eq!(got.expect("the ungated publish landed").body, b"gap");
+        .expect_err("publish gate (Write on the exchange resource)");
+    assert!(
+        is_access_refused(&err),
+        "publish gate (Write on \"\"), got {err:?}"
+    );
+    // A refused publish must not enqueue anywhere (the gate runs before
+    // routing, methods/publish.rs:54-58): the guest still sees an empty
+    // queue.
+    assert!(
+        gch.get("denied-q", true).await.expect("guest get").is_none(),
+        "the refused publish landed anyway"
+    );
 
     // An unrestricted user (no permissions entry) passes everything
     // (topology/mod.rs:170-176).
