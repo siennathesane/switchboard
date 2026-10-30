@@ -472,6 +472,18 @@ async fn read_frame<R: AsyncRead + Unpin>(
     }
     // §2.3 frame header: size (4), doff (1), type (1), channel (2).
     let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    // The wire size is peer-controlled (up to 4 GiB) and the frame may
+    // still precede SASL authentication: cap it before the body
+    // allocation instead of trusting it (code-scanning alert #11).
+    if size > super::PREAUTH_MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "amqp1: frame size {size} exceeds the pre-auth frame cap {}",
+                super::PREAUTH_MAX_FRAME_BYTES
+            ),
+        ));
+    }
     let doff = head[4] as usize;
     if doff < 2 {
         return Err(std::io::Error::new(
@@ -648,5 +660,54 @@ async fn teardown_link(ctx: &Arc<BridgeContext>, link: &Arc<tokio::sync::Mutex<L
     if let Some(consumer) = l.consumer.take() {
         consumer.stop(&ctx.node).await;
         shared::delete_queue(ctx, &consumer.queue).await;
+    }
+}
+
+#[cfg(test)]
+mod read_frame_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_wire_size_before_allocating() {
+        // 8-byte transport header announcing a ~4 GiB frame (doff 2): must
+        // fail fast with InvalidData before the body vector is created.
+        let mut stream: &[u8] = &[0xFF, 0xFF, 0xF0, 0x00, 2, 0x00, 0x00, 0x00];
+        let err = read_frame(&mut stream).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("pre-auth frame cap"));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_size_just_above_the_cap() {
+        let cap = super::super::PREAUTH_MAX_FRAME_BYTES;
+        let mut stream: &[u8] = &[
+            ((cap + 1) >> 24) as u8,
+            ((cap + 1) >> 16) as u8,
+            ((cap + 1) >> 8) as u8,
+            (cap + 1) as u8,
+            2,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        let err = read_frame(&mut stream).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_frame_still_decodes_a_small_frame() {
+        let bytes = frames::encode_frame(
+            0,
+            codes::BEGIN,
+            vec![
+                Value::Null,
+                Value::UInt(1),
+                Value::UInt(100),
+                Value::UInt(100),
+            ],
+        );
+        let mut stream: &[u8] = &bytes;
+        let f = read_frame(&mut stream).await.unwrap().unwrap();
+        assert_eq!(f.code(), Some(codes::BEGIN));
     }
 }

@@ -571,3 +571,25 @@ async fn publish_and_confirm(amqp: &mut support::TestClient, queue: &str, body: 
     let m = tokio::time::timeout(Duration::from_secs(10), amqp.expect(1)).await.unwrap().unwrap();
     assert!(matches!(m, Method::BasicAck { .. }), "expected publisher confirm, got {m:?}");
 }
+
+// ---------------------------------------------------------------------
+// Pre-auth allocation cap (code-scanning alert #11)
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn amqp10_preauth_oversized_frame_size_closes_the_connection() {
+    let (addr, _n) = gw().await;
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
+    // The server answers with sasl-mechanisms; read it so the write of
+    // the hostile header is not racing the greeting.
+    let mut buf = [0u8; 2048];
+    let _ = sock.read(&mut buf).await.unwrap();
+    // 8-byte transport header announcing a ~4 GiB frame (doff 2, type 0):
+    // the server must refuse it before allocating the body vector.
+    sock.write_all(&[0xFF, 0xFF, 0xF0, 0x00, 2, 0x00, 0x00, 0x00]).await.unwrap();
+    let mut tail = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), sock.read_to_end(&mut tail))
+        .await
+        .expect("server must close the connection");
+}
