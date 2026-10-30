@@ -135,6 +135,21 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
     }
     let content_length: Option<usize> =
         headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok());
+    // The body length is peer-controlled and this frame may still be the
+    // unauthenticated CONNECT: cap it before the allocation instead of
+    // letting a bogus content-length (e.g. 999999999999) OOM the node
+    // (code-scanning alert #10).
+    if let Some(len) = content_length {
+        if len > super::PREAUTH_MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "stomp: content-length {len} exceeds the pre-auth frame cap {}",
+                    super::PREAUTH_MAX_FRAME_BYTES
+                ),
+            ));
+        }
+    }
     let mut body = Vec::new();
     match content_length {
         Some(len) => {
@@ -144,7 +159,9 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
             r.read_exact(&mut term).await?; // NUL
         }
         None => {
-            // Read until NUL.
+            // Read until NUL, bounded by the same pre-auth cap: a peer
+            // streaming body bytes without a content-length must not
+            // buffer unboundedly either.
             let mut b = [0u8; 1];
             loop {
                 if r.read_exact(&mut b).await? == 0 {
@@ -152,6 +169,12 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
                 }
                 if b[0] == 0 {
                     break;
+                }
+                if body.len() >= super::PREAUTH_MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stomp: frame body without content-length exceeds the pre-auth frame cap",
+                    ));
                 }
                 body.push(b[0]);
             }
@@ -813,5 +836,52 @@ mod edge_tests {
     fn destination_exchange_without_key_is_error() {
         let d = parse_destination("/exchange/only-name");
         assert!(d.is_err());
+    }
+}
+
+#[cfg(test)]
+mod preauth_cap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_content_length_before_allocating() {
+        // A pre-auth CONNECT announcing a ~1 TiB body: must fail fast with
+        // InvalidData, never reach body.resize.
+        let data = b"CONNECT\ncontent-length:999999999999\n\n";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("content-length"));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_content_length_above_the_cap() {
+        let over = super::super::PREAUTH_MAX_FRAME_BYTES + 1;
+        let data = format!("CONNECT\ncontent-length:{over}\n\n");
+        let mut reader = tokio::io::BufReader::new(data.as_bytes());
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_unbounded_body_without_content_length() {
+        // No content-length: the read-until-NUL loop must also stop at the
+        // pre-auth cap instead of buffering a never-terminated body.
+        let cap = super::super::PREAUTH_MAX_FRAME_BYTES;
+        let mut data = b"SEND\ndestination:/queue/q\n\n".to_vec();
+        data.extend(std::iter::repeat(b'x').take(cap + 1)); // no NUL anywhere
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("without content-length"));
+    }
+
+    #[tokio::test]
+    async fn read_frame_still_accepts_a_normal_content_length_frame() {
+        let data = b"CONNECT\naccept-version:1.2\ncontent-length:2\n\nhi\0";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let f = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(f.command, "CONNECT");
+        assert_eq!(f.body, b"hi");
     }
 }

@@ -32,3 +32,19 @@ pub use detect::{classify, Detected};
 pub use gateway::serve_client;
 pub use shared::BridgeContext;
 pub use shared::ProtocolConfig;
+
+/// Defensive ceiling on a single *pre-authentication* frame for the
+/// bridged protocols: the STOMP body announced by `content-length`, the
+/// AMQP 1.0 frame size declared in the transport header, and the MQTT
+/// remaining-length (code-scanning alerts #10/#11/#12).
+///
+/// The native AMQP 0-9-1 session enforces the configured/negotiated
+/// `ConnectionLimits::frame_max` (default 128 KiB) on every read, but
+/// each bridge reads its first wire frame — STOMP `CONNECT`, the AMQP 1.0
+/// pre-SASL frame, the MQTT `CONNECT` — *before any credentials have
+/// been verified*, so on that path a peer-controlled length must never
+/// drive the allocation. Eight MiB sits far above any legitimate
+/// handshake frame (the AMQP 0-9-1 default frame budget is 128 KiB) and
+/// far below memory-exhaustion territory, and gives one consistent,
+/// documented bound for every bridge.
+pub(crate) const PREAUTH_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
