@@ -39,3 +39,6 @@ node_modules/
 
 # Compiled go publisher from the scale test
 /harness/clients/go/loadpub
+
+# Compiled go AMQP 0-9-1 conformance suite binary
+/harness/clients/go/amqp091_suite
