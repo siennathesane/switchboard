@@ -895,7 +895,22 @@ impl ClusterNode {
                     deleted,
                 };
                 if let Some(sink) = self.consumer_sinks.read().await.get(&sub) {
-                    let _ = sink.deliveries.send(delivery);
+                    // A failed send means the channel's delivery pump is
+                    // gone (socket died without a cancel): the hold stays
+                    // until the client lifecycle requeues it. Log it —
+                    // this path used to strand deliveries in total
+                    // silence, which made consumer-stream stalls
+                    // ("consumed=[]" in the go harness) undiagnosable.
+                    if sink.deliveries.send(delivery).is_err() {
+                        tracing::warn!(
+                            node = self.id,
+                            group,
+                            sub = ?sub,
+                            queue = %queue,
+                            seq,
+                            "deliver: local consumer sink gone; hold stays until client lifecycle requeues"
+                        );
+                    }
                     return;
                 }
                 // The consumer lives on another node: hand it over.
@@ -940,6 +955,16 @@ impl ClusterNode {
                     //   until it lands (at-least-once): a stranded hold
                     //   is never acked by anyone.
                     Ok(InternalResponse::Admin(AdminResponse::NotFound)) => {
+                        // Diagnostic: a zombie sub here used to spin the
+                        // unregister wheel in total silence.
+                        tracing::warn!(
+                            node = self.id,
+                            group,
+                            sub = ?sub,
+                            queue = %queue,
+                            seq,
+                            "deliver: owner reports consumer sink gone; unregistering zombie subscription"
+                        );
                         let node = self.clone();
                         tokio::spawn(async move {
                             let cmd = BrokerCommand::Shard(
@@ -962,6 +987,20 @@ impl ClusterNode {
                         });
                     }
                     _ => {
+                        // Diagnostic: the release-and-retry wheel used to
+                        // run silently; a persistently unreachable owner
+                        // looks on clients exactly like a starved
+                        // consumer stream ("consumed=[]" with no
+                        // broker-side error anywhere in the logs).
+                        tracing::warn!(
+                            node = self.id,
+                            group,
+                            sub = ?sub,
+                            queue = %queue,
+                            seq,
+                            error = ?response.as_ref().err().map(|e| e.to_string()),
+                            "deliver rpc failed; releasing hold for redelivery"
+                        );
                         let node = self.clone();
                         tokio::spawn(async move {
                             let cmd = BrokerCommand::Shard(

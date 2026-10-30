@@ -68,15 +68,44 @@ impl Channel {
             Ok((final_name, 0, 0))
         } else {
             // Live counts come from the owning shard (linearizable read).
-            let (depth, consumers) = match Self::stats_lenient(node, shard, &final_name).await?
-            {
-                ShardReply::Stats {
+            match Self::stats_lenient(node, shard, &final_name).await {
+                Ok(ShardReply::Stats {
                     depth,
                     consumer_count,
-                } => (depth, consumer_count),
-                _ => (0, 0),
-            };
-            Ok((final_name, depth, consumers))
+                }) => Ok((final_name, depth, consumer_count)),
+                Ok(_) => Ok((final_name, 0, 0)),
+                // Lost-drive heal: the queue exists in meta but the creating
+                // node's shard-side `CreateQueueData` never landed — it was
+                // paused or killed in the window between the meta commit
+                // and the shard write (chaos / restart). Nothing re-drives
+                // `CreateQueueData` from the meta state machine (an existing
+                // declare replies `created: false` forever), so the queue
+                // would 404 "on this shard" for every subsequent passive
+                // declare, get, publish and delete — permanently. Re-driving
+                // it here is safe: the shard SM's `CreateQueueData` is
+                // idempotent (`entry().or_insert_with`) and raft-durable, so
+                // the repair survives restarts. An active declare asserts
+                // usability (§4.8's declaration contract), so it may repair;
+                // a passive declare stays assertion-only and still 404s.
+                Err(e) if !passive && e.code == 404 => {
+                    tracing::warn!(
+                        queue = %final_name,
+                        shard,
+                        "queue exists in meta without shard-side data; re-driving CreateQueueData"
+                    );
+                    shard_call(
+                        node,
+                        shard,
+                        ShardCmd::CreateQueueData {
+                            queue: final_name.clone(),
+                            policy,
+                        },
+                    )
+                    .await?;
+                    Ok((final_name, 0, 0))
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -97,14 +126,22 @@ impl Channel {
     ) -> ChannelResult<u32> {
         let shard = self.queue_shard(node, queue).await?;
         // Linearizable stats feed the if_empty/if_unused assertions, which
-        // the meta state machine re-checks under raft.
-        let (depth, consumers) = match Self::stats_lenient(node, shard, queue).await?
-        {
-            ShardReply::Stats {
+        // the meta state machine re-checks under raft. A 404 from the shard
+        // means its queue data is missing — the lost-drive state (meta
+        // committed, the creating node died before `CreateQueueData` landed)
+        // or the create-race window. Either way the queue provably holds
+        // zero messages (an enqueue requires queue data) and zero consumers
+        // (a subscription registration requires queue data), so the
+        // assertions are vacuously satisfied and the delete must proceed —
+        // otherwise the queue could never be deleted by anyone.
+        let (depth, consumers) = match Self::stats_lenient(node, shard, queue).await {
+            Ok(ShardReply::Stats {
                 depth,
                 consumer_count,
-            } => (depth, consumer_count),
-            _ => (0, 0),
+            }) => (depth, consumer_count),
+            Ok(_) => (0, 0),
+            Err(e) if e.code == 404 => (0, 0),
+            Err(e) => return Err(e),
         };
         let reply = meta_call(
             node,
