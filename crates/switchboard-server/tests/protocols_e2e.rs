@@ -184,6 +184,99 @@ async fn mqtt_qos1_publish_gets_puback() {
     assert_eq!(&body[..2], &42u16.to_be_bytes());
 }
 
+/// Alert #26: client ids `a/b` and `a_b` used to sanitize to the SAME
+/// session queue, so two persistent sessions silently shared (and raced
+/// over) one queue. With the injective encoding each client owns a
+/// distinct durable session: both subscribe to the same filter and BOTH
+/// receive every published message.
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_colliding_client_ids_get_distinct_sessions() {
+    let _gateway_guard = lock().await;
+    let (addr, guard) = start_gateway(Default::default()).await;
+    let node = guard.0.clone();
+
+    // Persistent (clean_session=false) clients on the colliding pair.
+    let mut xs = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    xs.write_all(&mqtt_connect_persistent("a/b", "guest", "guest"))
+        .await
+        .unwrap();
+    let (_t, _) = with_timeout(mqtt_read(&mut xs), 10).await.unwrap().unwrap();
+    let mut ys = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    ys.write_all(&mqtt_connect_persistent("a_b", "guest", "guest"))
+        .await
+        .unwrap();
+    let (_t, _) = with_timeout(mqtt_read(&mut ys), 10).await.unwrap().unwrap();
+
+    // Both subscribe to the same filter.
+    for c in [&mut xs, &mut ys] {
+        c.write_all(&mqtt_subscribe(1, "sessions/two", 0))
+            .await
+            .unwrap();
+        let (t, _) = with_timeout(mqtt_read(c), 10).await.unwrap().unwrap();
+        assert_eq!(t, 9, "expected SUBACK");
+    }
+
+    // The two session queues are distinct broker entities.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let topo = node.topology();
+        let vh = topo.vhosts.get("/");
+        let both = vh
+            .map(|v| {
+                v.queues.contains_key("mqtt-session-a%2fb")
+                    && v.queues.contains_key("mqtt-session-a%5fb")
+            })
+            .unwrap_or(false);
+        if both {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both distinct session queues must exist"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Three messages; a shared queue would split them between the two
+    // competing consumers — distinct sessions deliver all three to each.
+    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&mqtt_connect("publisher")).await.unwrap();
+    let (_t, _) = with_timeout(mqtt_read(&mut pubc), 10)
+        .await
+        .unwrap()
+        .unwrap();
+    for i in 0..3u8 {
+        pubc.write_all(&mqtt_publish("sessions/two", &[i], 0, 0))
+            .await
+            .unwrap();
+    }
+
+    async fn drain_three(c: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut got = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while got.len() < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out with only {:?} of 3 messages",
+                got
+            );
+            let (t, body) = with_timeout(mqtt_read(c), 20).await.unwrap().unwrap();
+            assert_eq!(t, 3, "expected PUBLISH");
+            let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+            assert_eq!(&body[2..2 + tlen], b"sessions/two");
+            got.push(body[2 + tlen]);
+        }
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2], "each message exactly once");
+        got
+    }
+
+    let from_x = drain_three(&mut xs).await;
+    let from_y = drain_three(&mut ys).await;
+    assert_eq!(from_x, from_y, "both clients saw the same stream");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mqtt_cross_protocol_to_amqp() {
     let _gateway_guard = lock().await;

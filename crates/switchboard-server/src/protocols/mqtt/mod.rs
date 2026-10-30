@@ -67,18 +67,28 @@ fn matching_retained(ctx: &BridgeContext, filter: &str) -> Vec<(String, StoredMe
         .collect()
 }
 
-/// Durable session-queue name for a client id (sanitized for AMQP naming).
+/// Durable session-queue name for a client id — an INJECTIVE encoding
+/// (code-scanning alert #26).
+///
+/// The old mapping collapsed every character outside `[A-Za-z0-9_-]` to
+/// `_`, so client ids `a/b` and `a_b` (also `a:b`, `a b`, …) all mapped
+/// to the same `mqtt-session-a_b`: with `clean_session = false` a
+/// colliding client attached to — and drained — another client's
+/// durable session queue.
+///
+/// The encoding keeps `[A-Za-z0-9-]` as-is (so plain client ids keep
+/// exactly the queue names they always had, ACL regexes included) and
+/// escapes every other UTF-8 byte as `%XX` (including `_` → `%5f` and
+/// `%` → `%25`, so every `%` in the output starts an escape). Distinct
+/// client ids therefore always map to distinct queue names.
 pub fn session_queue_name(client_id: &str) -> String {
-    let safe: String = client_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut safe = String::with_capacity(client_id.len());
+    for byte in client_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' => safe.push(byte as char),
+            other => safe.push_str(&format!("%{other:02x}")),
+        }
+    }
     format!("mqtt-session-{safe}")
 }
 
@@ -522,4 +532,88 @@ async fn cleanup_consumer(ctx: &Arc<BridgeContext>, consumer: &BridgeConsumer, t
 /// Re-exported for tests: the MQTT filter conversion.
 pub fn convert_filter(filter: &str) -> String {
     mqtt_to_amqp_filter(filter)
+}
+
+#[cfg(test)]
+mod session_name_tests {
+    use super::*;
+
+    /// The alert's exact collision: `a/b` and `a_b` must be distinct.
+    #[test]
+    fn slash_and_underscore_ids_no_longer_collide() {
+        assert_ne!(
+            session_queue_name("a/b"),
+            session_queue_name("a_b"),
+            "the alert-#26 collision pair must map to distinct sessions"
+        );
+        // Every ambiguous separator is escaped distinctly.
+        let distinct = [
+            session_queue_name("a/b"),
+            session_queue_name("a_b"),
+            session_queue_name("a:b"),
+            session_queue_name("a b"),
+            session_queue_name("a.b"),
+            session_queue_name("a%2fb"),
+            session_queue_name("a-b"),
+            session_queue_name("ab"),
+        ];
+        for (i, x) in distinct.iter().enumerate() {
+            for y in distinct.iter().skip(i + 1) {
+                assert_ne!(x, y, "two client ids collapsed to one session queue");
+            }
+        }
+    }
+
+    /// Injectivity over a tricky corpus: no two ids share a queue name.
+    #[test]
+    fn encoding_is_injective_over_a_tricky_corpus() {
+        let ids = [
+            "a",
+            "a_b",
+            "a/b",
+            "a:b",
+            "a b",
+            "a%b",
+            "a%20b",
+            "a-b",
+            "A",
+            "a%2f",
+            "a_2f",
+            "mqtt-session-x",
+            "device/1/sensor",
+            "device_1_sensor",
+            "dévice",
+            "设备-1",
+            "",
+            "-",
+            "%",
+            "_",
+            "__",
+            "%5f",
+            "a+b",
+            "a=b",
+            "a#b",
+            "a#b/",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            assert!(seen.insert(session_queue_name(id)), "collision on {id:?}");
+        }
+    }
+
+    /// Plain client ids keep their historical queue names verbatim, so
+    /// existing ACL regexes over session-queue names stay valid.
+    #[test]
+    fn plain_ids_keep_their_historical_names() {
+        assert_eq!(session_queue_name("svc8"), "mqtt-session-svc8");
+        assert_eq!(session_queue_name("device-42"), "mqtt-session-device-42");
+    }
+
+    /// The escape character itself is escaped, so decoding is unambiguous.
+    #[test]
+    fn percent_and_underscore_are_escaped() {
+        assert_eq!(session_queue_name("a%b"), "mqtt-session-a%25b");
+        assert_eq!(session_queue_name("a_b"), "mqtt-session-a%5fb");
+        assert_eq!(session_queue_name("a/b"), "mqtt-session-a%2fb");
+    }
 }
