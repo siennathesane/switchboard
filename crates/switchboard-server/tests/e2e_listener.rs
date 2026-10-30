@@ -109,8 +109,17 @@ fn non_loopback_ip() -> Option<std::net::IpAddr> {
 async fn listener_run_stamps_peer_ip_for_guest_loopback_rule() {
     let internal = format!("127.0.0.1:{}", free_port());
     let client = format!("127.0.0.1:{}", free_port());
-    let (node, _unused) =
-        start_broker_node("peergw", 1, client.clone(), internal, vec![], true, 1, vec![]).await;
+    let (node, _unused) = start_broker_node(
+        "peergw",
+        1,
+        client.clone(),
+        internal,
+        vec![],
+        true,
+        1,
+        vec![],
+    )
+    .await;
 
     // All-interface bind so the same listener is reachable both via
     // loopback and via the host's non-loopback address.
@@ -134,7 +143,9 @@ async fn listener_run_stamps_peer_ip_for_guest_loopback_rule() {
 
     // Loopback half: `guest`/`guest` through the real listener succeeds.
     let loopback = format!("127.0.0.1:{port}");
-    let c = support::connect_and_open(&loopback, "/").await.expect("loopback guest login");
+    let c = support::connect_and_open(&loopback, "/")
+        .await
+        .expect("loopback guest login");
     drop(c);
 
     // Non-loopback half: same credentials from the host's LAN address are
