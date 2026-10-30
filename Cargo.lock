@@ -2323,6 +2323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchboard-capi"
+version = "1.0.0-rc.1"
+dependencies = [
+ "switchboard-cluster",
+ "switchboard-embedded",
+ "tokio",
+]
+
+[[package]]
 name = "switchboard-cluster"
 version = "1.0.0-rc.1"
 dependencies = [

@@ -1,0 +1,19 @@
+[package]
+name = "switchboard-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable C ABI over the switchboard-embedded in-process broker"
+
+[lib]
+name = "switchboard_capi"
+# cdylib: the shared library foreign embedders load (libswitchboard_capi.dylib/.so).
+# rlib: lets this workspace's own Rust tests drive the exact same extern fns.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+switchboard-embedded = { workspace = true }
+switchboard-cluster = { workspace = true }
+tokio = { workspace = true }
