@@ -136,22 +136,44 @@ pub async fn authorize(
 }
 
 /// One bridge connection's identity: a real connection id (so shard
-/// consumer-exclusivity semantics work) and a subscription counter.
+/// consumer-exclusivity semantics work), the authenticated username, and
+/// a subscription counter.
 pub struct BridgeContext {
     pub node: Arc<ClusterNode>,
     pub vhost: String,
+    /// The authenticated user this bridge connection acts as. Every
+    /// broker-mutating bridge operation is gated on this name through the
+    /// same replicated permissions table the direct AMQP path uses
+    /// (code-scanning alert #8) — a bridge protocol can no longer
+    /// declare/bind/publish/consume past a user's regexes.
+    pub user: String,
     pub conn: ConnectionId,
     sub_counter: AtomicU64,
 }
 
 impl BridgeContext {
     /// Create a context with a real cluster connection id (so shard-side
-    /// consumer-exclusivity semantics work for bridge clients too).
+    /// consumer-exclusivity semantics work for bridge clients too) acting
+    /// as the DEFAULT user. Protocol servers should prefer
+    /// [`BridgeContext::create_as`] with the credentials they just
+    /// authenticated.
     pub async fn create(node: Arc<ClusterNode>, vhost: String) -> Self {
+        Self::create_as(
+            node,
+            vhost,
+            switchboard_wire::constants::DEFAULT_USER.to_string(),
+        )
+        .await
+    }
+
+    /// Create a context acting as `user` (the name that passed
+    /// [`authorize`] for this connection).
+    pub async fn create_as(node: Arc<ClusterNode>, vhost: String, user: String) -> Self {
         let conn = node.new_connection_id().await;
         BridgeContext {
             node,
             vhost,
+            user,
             conn,
             sub_counter: AtomicU64::new(1),
         }
@@ -159,6 +181,27 @@ impl BridgeContext {
 
     pub fn next_sub(&self) -> SubscriptionId2 {
         SubscriptionId2(self.sub_counter.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Authorization gate mirroring the direct AMQP path's `authorize_ch`:
+    /// a pure read on the local topology view for the authenticated user.
+    fn authorize(
+        &self,
+        perm: switchboard_core::topology::Perm,
+        resource: &str,
+    ) -> BridgeResult<()> {
+        if self
+            .node
+            .topology()
+            .authorize(&self.user, &self.vhost, perm, resource)
+        {
+            return Ok(());
+        }
+        Err(BrokerError::access_refused(format!(
+            "{perm:?} access to {resource:?} in vhost {:?} refused for user {:?}",
+            self.vhost, self.user
+        ))
+        .channel_level())
     }
 }
 
@@ -175,6 +218,9 @@ pub async fn declare_queue(
     exclusive: bool,
     auto_delete: bool,
 ) -> BridgeResult<GroupId> {
+    // Configure permission on the queue name, like the direct path's
+    // QueueDeclare arm (code-scanning alert #8).
+    ctx.authorize(switchboard_core::topology::Perm::Configure, name)?;
     let reply = ctx
         .node
         .write(
@@ -231,6 +277,9 @@ pub async fn declare_queue(
 /// view is refreshed before returning so the very next publish observes
 /// the new binding (§4.4 visibility).
 pub async fn bind(ctx: &BridgeContext, exchange: &str, queue: &str, rk: &str) -> BridgeResult<()> {
+    // Configure permission on the queue, like the direct path's
+    // QueueBind arm (code-scanning alert #8).
+    ctx.authorize(switchboard_core::topology::Perm::Configure, queue)?;
     ctx.node
         .write(
             switchboard_cluster::META_GROUP,
@@ -314,6 +363,22 @@ pub async fn publish(
     routing_key: &str,
     message: StoredMessage,
 ) -> BridgeResult<bool> {
+    // Write permission on the exchange, plus the routing key on topic
+    // exchanges — the same two-step gate the direct AMQP publish path
+    // applies, checked before any routing work so a refused publish
+    // enqueues nowhere (code-scanning alert #8).
+    ctx.authorize(switchboard_core::topology::Perm::Write, exchange)?;
+    let topic_exchange = {
+        let topo = ctx.node.topology();
+        topo.vhosts
+            .get(&ctx.vhost)
+            .and_then(|v| v.exchanges.get(exchange))
+            .map(|e| e.kind == switchboard_core::model::ExchangeKind::Topic)
+            .unwrap_or(false)
+    };
+    if topic_exchange {
+        ctx.authorize(switchboard_core::topology::Perm::Write, routing_key)?;
+    }
     let node = &ctx.node;
     let topo = node.topology();
     let Some(vhost) = topo.vhosts.get(&ctx.vhost).cloned() else {
@@ -371,6 +436,9 @@ impl BridgeConsumer {
         no_ack: bool,
         tag: &str,
     ) -> BridgeResult<(Arc<BridgeConsumer>, mpsc::UnboundedReceiver<Delivery>)> {
+        // Read permission on the queue, like the direct path's
+        // BasicConsume/BasicGet arms (code-scanning alert #8).
+        ctx.authorize(switchboard_core::topology::Perm::Read, queue)?;
         let node = &ctx.node;
         let sub = node.next_subscription_id();
         let (dtx, drx) = mpsc::unbounded_channel::<Delivery>();

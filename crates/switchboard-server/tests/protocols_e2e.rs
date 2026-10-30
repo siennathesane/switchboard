@@ -2709,3 +2709,235 @@ async fn stomp_client_ack_on_fresh_gateway_settles() {
         Method::BasicGetEmpty { .. }
     ));
 }
+
+// ---------------------------------------------------------------------
+// Bridge authorization: MQTT/STOMP sessions act as their authenticated
+// user and hit the same permission gates as the direct AMQP path
+// (code-scanning alert #8).
+// ---------------------------------------------------------------------
+
+/// CONNECT with credentials and clean_session=false (persistent session:
+/// the subscription queue is the client-named `mqtt-session-<id>`).
+fn mqtt_connect_persistent(client_id: &str, user: &str, pass: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&4u16.to_be_bytes());
+    body.extend_from_slice(b"MQTT");
+    body.push(4); // level
+    body.push(0x80 | 0x40); // username + password, clean session NOT set
+    body.extend_from_slice(&60u16.to_be_bytes());
+    body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+    body.extend_from_slice(client_id.as_bytes());
+    body.extend_from_slice(&(user.len() as u16).to_be_bytes());
+    body.extend_from_slice(user.as_bytes());
+    body.extend_from_slice(&(pass.len() as u16).to_be_bytes());
+    body.extend_from_slice(pass.as_bytes());
+    let mut out = vec![0x10];
+    gateway_support::mqtt_remaining(body.len(), &mut out);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Create a user and install their permissions directly through the
+/// node's meta write path (the same commands the admin API issues).
+async fn put_user(
+    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
+    user: &str,
+    pass: &str,
+    configure: &str,
+    write: &str,
+    read: &str,
+) {
+    use switchboard_cluster::BrokerCommand;
+    use switchboard_core::topology::MetaCmd;
+    use switchboard_core::topology::Permissions;
+    for cmd in [
+        MetaCmd::CreateUser {
+            name: user.to_string(),
+            password: pass.to_string(),
+        },
+        MetaCmd::SetPermissions {
+            user: user.to_string(),
+            vhost: "/".to_string(),
+            permissions: Permissions {
+                configure: configure.to_string(),
+                write: write.to_string(),
+                read: read.to_string(),
+            },
+        },
+    ] {
+        node.write(switchboard_cluster::META_GROUP, BrokerCommand::Meta(cmd))
+            .await
+            .unwrap();
+    }
+    node.refresh_topology().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_sessions_are_permission_gated_as_their_user() {
+    let _gateway_guard = lock().await;
+    support::init_tracing();
+    let (addr, guard) = start_gateway(Default::default()).await;
+    let node = guard.0.clone();
+
+    // svc8: configure+read only its own MQTT session queue; write only
+    // its own topics on the topic exchange (write on the exchange is
+    // always checked first, so `amq.topic` must be granted too).
+    put_user(
+        &node,
+        "svc8",
+        "pw8",
+        "^mqtt-session-svc8$",
+        "^amq\\.topic$|^svc8\\..*$",
+        "^mqtt-session-svc8$",
+    )
+    .await;
+    // svc9: may declare its session queue (configure) but may read
+    // NOTHING — the consume gate must refuse.
+    put_user(
+        &node,
+        "svc9",
+        "pw9",
+        "^mqtt-session-svc9$|^somewhere$",
+        "^$",
+        "^nothing-at-all$",
+    )
+    .await;
+
+    // Admin observer: a queue bound to everything on amq.topic.
+    let mut eye = support::connect_and_open(&addr, "/").await.unwrap();
+    eye.send_method(
+        1,
+        &Method::QueueDeclare {
+            ticket: 0,
+            queue: "bridge-authz-eye".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    eye.expect(1).await.unwrap();
+    eye.send_method(
+        1,
+        &Method::QueueBind {
+            ticket: 0,
+            queue: "bridge-authz-eye".into(),
+            exchange: "amq.topic".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    eye.expect(1).await.unwrap();
+
+    // MQTT as svc8 (persistent session): the subscription's queue is
+    // svc8's own, so declare/bind/consume all pass…
+    let mut c8 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c8.write_all(&mqtt_connect_persistent("svc8", "svc8", "pw8"))
+        .await
+        .unwrap();
+    let (t, body) = with_timeout(mqtt_read(&mut c8), 30).await.unwrap().unwrap();
+    assert_eq!(t, 2, "expected CONNACK");
+    assert_eq!(body[1], 0, "svc8 must authenticate");
+    c8.write_all(&gateway_support::mqtt_subscribe(1, "svc8/feed", 0))
+        .await
+        .unwrap();
+    let (t, body) = with_timeout(mqtt_read(&mut c8), 30).await.unwrap().unwrap();
+    assert_eq!(t, 9, "expected SUBACK");
+    assert_eq!(
+        body[2], 0,
+        "in-scope subscribe must be granted, got {}",
+        body[2]
+    );
+
+    // …the allowed topic publishes through the bridge…
+    c8.write_all(&gateway_support::mqtt_publish(
+        "svc8/feed",
+        b"allowed",
+        0,
+        0,
+    ))
+    .await
+    .unwrap();
+    // …and the denied topic does not. The eye queue sees EVERY routed
+    // message on amq.topic (bound "#"), so the denied one must never
+    // appear there while the allowed one does.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_allowed = false;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "allowed publish never routed"
+        );
+        match support::basic_get(&mut eye, 1, "bridge-authz-eye", true)
+            .await
+            .unwrap()
+        {
+            Some((_, b)) => {
+                assert_eq!(b, b"allowed");
+                saw_allowed = true;
+                break;
+            }
+            None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    assert!(saw_allowed);
+    c8.write_all(&gateway_support::mqtt_publish(
+        "other/feed",
+        b"denied",
+        0,
+        0,
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let got = support::basic_get(&mut eye, 1, "bridge-authz-eye", true)
+        .await
+        .unwrap();
+    assert!(
+        got.is_none(),
+        "out-of-scope topic publish was routed anyway: {got:?}"
+    );
+
+    // MQTT as svc9: the consume gate refuses the read, surfacing as
+    // SUBACK failure code 0x80.
+    let mut c9 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c9.write_all(&mqtt_connect_persistent("svc9", "svc9", "pw9"))
+        .await
+        .unwrap();
+    let (t, body) = with_timeout(mqtt_read(&mut c9), 30).await.unwrap().unwrap();
+    assert_eq!(t, 2, "expected CONNACK");
+    assert_eq!(body[1], 0, "svc9 must authenticate");
+    c9.write_all(&gateway_support::mqtt_subscribe(1, "any/topic", 0))
+        .await
+        .unwrap();
+    let (t, body) = with_timeout(mqtt_read(&mut c9), 30).await.unwrap().unwrap();
+    assert_eq!(t, 9, "expected SUBACK");
+    assert_eq!(body[2], 0x80, "read-denied subscribe must be refused");
+
+    // STOMP as svc9: subscribing to a /queue/ the user cannot read is an
+    // ERROR frame (declare/consume is permission-gated there too).
+    let mut s9 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    s9.write_all(b"CONNECT\nlogin:svc9\npasscode:pw9\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut s9), 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "CONNECTED");
+    s9.write_all(b"SUBSCRIBE\ndestination:/queue/somewhere\nid:s1\nack:auto\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut s9), 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "ERROR", "read-denied STOMP subscribe must error");
+}

@@ -332,7 +332,10 @@ where
     )
     .await?;
 
-    let ctx = Arc::new(BridgeContext::create(node.clone(), "/".into()).await);
+    // Act as the authenticated user: every declare/bind/publish/consume
+    // through this context is permission-gated on that name
+    // (code-scanning alert #8).
+    let ctx = Arc::new(BridgeContext::create_as(node.clone(), "/".into(), user.clone()).await);
     // Heart-beat send loop: the negotiation committed us to `sx` (the
     // first value of our reply) — emit a bare-LF heartbeat at that
     // cadence so idle sessions stay alive and clients' silence

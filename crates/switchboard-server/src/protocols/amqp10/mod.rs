@@ -193,6 +193,10 @@ where
     }
     let mut frame: Option<frames::Frame> = read_frame(&mut reader).await?;
     let mut sasl_done = false;
+    // The identity this session acts as for bridge authorization
+    // (code-scanning alert #8): whichever user the SASL exchange
+    // authenticated; guest for the documented ANONYMOUS/skip path.
+    let mut authed_user = "guest".to_string();
     if matches!(&frame, Some(f) if f.frame_type == frames::FRAME_TYPE_SASL) {
         let Some(f) = frame.take() else { return Ok(()) };
         if f.code() != Some(codes::SASL_INIT) {
@@ -247,6 +251,7 @@ where
             .write_all(&frames::sasl_outcome(0))
             .await?;
         writer.lock().await.flush().await?;
+        authed_user = user;
         // The client restarts the connection: a fresh protocol header.
         let mut h2 = [0u8; 8];
         if reader.read_exact(&mut h2).await.is_err() || h2 != *b"AMQP\0\x01\0\0" {
@@ -277,7 +282,12 @@ where
     let _ = sasl_done;
 
     // ---- session ----
-    let ctx = Arc::new(BridgeContext::create(node.clone(), "/".into()).await);
+    // Act as the authenticated user (guest for the documented
+    // SASL-skip ANONYMOUS path): every declare/bind/publish/consume
+    // through this context is permission-gated on that name
+    // (code-scanning alert #8).
+    let ctx =
+        Arc::new(BridgeContext::create_as(node.clone(), "/".into(), authed_user.clone()).await);
     let links: Arc<tokio::sync::Mutex<HashMap<u32, Arc<tokio::sync::Mutex<Link>>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // delivery-id → (consumer, seq) for unsettled broker→client transfers.

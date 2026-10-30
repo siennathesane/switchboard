@@ -164,7 +164,10 @@ where
         return Ok(());
     }
 
-    let ctx = Arc::new(BridgeContext::create(node.clone(), "/".into()).await);
+    // Act as the authenticated user: every declare/bind/publish/consume
+    // through this context is permission-gated on that name
+    // (code-scanning alert #8).
+    let ctx = Arc::new(BridgeContext::create_as(node.clone(), "/".into(), user.clone()).await);
 
     // Persistent sessions: a clean=false session keeps its durable queue
     // and bindings across connections (messages published while the
