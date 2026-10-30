@@ -242,7 +242,7 @@ mod tests {
                 user: "guest".into(),
                 // Propose-side contract (alert #15): the command is built
                 // with the PHC string, never the plaintext password.
-                password_hash: switchboard_core::auth::hash_password("guest"),
+                password_hash: switchboard_core::auth::hash_password("guest", "guest"),
             })
             .unwrap();
         assert_eq!(r, BrokerReply::Bootstrapped);
@@ -254,7 +254,7 @@ mod tests {
             .apply(&BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "guest".into(),
-                password_hash: switchboard_core::auth::hash_password("guest"),
+                password_hash: switchboard_core::auth::hash_password("guest", "guest"),
             })
             .unwrap();
         assert_eq!(r2, BrokerReply::Bootstrapped);
@@ -266,7 +266,7 @@ mod tests {
         st.apply(&BrokerCommand::Bootstrap {
             vhost: "/".into(),
             user: "guest".into(),
-            password_hash: switchboard_core::auth::hash_password("guest"),
+            password_hash: switchboard_core::auth::hash_password("guest", "guest"),
         })
         .unwrap();
         let (BrokerReply::Meta(MetaReply::ExchangeDeclared { existed }), _) = st
@@ -318,7 +318,7 @@ mod tests {
             BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "u".into(),
-                password_hash: switchboard_core::auth::hash_password("p"),
+                password_hash: switchboard_core::auth::hash_password("u", "p"),
             },
             BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "vh".into() }),
             BrokerCommand::Shard(ShardCmd::ExpirePrepared {}),
@@ -340,7 +340,7 @@ mod tests {
         let bootstrap = bincode::serialize(&BrokerCommand::Bootstrap {
             vhost: "/".into(),
             user: "alice".into(),
-            password_hash: switchboard_core::auth::hash_password("hunter2-propose-side"),
+            password_hash: switchboard_core::auth::hash_password("alice", "hunter2-propose-side"),
         })
         .unwrap();
         assert!(
@@ -354,7 +354,7 @@ mod tests {
 
         let create = bincode::serialize(&BrokerCommand::Meta(MetaCmd::CreateUser {
             name: "bob".into(),
-            password_hash: switchboard_core::auth::hash_password("hunter2-propose-side"),
+            password_hash: switchboard_core::auth::hash_password("bob", "hunter2-propose-side"),
         }))
         .unwrap();
         assert!(

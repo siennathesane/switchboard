@@ -157,8 +157,10 @@ mod tests {
     }
 }
 
-fn hash_memo() -> &'static std::sync::Mutex<Option<(String, String)>> {
-    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(String, String)>>> =
+/// Memo slot: `((user, password), PHC string)` — keyed by BOTH the user
+/// and the password (code-scanning alert #22).
+fn hash_memo() -> &'static std::sync::Mutex<Option<((String, String), String)>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<((String, String), String)>>> =
         std::sync::OnceLock::new();
     MEMO.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -192,17 +194,24 @@ fn argon2_instance() -> argon2::Argon2<'static> {
     )
 }
 
-/// Hash a password for at-rest storage: argon2id. The PHC string carries
-/// the random salt and parameters, so stored hashes are self-describing.
+/// Hash `password` for at-rest storage under `user`'s entry: argon2id.
+/// The PHC string carries the random salt and parameters, so stored
+/// hashes are self-describing.
 ///
-/// Identical passwords return the identical (memoized) hash: every node
-/// boot re-derives the bootstrap credential, and a fresh memory-hard
-/// hash per start measurably starved parallel test formation. Memoizing
-/// loses nothing at rest — repeat hashes of the same password would
-/// never coexist in the users map.
-pub fn hash_password(password: &str) -> String {
-    if let Some((pw, hash)) = hash_memo().lock().unwrap().as_ref() {
-        if pw == password {
+/// Memoization is keyed on `(user, password)` (code-scanning alert
+/// #22): every node boot re-derives the bootstrap credential, and a
+/// fresh memory-hard hash per start measurably starved parallel test
+/// formation, so the most recent derivation is cached. The user is part
+/// of the key as a CORRECTNESS property, not hygiene: handing one user
+/// the PHC string derived for a DIFFERENT user with the same password
+/// would give both entries the same salt and hash — a hash-equality
+/// oracle for anyone with table read access, and a cached credential
+/// that belongs to another user. Reusing the hash for the same
+/// `(user, password)` is the same credential, so nothing is lost at
+/// rest.
+pub fn hash_password(user: &str, password: &str) -> String {
+    if let Some(((u, p), hash)) = hash_memo().lock().unwrap().as_ref() {
+        if u == user && p == password {
             return hash.clone();
         }
     }
@@ -216,7 +225,7 @@ pub fn hash_password(password: &str) -> String {
         .hash_password(password.as_bytes(), &salt)
         .expect("argon2 hash")
         .to_string();
-    *hash_memo().lock().unwrap() = Some((password.to_string(), hash.clone()));
+    *hash_memo().lock().unwrap() = Some(((user.to_string(), password.to_string()), hash.clone()));
     hash
 }
 
@@ -269,7 +278,7 @@ mod hashing_tests {
 
     #[test]
     fn hash_and_verify_roundtrip() {
-        let stored = hash_password("s3cret");
+        let stored = hash_password("alice", "s3cret");
         assert!(stored.starts_with("$argon2"), "{stored}");
         assert!(verify_password("s3cret", &stored));
         assert!(!verify_password("wrong", &stored));
@@ -283,6 +292,38 @@ mod hashing_tests {
 
     #[test]
     fn repeated_hashes_are_memoized() {
-        assert_eq!(hash_password("memo-me"), hash_password("memo-me"));
+        assert_eq!(
+            hash_password("carol", "memo-me"),
+            hash_password("carol", "memo-me")
+        );
+    }
+
+    /// Alert #22: the memoization is keyed by (user, password), so two
+    /// users who picked the SAME password never share a PHC string, and
+    /// one user's derived credential can never satisfy the other's
+    /// lookup.
+    #[test]
+    fn same_password_across_users_never_shares_a_hash() {
+        let alice = hash_password("alice", "shared-pw");
+        let bob = hash_password("bob", "shared-pw");
+        assert_ne!(
+            alice, bob,
+            "two users must never be handed the same PHC string"
+        );
+
+        // Both users verify correctly against their OWN entries...
+        assert!(verify_password("shared-pw", &alice));
+        assert!(verify_password("shared-pw", &bob));
+
+        // ...and a wrong password still fails for bob immediately after
+        // alice's identical password went through the memo (a hit or a
+        // re-derivation — either way the strings stay distinct).
+        let _alice_again = hash_password("alice", "shared-pw");
+        assert!(!verify_password("wrong", &bob), "wrong password must fail");
+        assert!(
+            verify_password("shared-pw", &bob),
+            "bob's own entry still verifies"
+        );
+        assert!(!verify_password("shared-pw-wrong", &alice));
     }
 }

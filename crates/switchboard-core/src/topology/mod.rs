@@ -165,7 +165,7 @@ pub fn bootstrap() -> MetaState {
     s.declare_default_entities(DEFAULT_VHOST);
     s.users.insert(
         DEFAULT_USER.into(),
-        crate::auth::hash_password(DEFAULT_PASSWORD),
+        crate::auth::hash_password(DEFAULT_USER, DEFAULT_PASSWORD),
     );
     // The bootstrap user is admin-flagged from the start (code-scanning
     // alert #19): someone must be able to grant the flag to others.

@@ -175,7 +175,9 @@ impl Broker {
                             // Hash at propose, outside raft (code-scanning
                             // alert #15): the replicated log carries the
                             // PHC string, never the plaintext password.
-                            password_hash: switchboard_core::auth::hash_password(password),
+                            // Keyed by user (alert #22): the memoized
+                            // hash is this user's credential only.
+                            password_hash: switchboard_core::auth::hash_password(user, password),
                         },
                     )
                     .await;
@@ -482,7 +484,7 @@ impl Broker {
     pub async fn create_user(&self, user: &str, password: &str) -> Result<(), AdminError> {
         self.admin_write(BrokerCommand::Meta(MetaCmd::CreateUser {
             name: user.to_string(),
-            password_hash: switchboard_core::auth::hash_password(password),
+            password_hash: switchboard_core::auth::hash_password(user, password),
         }))
         .await
     }

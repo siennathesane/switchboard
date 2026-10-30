@@ -626,7 +626,7 @@ async fn put_user(node: &Arc<ClusterNode>, name: &str, body: &[u8]) -> Result<St
         node,
         MetaCmd::CreateUser {
             name: name.into(),
-            password_hash: switchboard_core::auth::hash_password(&password),
+            password_hash: switchboard_core::auth::hash_password(name, &password),
         },
     )
     .await?;

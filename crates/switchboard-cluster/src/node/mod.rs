@@ -672,7 +672,10 @@ impl ClusterNode {
                 // proposing node, so the replicated log and the at-rest
                 // user map only ever carry the PHC string — and apply
                 // never hashes.
-                password_hash: switchboard_core::auth::hash_password(&self.cfg.bootstrap_password),
+                password_hash: switchboard_core::auth::hash_password(
+                    &self.cfg.bootstrap_user,
+                    &self.cfg.bootstrap_password,
+                ),
             },
         )
         .await?;

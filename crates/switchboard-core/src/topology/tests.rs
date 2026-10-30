@@ -479,7 +479,7 @@ fn create_user_stores_phc_only() {
     assert!(!s.users.contains_key("ghost"));
 
     // PHC arm: stored verbatim, byte-identical to what apply received.
-    let phc = crate::auth::hash_password("hunter2");
+    let phc = crate::auth::hash_password("ghost", "hunter2");
     s.apply(&MetaCmd::CreateUser {
         name: "ghost".into(),
         password_hash: phc.clone(),
@@ -1039,7 +1039,7 @@ fn admin_flag_grant_revoke_and_cascade() {
     );
     s.apply(&MetaCmd::CreateUser {
         name: "boss".into(),
-        password_hash: crate::auth::hash_password("pw"),
+        password_hash: crate::auth::hash_password("boss", "pw"),
     })
     .unwrap();
 

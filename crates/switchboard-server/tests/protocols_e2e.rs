@@ -3044,7 +3044,7 @@ async fn put_user(
             name: user.to_string(),
             // Propose-side hash (alert #15): the replicated command
             // carries the PHC string, never the plaintext password.
-            password_hash: switchboard_core::auth::hash_password(pass),
+            password_hash: switchboard_core::auth::hash_password(user, pass),
         },
         MetaCmd::SetPermissions {
             user: user.to_string(),
