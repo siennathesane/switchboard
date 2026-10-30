@@ -19,7 +19,13 @@ use lapin::BasicProperties;
 use lapin::Connection;
 use lapin::ConnectionProperties;
 use lapin::message::Delivery;
-use lapin::options::*;
+use lapin::options::BasicConsumeOptions;
+use lapin::options::BasicPublishOptions;
+use lapin::options::ConfirmSelectOptions;
+use lapin::options::ExchangeDeclareOptions;
+use lapin::options::QueueBindOptions;
+use lapin::options::QueueDeclareOptions;
+use lapin::options::QueueDeleteOptions;
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
 use serde_json::Map;
@@ -143,9 +149,7 @@ async fn publisher_task(
         // broker never sends Basic.Ack and every awaited confirm times
         // out.
         if wait_for_ack {
-            let _ = ch
-                .confirm_select(lapin::options::ConfirmSelectOptions::default())
-                .await;
+            let _ = ch.confirm_select(ConfirmSelectOptions::default()).await;
         }
         let props = persistent_props();
         let size = payload.len() as u64;

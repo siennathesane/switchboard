@@ -10,8 +10,9 @@
 
 use std::time::Duration;
 
-use switchboard_cluster::discovery::{self, DiscoveryConfig};
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::discovery::DiscoveryConfig;
+use switchboard_cluster::discovery::{self};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -21,10 +22,10 @@ fn free_port() -> u16 {
         .port()
 }
 
-
-
 fn set_test_tempo() {
-    unsafe { std::env::set_var("SB_TIME_SCALE", "10"); }
+    unsafe {
+        std::env::set_var("SB_TIME_SCALE", "10");
+    }
 }
 
 fn wait_until(mut check: impl FnMut() -> bool, secs: u64, what: &str) {
@@ -46,7 +47,11 @@ async fn dns_seed_discovery_joins_a_pending_node() {
     let client1 = format!("127.0.0.1:{}", free_port());
     let cfg1 = switchboard_cluster::NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!("sb-disc1-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-disc1-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: client1.clone(),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -63,7 +68,11 @@ async fn dns_seed_discovery_joins_a_pending_node() {
     let client2 = format!("127.0.0.1:{}", free_port());
     let cfg2 = switchboard_cluster::NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-disc2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-disc2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: client2.clone(),
         internal_addr: internal2.clone(),
         seeds: vec![],
@@ -97,13 +106,7 @@ async fn dns_seed_discovery_joins_a_pending_node() {
         "joiner topology adoption",
     );
     wait_until(
-        || {
-            node1
-                .topology()
-                .groups
-                .values()
-                .any(|m| m.contains(&2))
-        },
+        || node1.topology().groups.values().any(|m| m.contains(&2)),
         60,
         "layout coverage for the discovered node",
     );
@@ -141,7 +144,11 @@ async fn mdns_discovery_assembles_two_nodes() {
     let internal1 = format!("127.0.0.1:{}", free_port());
     let cfg1 = switchboard_cluster::NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!("sb-mdns1-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-mdns1-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -155,7 +162,11 @@ async fn mdns_discovery_assembles_two_nodes() {
     let internal2 = format!("127.0.0.1:{}", free_port());
     let cfg2 = switchboard_cluster::NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-mdns2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-mdns2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal2.clone(),
         seeds: vec![],
@@ -208,7 +219,11 @@ async fn meta_voters_grow_to_first_three_nodes() {
     let internal1 = format!("127.0.0.1:{}", free_port());
     let cfg1 = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!("sb-meta1-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-meta1-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -227,14 +242,18 @@ async fn meta_voters_grow_to_first_three_nodes() {
     for id in [2u64, 3u64] {
         let cfg = NodeConfig {
             id,
-            data_dir: std::env::temp_dir().join(format!("sb-meta{id}-{}-{}", std::process::id(), free_port())),
+            data_dir: std::env::temp_dir().join(format!(
+                "sb-meta{id}-{}-{}",
+                std::process::id(),
+                free_port()
+            )),
             client_addr: format!("127.0.0.1:{}", free_port()),
             internal_addr: format!("127.0.0.1:{}", free_port()),
             seeds: vec![internal1.clone()],
             bootstrap: false,
             expected_nodes: 1,
             peers: vec![],
-        timeouts: Default::default(),
+            timeouts: Default::default(),
         };
         let node = ClusterNode::start(cfg).await.unwrap();
         let _ = node; // keep alive for the duration
@@ -274,12 +293,17 @@ fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
 #[tokio::test(flavor = "multi_thread")]
 async fn discovery_with_unreachable_seeds_keeps_node_pending() {
     set_test_tempo();
-    use switchboard_cluster::discovery::{self, DiscoveryConfig};
     use switchboard_cluster::NodeConfig;
+    use switchboard_cluster::discovery::DiscoveryConfig;
+    use switchboard_cluster::discovery::{self};
 
     let cfg = NodeConfig {
         id: 9,
-        data_dir: std::env::temp_dir().join(format!("sb-pending-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-pending-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -303,7 +327,10 @@ async fn discovery_with_unreachable_seeds_keeps_node_pending() {
     // dead seed fails fast (connection refused), so a short beat is
     // enough to be confident no bootstrap crept in.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(node.topology().vhosts.is_empty(), "pending node must not self-bootstrap");
+    assert!(
+        node.topology().vhosts.is_empty(),
+        "pending node must not self-bootstrap"
+    );
     node.shutdown().await;
 }
 
@@ -316,7 +343,11 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
     // full budget, then surfaces NotJoined and remains pending.
     let cfg = NodeConfig {
         id: 7,
-        data_dir: std::env::temp_dir().join(format!("sb-deadseed-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-deadseed-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![format!("127.0.0.1:{}", free_port())], // nothing listens
@@ -336,7 +367,10 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
     // refuses instantly each round; budget exhausted at 60s) then pending.
     // Tempo-scaled: the broker's 60 s join budget runs in ~1.2 s; only
     // assert it actually retried for a while rather than failing fast.
-    assert!(elapsed >= std::time::Duration::from_millis(500), "join must retry");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(500),
+        "join must retry"
+    );
     assert!(node.topology().vhosts.is_empty());
     node.shutdown().await;
 }
@@ -350,7 +384,11 @@ async fn janitor_sweep_on_idle_node_is_harmless() {
     // seconds it must still serve writes (sweeps don't corrupt state).
     let cfg = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!("sb-jan-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-jan-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -370,6 +408,9 @@ async fn janitor_sweep_on_idle_node_is_harmless() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     };
-    assert!(!topo.vhosts.is_empty(), "bootstrap entities must survive sweeps");
+    assert!(
+        !topo.vhosts.is_empty(),
+        "bootstrap entities must survive sweeps"
+    );
     node.shutdown().await;
 }

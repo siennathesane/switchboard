@@ -12,7 +12,8 @@ use tracing::warn;
 use switchboard_cluster::ClusterNode;
 
 use crate::channel::ConnectionLimits;
-use crate::protocols;
+use crate::protocols::ProtocolConfig;
+use crate::protocols::serve_client;
 use crate::tls::TlsIdentity;
 
 /// Run a client-facing listener until the process exits.
@@ -21,7 +22,7 @@ pub async fn run(
     addr: &str,
     limits: ConnectionLimits,
     tls: Option<TlsIdentity>,
-    protocols: protocols::ProtocolConfig,
+    protocols: ProtocolConfig,
 ) -> std::io::Result<()> {
     let acceptor = match &tls {
         Some(id) => match crate::tls::acceptor(id) {
@@ -58,7 +59,7 @@ pub async fn run(
                 tokio::spawn(async move {
                     match a.accept(socket).await {
                         Ok(tls) => {
-                            let _ = protocols::serve_client(tls, node, limits, protocols).await;
+                            let _ = serve_client(tls, node, limits, protocols).await;
                         }
                         Err(e) => warn!(err = ?e, "tls handshake failed"),
                     }
@@ -66,7 +67,7 @@ pub async fn run(
             }
             None => {
                 tokio::spawn(async move {
-                    let _ = protocols::serve_client(socket, node, limits, protocols).await;
+                    let _ = serve_client(socket, node, limits, protocols).await;
                 });
             }
         }

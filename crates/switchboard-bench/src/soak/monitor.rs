@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Ctx;
-use super::k8s;
+use super::k8s::EndpointSet;
+use super::k8s::parse_response;
 
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -50,7 +51,7 @@ fn histories() -> &'static std::sync::Mutex<HashMap<String, History>> {
     H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-pub async fn run(ctx: Arc<Ctx>, endpoints: Arc<k8s::EndpointSet>) {
+pub async fn run(ctx: Arc<Ctx>, endpoints: Arc<EndpointSet>) {
     let mut tick = tokio::time::interval(ctx.cfg.monitor_every);
     let mut log_tick = tokio::time::interval(Duration::from_secs(60));
     log_tick.reset(); // don't fire immediately
@@ -72,7 +73,7 @@ pub async fn run(ctx: Arc<Ctx>, endpoints: Arc<k8s::EndpointSet>) {
     }
 }
 
-async fn sample_all(ctx: &Arc<Ctx>, endpoints: &Arc<k8s::EndpointSet>, monitor_no: u64) {
+async fn sample_all(ctx: &Arc<Ctx>, endpoints: &Arc<EndpointSet>, monitor_no: u64) {
     // Pod restarts (k8s mode): an increase is an infrastructure
     // transition, never an error — but always recorded.
     if let Some(k) = endpoints.k8s() {
@@ -183,7 +184,7 @@ async fn http_get(host: &str, path: &str) -> Option<String> {
         }
         raw.extend_from_slice(&buf[..n]);
     }
-    let (status, body) = k8s::parse_response(&raw).ok()?;
+    let (status, body) = parse_response(&raw).ok()?;
     if status != 200 {
         return None;
     }
@@ -192,7 +193,7 @@ async fn http_get(host: &str, path: &str) -> Option<String> {
 
 /// Scan broker logs for new ERROR/panic lines (k8s mode only; docker
 /// deployments tail logs out of band).
-async fn scan_logs(ctx: &Arc<Ctx>, endpoints: &Arc<k8s::EndpointSet>) {
+async fn scan_logs(ctx: &Arc<Ctx>, endpoints: &Arc<EndpointSet>) {
     let Some(k) = endpoints.k8s() else { return };
     let Ok(pods) = k.pods(endpoints.label()).await else {
         return;

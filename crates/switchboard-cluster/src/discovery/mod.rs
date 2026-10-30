@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use switchboard_core::topology::GroupId;
 
@@ -130,7 +132,15 @@ pub async fn run(
             match dns::resolve_seed(seed).await {
                 Ok(addrs) => {
                     for addr in addrs {
-                        consider(&node, &mut tried, DiscoveredPeer { internal_addr: addr, node_id: None }, switchboard_core::tempo::scale(Duration::from_secs(30)));
+                        consider(
+                            &node,
+                            &mut tried,
+                            DiscoveredPeer {
+                                internal_addr: addr,
+                                node_id: None,
+                            },
+                            switchboard_core::tempo::scale(Duration::from_secs(30)),
+                        );
                     }
                 }
                 Err(e) => debug!(seed, err = %e, "dns seed unresolved"),
@@ -141,7 +151,15 @@ pub async fn run(
             match dns::resolve_srv(domain).await {
                 Ok(addrs) => {
                     for addr in addrs {
-                        consider(&node, &mut tried, DiscoveredPeer { internal_addr: addr, node_id: None }, switchboard_core::tempo::scale(Duration::from_secs(30)));
+                        consider(
+                            &node,
+                            &mut tried,
+                            DiscoveredPeer {
+                                internal_addr: addr,
+                                node_id: None,
+                            },
+                            switchboard_core::tempo::scale(Duration::from_secs(30)),
+                        );
                     }
                 }
                 Err(e) => debug!(domain, err = %e, "dns srv unresolved"),
@@ -180,9 +198,11 @@ fn consider(
     let joined = node.topology().nodes.contains_key(&node.id);
     if joined
         && peer.node_id.is_none()
-        && node.topology().nodes.iter().any(|(id, info)| {
-            *id != node.id && normalize_addr(&info.internal_addr, 0) == addr
-        })
+        && node
+            .topology()
+            .nodes
+            .iter()
+            .any(|(id, info)| *id != node.id && normalize_addr(&info.internal_addr, 0) == addr)
     {
         return;
     }
@@ -252,14 +272,18 @@ mod unit {
             };
             let cfg = crate::NodeConfig {
                 id: 1,
-                data_dir: std::env::temp_dir().join(format!("sb-disc-u-{}-{}", std::process::id(), port())),
+                data_dir: std::env::temp_dir().join(format!(
+                    "sb-disc-u-{}-{}",
+                    std::process::id(),
+                    port()
+                )),
                 client_addr: format!("127.0.0.1:{}", port()),
                 internal_addr: format!("127.0.0.1:{}", port()),
                 seeds: vec![],
                 bootstrap: true,
                 expected_nodes: 1,
                 peers: vec![],
-            timeouts: Default::default(),
+                timeouts: Default::default(),
             };
             crate::ClusterNode::start(cfg).await.unwrap()
         });

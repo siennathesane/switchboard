@@ -82,8 +82,14 @@ mod tests {
 
     #[test]
     fn seed_splitting() {
-        assert_eq!(split_seed("node.internal:1234").unwrap(), ("node.internal".into(), 1234));
-        assert_eq!(split_seed("node.internal").unwrap(), ("node.internal".into(), 5673));
+        assert_eq!(
+            split_seed("node.internal:1234").unwrap(),
+            ("node.internal".into(), 1234)
+        );
+        assert_eq!(
+            split_seed("node.internal").unwrap(),
+            ("node.internal".into(), 5673)
+        );
         assert_eq!(split_seed("[::1]:9999").unwrap(), ("::1".into(), 9999));
         assert_eq!(split_seed("[::1]").unwrap(), ("::1".into(), 5673));
         assert!(split_seed("").is_err());
@@ -124,15 +130,18 @@ mod tests {
             .await
         });
         match result {
-            Ok(Err(_)) => {}         // resolver error: expected
-            Err(_) => {}             // timeout guard fired: also acceptable
+            Ok(Err(_)) => {} // resolver error: expected
+            Err(_) => {}     // timeout guard fired: also acceptable
             Ok(Ok(v)) => panic!("unexpected success {v:?}"),
         }
     }
 
     #[test]
     fn peer_shape_is_stable() {
-        let p = DiscoveredPeer { internal_addr: "10.0.0.1:5673".into(), node_id: None };
+        let p = DiscoveredPeer {
+            internal_addr: "10.0.0.1:5673".into(),
+            node_id: None,
+        };
         assert_eq!(p.internal_addr, "10.0.0.1:5673");
         assert_eq!(p.node_id, None);
     }

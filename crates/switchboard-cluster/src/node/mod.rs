@@ -46,11 +46,11 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use openraft::Config;
+use openraft::Raft;
 use openraft::error::ClientWriteError;
 use openraft::error::ForwardToLeader;
 use openraft::error::RaftError;
-use openraft::Config;
-use openraft::Raft;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -223,9 +223,10 @@ impl ClusterError {
     fn for_waiter(&self, group: GroupId) -> ClusterError {
         match self {
             ClusterError::Broker(e) => ClusterError::Broker(e.clone()),
-            ClusterError::Raft { group, message } => {
-                ClusterError::Raft { group: *group, message: message.clone() }
-            }
+            ClusterError::Raft { group, message } => ClusterError::Raft {
+                group: *group,
+                message: message.clone(),
+            },
             ClusterError::Transient => ClusterError::Unreachable { group },
             ClusterError::Unreachable { group } => ClusterError::Unreachable { group: *group },
             ClusterError::NotJoined => ClusterError::NotJoined,
@@ -375,9 +376,7 @@ impl ClusterNode {
                 tracing::warn!(node = node.id, err = ?e, "seed join failed; pending, retrying in background");
                 let n = node.clone();
                 tokio::spawn(async move {
-                    let pause = switchboard_core::tempo::scale(
-                        n.cfg.timeouts.reconcile_interval,
-                    );
+                    let pause = switchboard_core::tempo::scale(n.cfg.timeouts.reconcile_interval);
                     loop {
                         tokio::time::sleep(pause).await;
                         if n.join_seeds().await.is_ok() {
@@ -458,8 +457,13 @@ impl ClusterNode {
         let groups = self.groups.read().expect("groups lock");
         match groups.get(&META_GROUP) {
             Some(h) => {
-                let mut v: Vec<NodeId> =
-                    h.raft.metrics().borrow().membership_config.voter_ids().collect();
+                let mut v: Vec<NodeId> = h
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .voter_ids()
+                    .collect();
                 v.sort();
                 v
             }
@@ -468,8 +472,21 @@ impl ClusterNode {
     }
 
     pub async fn meta_voters(&self) -> Option<std::collections::BTreeSet<NodeId>> {
-        let handle = self.groups.read().expect("groups lock").get(&META_GROUP).cloned()?;
-        Some(handle.raft.metrics().borrow().membership_config.voter_ids().collect())
+        let handle = self
+            .groups
+            .read()
+            .expect("groups lock")
+            .get(&META_GROUP)
+            .cloned()?;
+        Some(
+            handle
+                .raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .voter_ids()
+                .collect(),
+        )
     }
 
     pub fn shutting_down(&self) -> bool {
@@ -582,7 +599,8 @@ impl ClusterNode {
         // resolves which replica's vote wins.
         let initial_voters: Vec<NodeId> =
             (1..=self.cfg.expected_nodes.min(MAX_VOTERS as u64)).collect();
-        self.initialize_group_if_fresh(META_GROUP, initial_voters).await?;
+        self.initialize_group_if_fresh(META_GROUP, initial_voters)
+            .await?;
 
         // Leadership requires the other initial voters to finish starting;
         // the remaining formation steps run as a background task so
@@ -635,7 +653,8 @@ impl ClusterNode {
         };
         // Retry until the deadline: seeds may still be forming (leader not
         // elected yet, registration write deferred) or briefly restarting.
-        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(self.cfg.timeouts.join_budget);
+        let deadline = tokio::time::Instant::now()
+            + switchboard_core::tempo::scale(self.cfg.timeouts.join_budget);
         loop {
             for seed in &self.cfg.seeds {
                 match self.join_one_seed(seed, &info).await {
@@ -679,8 +698,8 @@ impl ClusterNode {
         let bytes = bincode::serialize(&req).map_err(|e| ClusterError::Codec(e.to_string()))?;
         conn.send(&bytes).await?;
         let back = conn.recv().await?;
-        let msg: InternalMessage = bincode::deserialize(&back)
-            .map_err(|e| ClusterError::Codec(e.to_string()))?;
+        let msg: InternalMessage =
+            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
         if let InternalMessage::Response(InternalResponse::Admin(AdminResponse::Joined {
             directory,
             ..
@@ -704,7 +723,10 @@ impl ClusterNode {
     // Raft group lifecycle
     // ------------------------------------------------------------------
 
-    async fn ensure_group(self: &Arc<Self>, group: GroupId) -> Result<Arc<GroupHandle>, ClusterError> {
+    async fn ensure_group(
+        self: &Arc<Self>,
+        group: GroupId,
+    ) -> Result<Arc<GroupHandle>, ClusterError> {
         if let Some(h) = self.groups.read().expect("groups lock").get(&group) {
             return Ok(h.clone());
         }
@@ -713,14 +735,23 @@ impl ClusterNode {
         // Keyed by the RocksDB instance pointer (node identity) + group.
         //
         // NOTE: entries hold Weak handles so shutdown simply drops rafts.
-        static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, GroupId), std::sync::Weak<GroupHandle>>>> =
-            std::sync::OnceLock::new();
+        static LIVE: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<(usize, GroupId), std::sync::Weak<GroupHandle>>,
+            >,
+        > = std::sync::OnceLock::new();
 
         {
-            let mut live = LIVE.get_or_init(Default::default).lock().expect("live lock");
+            let mut live = LIVE
+                .get_or_init(Default::default)
+                .lock()
+                .expect("live lock");
             let key = (self.kv.identity(), group);
             if let Some(h) = live.get(&key).and_then(std::sync::Weak::upgrade) {
-                self.groups.write().expect("groups lock").insert(group, h.clone());
+                self.groups
+                    .write()
+                    .expect("groups lock")
+                    .insert(group, h.clone());
                 return Ok(h);
             }
             live.remove(&key);
@@ -758,16 +789,19 @@ impl ClusterNode {
             purge_batch_size: 50_000,
             ..Default::default()
         };
-        let config = Arc::new(
-            config
-                .validate()
-                .map_err(|e| ClusterError::Raft { group, message: e.to_string() })?,
-        );
+        let config = Arc::new(config.validate().map_err(|e| ClusterError::Raft {
+            group,
+            message: e.to_string(),
+        })?);
 
         let log_store = LogStore::new(self.kv.clone(), group);
         let (effects_tx, effects_rx) = tokio::sync::mpsc::unbounded_channel::<Effect>();
-        let sm = StateMachine::new(self.kv.clone(), group, effects_tx)
-            .map_err(|e| ClusterError::Raft { group, message: e.to_string() })?;
+        let sm = StateMachine::new(self.kv.clone(), group, effects_tx).map_err(|e| {
+            ClusterError::Raft {
+                group,
+                message: e.to_string(),
+            }
+        })?;
 
         let network = NetworkFactory {
             group,
@@ -778,7 +812,10 @@ impl ClusterNode {
 
         let raft = Raft::new(self.id, config, network, log_store, sm.clone())
             .await
-            .map_err(|e| ClusterError::Raft { group, message: e.to_string() })?;
+            .map_err(|e| ClusterError::Raft {
+                group,
+                message: e.to_string(),
+            })?;
 
         let handle = Arc::new(GroupHandle {
             raft,
@@ -786,10 +823,16 @@ impl ClusterNode {
             _effects: self.spawn_effect_pump(group, effects_rx),
         });
         {
-            let mut live = LIVE.get_or_init(Default::default).lock().expect("live lock");
+            let mut live = LIVE
+                .get_or_init(Default::default)
+                .lock()
+                .expect("live lock");
             live.insert((self.kv.identity(), group), Arc::downgrade(&handle));
         }
-        self.groups.write().expect("groups lock").insert(group, handle.clone());
+        self.groups
+            .write()
+            .expect("groups lock")
+            .insert(group, handle.clone());
         info!(node = self.id, group, "raft group handle created");
         Ok(handle)
     }
@@ -824,7 +867,10 @@ impl ClusterNode {
             }
             tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(50))).await;
         }
-        Err(ClusterError::Raft { group, message: "no leader elected".into() })
+        Err(ClusterError::Raft {
+            group,
+            message: "no leader elected".into(),
+        })
     }
 
     /// Is this node's store for `group` still untouched (formation time)?
@@ -859,7 +905,12 @@ impl ClusterNode {
                 // channel close, consumer cancel, node restart —
                 // requeues such hand-outs.)
                 let leader_is_someone_else = {
-                    let handle = node.groups.read().expect("groups lock").get(&group).cloned();
+                    let handle = node
+                        .groups
+                        .read()
+                        .expect("groups lock")
+                        .get(&group)
+                        .cloned();
                     match handle {
                         Some(h) => h.raft.metrics().borrow().state != openraft::ServerState::Leader,
                         None => true,
@@ -920,8 +971,8 @@ impl ClusterNode {
                 let target = self.owner_node_of(sub);
                 let t_del = std::time::Instant::now();
                 let response = match target {
-                    Some(peer) => self
-                        .call(
+                    Some(peer) => {
+                        self.call(
                             peer,
                             InternalRequest::Admin(AdminRequest::Deliver {
                                 sub,
@@ -932,11 +983,16 @@ impl ClusterNode {
                                 deleted,
                             }),
                         )
-                        .await,
+                        .await
+                    }
                     _ => Err(ClusterError::Unreachable { group }),
                 };
                 if std::env::var("SB_TIMING").is_ok() {
-                    eprintln!("[timing] deliver rpc took {:?} peer={:?}", t_del.elapsed(), target);
+                    eprintln!(
+                        "[timing] deliver rpc took {:?} peer={:?}",
+                        t_del.elapsed(),
+                        target
+                    );
                 }
                 match response {
                     Ok(InternalResponse::Admin(AdminResponse::Delivered)) => {}
@@ -968,9 +1024,7 @@ impl ClusterNode {
                         let node = self.clone();
                         tokio::spawn(async move {
                             let cmd = BrokerCommand::Shard(
-                                switchboard_core::shard::ShardCmd::UnregisterSubscription {
-                                    sub,
-                                },
+                                switchboard_core::shard::ShardCmd::UnregisterSubscription { sub },
                             );
                             for _ in 0..node.cfg.timeouts.deliver_release_retries {
                                 match node.write(group, cmd.clone()).await {
@@ -1003,14 +1057,13 @@ impl ClusterNode {
                         );
                         let node = self.clone();
                         tokio::spawn(async move {
-                            let cmd = BrokerCommand::Shard(
-                                switchboard_core::shard::ShardCmd::Release {
+                            let cmd =
+                                BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Release {
                                     queue: queue.clone(),
                                     sub: Some(sub),
                                     seqs: vec![seq],
                                     dead: false,
-                                },
-                            );
+                                });
                             for _ in 0..node.cfg.timeouts.deliver_release_retries {
                                 match node.write(group, cmd.clone()).await {
                                     Ok(_) => return,
@@ -1030,11 +1083,17 @@ impl ClusterNode {
             Effect::Shard(ShardEffect::DeadLettered { message, dlx, .. }) => {
                 // Route the dead-lettered message through the configured
                 // DLX (or drop it when the queue has none).
-                let Some((exchange, rk_override)) = dlx else { return };
+                let Some((exchange, rk_override)) = dlx else {
+                    return;
+                };
                 let rk = rk_override.unwrap_or_else(|| message.routing_key.clone());
                 self.route_and_enqueue("/", &exchange, &rk, &message).await;
             }
-            Effect::Shard(ShardEffect::ConsumerCancelled { sub, node, consumer_tag }) => {
+            Effect::Shard(ShardEffect::ConsumerCancelled {
+                sub,
+                node,
+                consumer_tag,
+            }) => {
                 if node == self.id {
                     if let Some(sink) = self.consumer_sinks.read().await.get(&sub) {
                         let _ = sink.cancelled.send(consumer_tag);
@@ -1071,26 +1130,26 @@ impl ClusterNode {
             + switchboard_core::tempo::scale(std::time::Duration::from_millis(750));
         let (vh, destinations) = loop {
             let topo = self.topology();
-            let Some(vh) = topo.vhosts.get(vhost).cloned() else { return };
+            let Some(vh) = topo.vhosts.get(vhost).cloned() else {
+                return;
+            };
             let view = switchboard_core::topology::VhostView { vhost: &vh };
-            let d = switchboard_core::routing::route(
-                &view,
-                exchange,
-                routing_key,
-                &message.properties,
-            );
+            let d =
+                switchboard_core::routing::route(&view, exchange, routing_key, &message.properties);
             if !d.is_empty() || tokio::time::Instant::now() >= deadline {
                 break (vh, d);
             }
             drop(topo);
             self.refresh_topology().await;
-            tokio::time::sleep(
-                switchboard_core::tempo::scale(std::time::Duration::from_millis(25)),
-            )
+            tokio::time::sleep(switchboard_core::tempo::scale(
+                std::time::Duration::from_millis(25),
+            ))
             .await;
         };
         for q in destinations {
-            let Some(shard) = vh.queues.get(&q).map(|qi| qi.shard) else { continue };
+            let Some(shard) = vh.queues.get(&q).map(|qi| qi.shard) else {
+                continue;
+            };
             let _ = self
                 .write(
                     shard,
@@ -1249,32 +1308,35 @@ impl ClusterNode {
             };
             let topo = self.topology();
             let vhost = topo.vhosts.get(&pending.vhost).cloned();
-            let legs = futures::future::join_all(pending.queues.iter().enumerate().map(|(leg, q)| {
-                let group = vhost.as_ref().and_then(|vh| vh.queues.get(q).map(|qi| qi.shard));
-                let q = q.clone();
-                let message = pending.message.clone();
-                let leg_id = Self::fanout_leg_id(pending.id, leg);
-                async move {
-                    let Some(group) = group else {
-                        // Vanished between acceptance and execution: skip,
-                        // mirroring the direct path's treatment of unrouted
-                        // destinations.
-                        return Ok(());
-                    };
-                    self.write_idempotent(
-                        group,
-                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
-                            queue: q,
-                            message,
-                            at_ms: now_ms(),
-                        }),
-                        leg_id,
-                    )
-                    .await
-                    .map(|_| ())
-                }
-            }))
-            .await;
+            let legs =
+                futures::future::join_all(pending.queues.iter().enumerate().map(|(leg, q)| {
+                    let group = vhost
+                        .as_ref()
+                        .and_then(|vh| vh.queues.get(q).map(|qi| qi.shard));
+                    let q = q.clone();
+                    let message = pending.message.clone();
+                    let leg_id = Self::fanout_leg_id(pending.id, leg);
+                    async move {
+                        let Some(group) = group else {
+                            // Vanished between acceptance and execution: skip,
+                            // mirroring the direct path's treatment of unrouted
+                            // destinations.
+                            return Ok(());
+                        };
+                        self.write_idempotent(
+                            group,
+                            BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
+                                queue: q,
+                                message,
+                                at_ms: now_ms(),
+                            }),
+                            leg_id,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }))
+                .await;
             for r in legs {
                 r?;
             }
@@ -1285,7 +1347,6 @@ impl ClusterNode {
             .await?;
         }
     }
-
 
     pub async fn refresh_topology(self: &Arc<Self>) {
         // Bind the local (sync) read result, then drop the lock before any
@@ -1337,7 +1398,9 @@ impl ClusterNode {
     /// have moved (and by tests that intercept a peer's traffic).
     pub async fn reroute_peer(&self, peer: NodeId, addr: String) {
         let old = self.dir.addr_of(peer);
-        if self.dir.update(peer, addr) && let Some(old) = old {
+        if self.dir.update(peer, addr)
+            && let Some(old) = old
+        {
             self.channel.invalidate(&old).await;
         }
     }
@@ -1349,8 +1412,9 @@ impl ClusterNode {
             if peer == self.id {
                 continue;
             }
-            if let Ok(InternalResponse::Admin(AdminResponse::Topology(t))) =
-                self.call(peer, InternalRequest::Admin(AdminRequest::Topology)).await
+            if let Ok(InternalResponse::Admin(AdminResponse::Topology(t))) = self
+                .call(peer, InternalRequest::Admin(AdminRequest::Topology))
+                .await
             {
                 if !t.meta.vhosts.is_empty() {
                     return Some(t.meta);
@@ -1402,7 +1466,8 @@ impl ClusterNode {
         if group != META_GROUP && Self::commit_batch_max() > 1 {
             return self.coalesced_write(group, command).await;
         }
-        let deadline = tokio::time::Instant::now() + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
+        let deadline = tokio::time::Instant::now()
+            + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
         loop {
             match self.try_write_depth(group, &command, 0).await {
                 Ok(reply) => return Ok(reply),
@@ -1410,7 +1475,8 @@ impl ClusterNode {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(ClusterError::Unreachable { group });
                     }
-                    tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))).await;
+                    tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100)))
+                        .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1438,8 +1504,11 @@ impl ClusterNode {
     ) -> Result<BrokerReply, ClusterError> {
         let tx = self.coalescer_for(group).await;
         let (rtx, rrx) = tokio::sync::oneshot::channel();
-        tx.send(CoalesceReq { command, reply: rtx })
-            .map_err(|_| ClusterError::Unreachable { group })?;
+        tx.send(CoalesceReq {
+            command,
+            reply: rtx,
+        })
+        .map_err(|_| ClusterError::Unreachable { group })?;
         rrx.await.map_err(|_| ClusterError::Unreachable { group })?
     }
 
@@ -1485,11 +1554,12 @@ impl ClusterNode {
                     Err(_) => break,
                 }
             }
-            let deadline =
-                tokio::time::Instant::now() + switchboard_core::tempo::scale(node.cfg.timeouts.write_budget);
+            let deadline = tokio::time::Instant::now()
+                + switchboard_core::tempo::scale(node.cfg.timeouts.write_budget);
             loop {
-                let commands =
-                    BrokerCommand::Batch { commands: batch.iter().map(|r| r.command.clone()).collect() };
+                let commands = BrokerCommand::Batch {
+                    commands: batch.iter().map(|r| r.command.clone()).collect(),
+                };
                 match node.try_write_depth(group, &commands, 0).await {
                     Ok(BrokerReply::Batch(replies)) if replies.len() == batch.len() => {
                         for (req, reply) in batch.drain(..).zip(replies) {
@@ -1519,7 +1589,10 @@ impl ClusterNode {
                                 Err(_) => break,
                             }
                         }
-                        tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))).await;
+                        tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(
+                            100,
+                        )))
+                        .await;
                     }
                     Err(e) => {
                         for req in batch.drain(..) {
@@ -1558,7 +1631,12 @@ impl ClusterNode {
             let _ = self.ensure_group(group).await;
         }
 
-        let local = self.groups.read().expect("groups lock").get(&group).cloned();
+        let local = self
+            .groups
+            .read()
+            .expect("groups lock")
+            .get(&group)
+            .cloned();
         if let Some(handle) = local {
             let mut hint: Option<NodeId> = handle.raft.current_leader().await;
             // Bounded: each round either lands the write, follows the
@@ -1599,9 +1677,17 @@ impl ClusterNode {
                         hint = leader_id;
                     }
                     Err(RaftError::APIError(other)) => {
-                        return Err(ClusterError::Raft { group, message: other.to_string() });
+                        return Err(ClusterError::Raft {
+                            group,
+                            message: other.to_string(),
+                        });
                     }
-                    Err(e) => return Err(ClusterError::Raft { group, message: e.to_string() }),
+                    Err(e) => {
+                        return Err(ClusterError::Raft {
+                            group,
+                            message: e.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1667,7 +1753,9 @@ impl ClusterNode {
             }),
             Err(e) => Err(e),
             Ok(InternalResponse::Error(e)) => Err(ClusterError::Codec(e)),
-            Ok(other) => Err(ClusterError::Codec(format!("unexpected forward reply: {other:?}"))),
+            Ok(other) => Err(ClusterError::Codec(format!(
+                "unexpected forward reply: {other:?}"
+            ))),
         }
     }
 
@@ -1697,8 +1785,8 @@ impl ClusterNode {
             .rpc(&addr, &bytes)
             .await
             .map_err(ClusterError::Io)?;
-        let msg: InternalMessage = bincode::deserialize(&back)
-            .map_err(|e| ClusterError::Codec(e.to_string()))?;
+        let msg: InternalMessage =
+            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
         match msg {
             InternalMessage::Response(r) => Ok(r),
             other => Err(ClusterError::Codec(format!("unexpected {other:?}"))),
@@ -1710,8 +1798,9 @@ impl ClusterNode {
     // ------------------------------------------------------------------
 
     async fn reconcile_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick =
-            tokio::time::interval(switchboard_core::tempo::scale(self.cfg.timeouts.reconcile_interval));
+        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(
+            self.cfg.timeouts.reconcile_interval,
+        ));
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -1728,12 +1817,19 @@ impl ClusterNode {
 
             // Every node hosts the meta group: it may be added to the meta
             // voter set at any time and must be able to receive entries.
-            if !self.groups.read().expect("groups lock").contains_key(&META_GROUP) {
+            if !self
+                .groups
+                .read()
+                .expect("groups lock")
+                .contains_key(&META_GROUP)
+            {
                 let fresh = self.group_is_fresh(META_GROUP);
                 match self.ensure_group(META_GROUP).await {
                     Ok(_) => {
                         if fresh && self.cfg.bootstrap {
-                            let _ = self.initialize_group_if_fresh(META_GROUP, vec![self.id]).await;
+                            let _ = self
+                                .initialize_group_if_fresh(META_GROUP, vec![self.id])
+                                .await;
                         }
                     }
                     Err(e) => debug!(err = ?e, "meta ensure_group failed (will retry)"),
@@ -1750,8 +1846,7 @@ impl ClusterNode {
                 match self.ensure_group(*g).await {
                     Ok(_) => {
                         if fresh && members.first() == Some(&self.id) {
-                            let _ =
-                                self.initialize_group_if_fresh(*g, members.clone()).await;
+                            let _ = self.initialize_group_if_fresh(*g, members.clone()).await;
                         }
                     }
                     Err(e) => debug!(group = g, err = ?e, "ensure_group failed (will retry)"),
@@ -1773,7 +1868,12 @@ impl ClusterNode {
                 _ = tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(400))) => {}
                 _ = shutdown.changed() => break,
             }
-            let Some(handle) = self.groups.read().expect("groups lock").get(&META_GROUP).cloned()
+            let Some(handle) = self
+                .groups
+                .read()
+                .expect("groups lock")
+                .get(&META_GROUP)
+                .cloned()
             else {
                 continue;
             };
@@ -1794,7 +1894,12 @@ impl ClusterNode {
                 let layout = sliding_windows(&nodes);
                 if !layout.is_empty() {
                     match self
-                        .write(META_GROUP, BrokerCommand::Meta(MetaCmd::SetGroups { groups: layout.clone() }))
+                        .write(
+                            META_GROUP,
+                            BrokerCommand::Meta(MetaCmd::SetGroups {
+                                groups: layout.clone(),
+                            }),
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -1814,8 +1919,11 @@ impl ClusterNode {
             //    frozen — queue placement never moves, capacity extends.
             let covered: std::collections::BTreeSet<NodeId> =
                 topo.groups.values().flatten().copied().collect();
-            let missing: Vec<NodeId> =
-                nodes.iter().filter(|n| !covered.contains(n)).copied().collect();
+            let missing: Vec<NodeId> = nodes
+                .iter()
+                .filter(|n| !covered.contains(n))
+                .copied()
+                .collect();
             if !missing.is_empty() && !covered.is_empty() {
                 let mut layout: Vec<(GroupId, Vec<NodeId>)> =
                     topo.groups.iter().map(|(g, m)| (*g, m.clone())).collect();
@@ -1832,7 +1940,12 @@ impl ClusterNode {
                     layout.push((gid, members.into_iter().collect()));
                 }
                 match self
-                    .write(META_GROUP, BrokerCommand::Meta(MetaCmd::SetGroups { groups: layout.clone() }))
+                    .write(
+                        META_GROUP,
+                        BrokerCommand::Meta(MetaCmd::SetGroups {
+                            groups: layout.clone(),
+                        }),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -1870,11 +1983,7 @@ impl ClusterNode {
                         .await;
                 } else if nodes.len() == 2 {
                     let _ = self
-                        .reconfigure_group_with_learners(
-                            META_GROUP,
-                            vec![nodes[0]],
-                            vec![nodes[1]],
-                        )
+                        .reconfigure_group_with_learners(META_GROUP, vec![nodes[0]], vec![nodes[1]])
                         .await;
                 } else if nodes.len() == 1 {
                     let _ = self.reconfigure_group(META_GROUP, vec![nodes[0]]).await;
@@ -1904,10 +2013,16 @@ impl ClusterNode {
             for (g, members) in layout.iter_mut() {
                 let all_live = members.iter().all(|m| nodes.contains(m));
                 if !all_live || members.len() < MAX_VOTERS {
-                    let mut next: Vec<NodeId> =
-                        members.iter().filter(|m| nodes.contains(m)).copied().collect();
-                    let mut candidates: Vec<NodeId> =
-                        nodes.iter().filter(|n| !next.contains(n)).copied().collect();
+                    let mut next: Vec<NodeId> = members
+                        .iter()
+                        .filter(|m| nodes.contains(m))
+                        .copied()
+                        .collect();
+                    let mut candidates: Vec<NodeId> = nodes
+                        .iter()
+                        .filter(|n| !next.contains(n))
+                        .copied()
+                        .collect();
                     let mut k = *g as usize;
                     while next.len() < MAX_VOTERS && !candidates.is_empty() {
                         let idx = k % candidates.len();
@@ -1926,7 +2041,12 @@ impl ClusterNode {
             }
             if healed {
                 match self
-                    .write(META_GROUP, BrokerCommand::Meta(MetaCmd::SetGroups { groups: layout.clone() }))
+                    .write(
+                        META_GROUP,
+                        BrokerCommand::Meta(MetaCmd::SetGroups {
+                            groups: layout.clone(),
+                        }),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -1961,7 +2081,9 @@ impl ClusterNode {
                 if *g == META_GROUP || members.first() != Some(&self.id) {
                     continue;
                 }
-                if !self.groups.read().expect("groups lock").contains_key(g) && self.group_is_fresh(*g) {
+                if !self.groups.read().expect("groups lock").contains_key(g)
+                    && self.group_is_fresh(*g)
+                {
                     let _ = self.initialize_group_if_fresh(*g, members.clone()).await;
                 }
             }
@@ -1977,7 +2099,10 @@ impl ClusterNode {
     /// index (a snapshot-only single-voter group — the standard openraft
     /// shape), and let the normal learner catch-up + snapshot path bring
     /// everyone else back in.
-    async fn meta_recovery_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    async fn meta_recovery_loop(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         let window = switchboard_core::tempo::scale(Duration::from_secs(30));
         let mut leaderless_since: Option<tokio::time::Instant> = None;
         loop {
@@ -1985,7 +2110,13 @@ impl ClusterNode {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 _ = shutdown.changed() => break,
             }
-            let Some(handle) = self.groups.read().expect("groups lock").get(&META_GROUP).cloned() else {
+            let Some(handle) = self
+                .groups
+                .read()
+                .expect("groups lock")
+                .get(&META_GROUP)
+                .cloned()
+            else {
                 leaderless_since = None;
                 continue;
             };
@@ -2011,11 +2142,17 @@ impl ClusterNode {
             if registered.first() != Some(&self.id) {
                 continue;
             }
-            warn!(node = self.id, "meta group leaderless for {window:?}; rebuilding from applied state");
+            warn!(
+                node = self.id,
+                "meta group leaderless for {window:?}; rebuilding from applied state"
+            );
             match self.rebuild_meta_from_applied().await {
                 Ok(()) => {
                     leaderless_since = None;
-                    warn!(node = self.id, "meta group rebuilt; sole voter until peers rejoin");
+                    warn!(
+                        node = self.id,
+                        "meta group rebuilt; sole voter until peers rejoin"
+                    );
                 }
                 Err(e) => {
                     error!(node = self.id, err = ?e, "meta rebuild failed; retrying");
@@ -2061,21 +2198,34 @@ impl ClusterNode {
             openraft::LogId::new(openraft::LeaderId::new(new_term, self.id), applied_index);
 
         // Drop the live handle (its openraft core + IO tasks) first.
-        let handle = self.groups.write().expect("groups lock").remove(&META_GROUP);
+        let handle = self
+            .groups
+            .write()
+            .expect("groups lock")
+            .remove(&META_GROUP);
         if let Some(h) = handle {
             let _ = h.raft.shutdown().await;
         }
 
         // Surgery: purge logs + purged marker + old vote; keep sm,
         // last-applied. Then write the claimed state.
-        self.kv.delete(&vote_key).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
-        self.kv.delete(&purged_key).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
-        self.kv.delete_prefix(&logs_prefix).map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        self.kv
+            .delete(&vote_key)
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        self.kv
+            .delete(&purged_key)
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+        self.kv
+            .delete_prefix(&logs_prefix)
+            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
         let new_vote = openraft::Vote::new_committed(new_term, self.id);
         self.kv
             .write_mixed(
                 [
-                    (vote_key.clone(), bincode::serialize(&new_vote).expect("vote serializes")),
+                    (
+                        vote_key.clone(),
+                        bincode::serialize(&new_vote).expect("vote serializes"),
+                    ),
                     (
                         purged_key.clone(),
                         bincode::serialize(&applied_log_id).expect("purged serializes"),
@@ -2089,22 +2239,30 @@ impl ClusterNode {
         let mut members = std::collections::BTreeMap::new();
         members.insert(self.id, openraft::impls::BasicNode::default());
         let stored_membership = openraft::Membership::new(vec![voters], members);
-        let stored =
-            openraft::StoredMembership::new(Some(applied_log_id), stored_membership);
+        let stored = openraft::StoredMembership::new(Some(applied_log_id), stored_membership);
         let mut membership_key = prefix.clone();
         membership_key.extend_from_slice(b"membership");
         self.kv
             .write_mixed(
-                [(membership_key, bincode::serialize(&stored).expect("membership serializes"))],
+                [(
+                    membership_key,
+                    bincode::serialize(&stored).expect("membership serializes"),
+                )],
                 [],
             )
             .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
 
         // Fresh handle over the rebuilt state; it elects itself (sole
         // voter) and serves meta writes immediately.
-        self.groups.write().expect("groups lock").remove(&META_GROUP);
+        self.groups
+            .write()
+            .expect("groups lock")
+            .remove(&META_GROUP);
         self.ensure_group(META_GROUP).await?;
-        info!(node = self.id, applied_index, new_term, "meta group rebuilt from applied state");
+        info!(
+            node = self.id,
+            applied_index, new_term, "meta group rebuilt from applied state"
+        );
         Ok(())
     }
 
@@ -2120,7 +2278,11 @@ impl ClusterNode {
             if id == self.id {
                 continue;
             }
-            let Some(addr) = self.topology().nodes.get(&id).map(|i| i.internal_addr.clone())
+            let Some(addr) = self
+                .topology()
+                .nodes
+                .get(&id)
+                .map(|i| i.internal_addr.clone())
             else {
                 continue;
             };
@@ -2149,9 +2311,15 @@ impl ClusterNode {
             }
         }
         for id in reaped {
-            warn!(node = id, "reaping registered node: internal port refuses connections");
+            warn!(
+                node = id,
+                "reaping registered node: internal port refuses connections"
+            );
             let _ = self
-                .write(META_GROUP, BrokerCommand::Meta(MetaCmd::ForgetNode { node: id }))
+                .write(
+                    META_GROUP,
+                    BrokerCommand::Meta(MetaCmd::ForgetNode { node: id }),
+                )
                 .await;
         }
     }
@@ -2160,19 +2328,30 @@ impl ClusterNode {
     /// expiring per-message/queue TTLs (dead-lettering as configured) and
     /// abandoning stale prepared transactions.
     async fn janitor_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick =
-            tokio::time::interval(switchboard_core::tempo::scale(self.cfg.timeouts.janitor_interval));
+        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(
+            self.cfg.timeouts.janitor_interval,
+        ));
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
                 _ = shutdown.changed() => break,
             }
             let groups: Vec<GroupId> = {
-                self.groups.read().expect("groups lock").keys().copied().collect()
+                self.groups
+                    .read()
+                    .expect("groups lock")
+                    .keys()
+                    .copied()
+                    .collect()
             };
             for group in groups {
                 let is_leader = {
-                    let handle = self.groups.read().expect("groups lock").get(&group).cloned();
+                    let handle = self
+                        .groups
+                        .read()
+                        .expect("groups lock")
+                        .get(&group)
+                        .cloned();
                     match handle {
                         Some(h) => h.raft.current_leader().await == Some(self.id),
                         None => false,
@@ -2203,13 +2382,11 @@ impl ClusterNode {
                     .nodes
                     .iter()
                     .map(|(id, info)| (*id, info.internal_addr.clone()))
-                    .chain(std::iter::once((
-                        self.id,
-                        self.cfg.internal_addr.clone(),
-                    )))
+                    .chain(std::iter::once((self.id, self.cfg.internal_addr.clone())))
                     .collect();
                 let mut fails = self.peer_probe_fails.lock().expect("probe lock").clone();
-                let mut live: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+                let mut live: std::collections::BTreeSet<NodeId> =
+                    std::collections::BTreeSet::new();
                 for (id, addr) in peers {
                     if id == self.id {
                         fails.remove(&id);
@@ -2239,9 +2416,7 @@ impl ClusterNode {
                         // EADDRNOTAVAIL = local ephemeral-port exhaustion,
                         // load) says nothing about the peer — fail OPEN,
                         // or a loaded node would eat its live consumers.
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::ConnectionRefused =>
-                        {
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                             let n = fails.entry(id).or_insert(0);
                             *n += 1;
                             let dead = *n >= dead_after;
@@ -2321,7 +2496,8 @@ impl ClusterNode {
                 Ok(e) => e,
                 Err(e) => {
                     let resp = InternalMessage::Response(InternalResponse::Error(e.to_string()));
-                    conn.write_frame(&bincode::serialize(&resp).unwrap()).await?;
+                    conn.write_frame(&bincode::serialize(&resp).unwrap())
+                        .await?;
                     continue;
                 }
             };
@@ -2345,10 +2521,7 @@ impl ClusterNode {
                     Ok(reply) => {
                         // A fanout accepted through us just became pending
                         // on this (leading) node: start executing now.
-                        if matches!(
-                            &command,
-                            BrokerCommand::Meta(MetaCmd::FanoutBegin { .. })
-                        ) {
+                        if matches!(&command, BrokerCommand::Meta(MetaCmd::FanoutBegin { .. })) {
                             self.fanout_wake.notify_one();
                         }
                         InternalResponse::Forward(reply)
@@ -2356,7 +2529,9 @@ impl ClusterNode {
                     Err(e) => InternalResponse::ForwardFailed(ForwardError::from(&e)),
                 }
             }
-            InternalRequest::Admin(AdminRequest::Ping) => InternalResponse::Admin(AdminResponse::Pong),
+            InternalRequest::Admin(AdminRequest::Ping) => {
+                InternalResponse::Admin(AdminResponse::Pong)
+            }
             InternalRequest::Admin(AdminRequest::Topology) => {
                 let groups = self.groups.read().expect("groups lock");
                 if let Some(h) = groups.get(&META_GROUP) {
@@ -2416,7 +2591,11 @@ impl ClusterNode {
             InternalRequest::Admin(AdminRequest::AttachConsumer { .. }) => {
                 InternalResponse::Admin(AdminResponse::Attached)
             }
-            InternalRequest::Admin(AdminRequest::ReconfigureGroup { group, voters, forwarded }) => {
+            InternalRequest::Admin(AdminRequest::ReconfigureGroup {
+                group,
+                voters,
+                forwarded,
+            }) => {
                 match self.reconfigure_group(group, voters.clone()).await {
                     Ok(()) => InternalResponse::Admin(AdminResponse::Reconfigured),
                     Err(e) => {
@@ -2436,7 +2615,9 @@ impl ClusterNode {
                                     Ok(InternalResponse::Error(err)) => {
                                         InternalResponse::Error(err)
                                     }
-                                    Ok(_) => InternalResponse::Error("bad reconfigure reply".into()),
+                                    Ok(_) => {
+                                        InternalResponse::Error("bad reconfigure reply".into())
+                                    }
                                     Err(err) => InternalResponse::Error(err.to_string()),
                                 };
                             }
@@ -2450,7 +2631,12 @@ impl ClusterNode {
 
     /// The cached leader hint for `group`, if this node knows one.
     async fn leader_hint_of(&self, group: GroupId) -> Option<NodeId> {
-        let handle = self.groups.read().expect("groups lock").get(&group).cloned()?;
+        let handle = self
+            .groups
+            .read()
+            .expect("groups lock")
+            .get(&group)
+            .cloned()?;
         handle.raft.current_leader().await
     }
 
@@ -2477,7 +2663,12 @@ impl ClusterNode {
         voters: Vec<NodeId>,
         learners: Vec<NodeId>,
     ) -> Result<(), ClusterError> {
-        let handle = self.groups.read().expect("groups lock").get(&group).cloned();
+        let handle = self
+            .groups
+            .read()
+            .expect("groups lock")
+            .get(&group)
+            .cloned();
         let Some(handle) = handle else {
             return Err(ClusterError::Unreachable { group });
         };
@@ -2559,7 +2750,10 @@ impl ClusterNode {
         .await;
         match change {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(ClusterError::Raft { group, message: e.to_string() }),
+            Ok(Err(e)) => Err(ClusterError::Raft {
+                group,
+                message: e.to_string(),
+            }),
             Err(_) => Err(ClusterError::Raft {
                 group,
                 message: "membership change did not settle in time".into(),
@@ -2567,7 +2761,11 @@ impl ClusterNode {
         }
     }
 
-    async fn handle_raft(self: &Arc<Self>, group: GroupId, payload: RaftPayload) -> InternalResponse {
+    async fn handle_raft(
+        self: &Arc<Self>,
+        group: GroupId,
+        payload: RaftPayload,
+    ) -> InternalResponse {
         // ensure_group either returns the hosted handle or fails; its
         // success guarantees the map entry, so no separate hosted check
         // is needed.
@@ -2582,14 +2780,14 @@ impl ClusterNode {
                     Ok(r) => InternalResponse::Raft(RaftResponse::AppendEntries(Box::new(r))),
                     Err(e) => InternalResponse::Error(e.to_string()),
                 }
-            },
+            }
             RaftPayload::Vote(req) => {
                 let out = handle.raft.vote(*req).await;
                 match out {
                     Ok(r) => InternalResponse::Raft(RaftResponse::Vote(Box::new(r))),
                     Err(e) => InternalResponse::Error(e.to_string()),
                 }
-            },
+            }
             RaftPayload::InstallSnapshot(req) => match handle.raft.install_snapshot(*req).await {
                 Ok(r) => InternalResponse::Raft(RaftResponse::InstallSnapshot(Box::new(r))),
                 Err(e) => InternalResponse::Error(e.to_string()),

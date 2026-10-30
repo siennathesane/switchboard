@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::CertifiedKey;
+use rcgen::generate_simple_self_signed;
 
 /// Mint a self-signed cert for `server_name` with SAN entries; returns
 /// (cert_pem, key_pem, der).
@@ -13,12 +14,17 @@ fn self_signed(names: &[String]) -> (Vec<u8>, Vec<u8>, rustls::pki_types::Certif
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(names.to_vec()).expect("cert generation");
     let cert_der = cert.der().to_owned();
-    (cert.pem().into_bytes(), key_pair.serialize_pem().into_bytes(), cert_der)
+    (
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
+        cert_der,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_transport_tls_roundtrip() {
-    use switchboard_cluster::transport::{tls_acceptor, PeerChannel};
+    use switchboard_cluster::transport::PeerChannel;
+    use switchboard_cluster::transport::tls_acceptor;
 
     let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let (cert_pem, key_pem, cert_der) = self_signed(&names);
@@ -52,7 +58,8 @@ async fn cluster_transport_tls_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_transport_tls_client_rejects_unknown_ca() {
-    use switchboard_cluster::transport::{tls_acceptor, PeerChannel};
+    use switchboard_cluster::transport::PeerChannel;
+    use switchboard_cluster::transport::tls_acceptor;
 
     // The server presents a cert the client does NOT trust.
     let names = vec!["localhost".to_string()];
@@ -60,8 +67,7 @@ async fn cluster_transport_tls_client_rejects_unknown_ca() {
     let acceptor = tls_acceptor(&cert_pem, &key_pem).expect("acceptor");
 
     // The client trusts a DIFFERENT self-signed cert.
-    let (_other_pem, _other_key, _other_der) =
-        self_signed(&vec!["other".to_string()]);
+    let (_other_pem, _other_key, _other_der) = self_signed(&vec!["other".to_string()]);
     let connector = switchboard_cluster::transport::tls_connector(&_other_pem).expect("connector");
     let channel = PeerChannel::new(Some(connector), "localhost".into());
 
@@ -74,7 +80,11 @@ async fn cluster_transport_tls_client_rejects_unknown_ca() {
 
     // The TLS handshake must FAIL: the presented cert chains to an
     // unknown root.
-    let err = channel.connect(&addr).await.err().expect("handshake must fail");
+    let err = channel
+        .connect(&addr)
+        .await
+        .err()
+        .expect("handshake must fail");
     assert!(
         err.to_string().contains("certificate") || err.kind() == std::io::ErrorKind::InvalidData,
         "unexpected error: {err}"
@@ -87,7 +97,7 @@ use switchboard_cluster::transport::PeerConn;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tls_peer_channel_send_recv_with_self_signed_trust() {
-    use switchboard_cluster::transport::{tls_acceptor};
+    use switchboard_cluster::transport::tls_acceptor;
 
     let names = vec!["localhost".to_string()];
     let (cert_pem, key_pem, cert_der) = self_signed(&names);
@@ -115,9 +125,7 @@ async fn tls_peer_channel_send_recv_with_self_signed_trust() {
     .unwrap()
     .with_root_certificates({
         let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(cert_der)
-            .unwrap();
+        roots.add(cert_der).unwrap();
         roots
     })
     .with_no_client_auth();

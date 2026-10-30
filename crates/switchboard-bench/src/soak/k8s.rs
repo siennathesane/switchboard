@@ -34,7 +34,11 @@ use tokio_rustls::rustls::RootCertStore;
 
 use super::Ctx;
 use super::check::encode_body;
-use super::client;
+use super::client::channel;
+use super::client::confirm_mode;
+use super::client::connect_setup;
+use super::client::declare_durable_expect;
+use super::client::publish_confirmed;
 
 // ---------------------------------------------------------------------
 // In-cluster REST client
@@ -739,7 +743,7 @@ pub async fn drain_all(ctx: &Arc<Ctx>) -> bool {
         let mut backlog = 0i64;
         for q in queues {
             for h in &hosts {
-                if let Ok(n) = client::declare_durable_expect(ctx, h, q, "quiesce").await {
+                if let Ok(n) = declare_durable_expect(ctx, h, q, "quiesce").await {
                     backlog += n as i64;
                 }
             }
@@ -759,17 +763,17 @@ async fn canary(ctx: &Arc<Ctx>) -> Result<(), String> {
     let Some(host) = ctx.endpoints.random().await else {
         return Err("no endpoints".into());
     };
-    let Some(conn) = client::connect_setup(ctx, &host, "canary").await else {
+    let Some(conn) = connect_setup(ctx, &host, "canary").await else {
         return Err("shutting down".into());
     };
-    let Some(ch) = client::channel(ctx, &conn, "canary", &host).await else {
+    let Some(ch) = channel(ctx, &conn, "canary", &host).await else {
         return Err("channel".into());
     };
-    if !client::confirm_mode(ctx, &ch, "canary", &host).await {
+    if !confirm_mode(ctx, &ch, "canary", &host).await {
         return Err("confirm".into());
     }
     let body = encode_body("canary", now_nanos(), 64);
-    client::publish_confirmed(ctx, &ch, &host, "canary", "", "soak.control", &body)
+    publish_confirmed(ctx, &ch, &host, "canary", "", "soak.control", &body)
         .await
         .filter(|ok| *ok)
         .ok_or_else(|| "canary confirm failed".to_string())?;

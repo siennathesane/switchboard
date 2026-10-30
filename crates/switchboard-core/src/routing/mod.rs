@@ -9,7 +9,7 @@
 use crate::model::Binding;
 use crate::model::Exchange;
 use crate::model::ExchangeKind;
-use crate::topic;
+use crate::topic::matches;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::field::FieldValue;
@@ -118,7 +118,7 @@ pub fn binding_matches(
     match ex.kind {
         ExchangeKind::Direct => b.routing_key == routing_key,
         ExchangeKind::Fanout => true,
-        ExchangeKind::Topic => topic::matches(&b.routing_key, routing_key),
+        ExchangeKind::Topic => matches(&b.routing_key, routing_key),
         ExchangeKind::Headers => headers_match(&b.arguments, properties.headers.as_ref()),
     }
 }

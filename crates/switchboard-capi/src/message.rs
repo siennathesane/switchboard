@@ -4,7 +4,7 @@
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_char;
-use std::slice;
+use std::slice::from_raw_parts;
 
 use switchboard_embedded::Delivery;
 use switchboard_embedded::ReturnedMessage;
@@ -152,5 +152,5 @@ pub(crate) unsafe fn bytes<'a>(
             format_args!("{arg} is NULL but {arg}_len is {len}"),
         ));
     }
-    Ok(unsafe { slice::from_raw_parts(ptr, len) })
+    Ok(unsafe { from_raw_parts(ptr, len) })
 }

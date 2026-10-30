@@ -13,8 +13,8 @@
 //!   protocol, cluster formation (sliding-window shard groups), effect
 //!   pumps, and the internal listener.
 
-pub mod net;
 pub mod discovery;
+pub mod net;
 
 pub use node::now_ms;
 pub mod node;
@@ -22,5 +22,15 @@ pub mod proto;
 pub mod transport;
 pub mod typ;
 
-pub use node::{ClusterNode, ClusterError, ConsumerSink, Delivery, NodeConfig, MAX_VOTERS, META_GROUP};
-pub use typ::{BrokerCommand, BrokerReply, Effect, NodeId, SwitchboardTypeConfig};
+pub use node::ClusterError;
+pub use node::ClusterNode;
+pub use node::ConsumerSink;
+pub use node::Delivery;
+pub use node::MAX_VOTERS;
+pub use node::META_GROUP;
+pub use node::NodeConfig;
+pub use typ::BrokerCommand;
+pub use typ::BrokerReply;
+pub use typ::Effect;
+pub use typ::NodeId;
+pub use typ::SwitchboardTypeConfig;

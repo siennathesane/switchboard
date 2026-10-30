@@ -5,11 +5,16 @@
 
 use std::time::Duration;
 
-use switchboard_cluster::proto::{
-    AdminRequest, AdminResponse, Envelope, InternalMessage, InternalRequest, InternalResponse,
-};
-use switchboard_cluster::{ClusterNode, NodeConfig};
-use switchboard_core::model::{StoredMessage, SubscriptionId};
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::NodeConfig;
+use switchboard_cluster::proto::AdminRequest;
+use switchboard_cluster::proto::AdminResponse;
+use switchboard_cluster::proto::Envelope;
+use switchboard_cluster::proto::InternalMessage;
+use switchboard_cluster::proto::InternalRequest;
+use switchboard_cluster::proto::InternalResponse;
+use switchboard_core::model::StoredMessage;
+use switchboard_core::model::SubscriptionId;
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -22,7 +27,11 @@ fn free_port() -> u16 {
 async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
     let cfg = NodeConfig {
         id,
-        data_dir: std::env::temp_dir().join(format!("sb-ip-{tag}-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-ip-{tag}-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -58,7 +67,10 @@ async fn internal_protocol_admin_and_error_arms() {
     // Liveness.
     let resp = roundtrip(
         &mut conn,
-        &Envelope { from: 9, message: InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping)) },
+        &Envelope {
+            from: 9,
+            message: InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping)),
+        },
     )
     .await;
     assert!(matches!(resp, InternalResponse::Admin(AdminResponse::Pong)));
@@ -66,16 +78,23 @@ async fn internal_protocol_admin_and_error_arms() {
     // A Response where the peer expected a Request is a protocol error.
     let resp = roundtrip(
         &mut conn,
-        &Envelope { from: 9, message: InternalMessage::Response(InternalResponse::Admin(AdminResponse::Pong)) },
+        &Envelope {
+            from: 9,
+            message: InternalMessage::Response(InternalResponse::Admin(AdminResponse::Pong)),
+        },
     )
     .await;
     assert!(matches!(resp, InternalResponse::Error(ref e) if e.contains("expected request")));
 
     // A frame that does not decode as bincode is answered with the
     // codec error (the connection stays usable for well-formed frames).
-    conn.send(b"\x00\x01\x02\x03 definitely not bincode").await.unwrap();
+    conn.send(b"\x00\x01\x02\x03 definitely not bincode")
+        .await
+        .unwrap();
     let back = conn.recv().await.unwrap();
-    let InternalMessage::Response(InternalResponse::Error(_)) = bincode::deserialize(&back).unwrap() else {
+    let InternalMessage::Response(InternalResponse::Error(_)) =
+        bincode::deserialize(&back).unwrap()
+    else {
         panic!("codec error expected");
     };
 

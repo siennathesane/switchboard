@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use openraft::MessageSummary;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
-use openraft::error::RaftError;
 use openraft::error::RPCError;
+use openraft::error::RaftError;
 use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::network::RaftNetwork;
@@ -24,7 +25,6 @@ use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::MessageSummary;
 
 use switchboard_core::topology::GroupId;
 
@@ -73,7 +73,12 @@ impl Directory {
     }
 
     pub fn all(&self) -> Vec<(NodeId, String)> {
-        self.addrs.read().expect("dir lock").iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.addrs
+            .read()
+            .expect("dir lock")
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 }
 
@@ -114,12 +119,15 @@ impl RaftNetClient {
         RPCError::Network(NetworkError::new(&ConnectionError::new(msg)))
     }
 
-    async fn rpc(&mut self, payload: RaftPayload, summary: &str) -> Result<RaftResponse, RaftNetErr> {
+    async fn rpc(
+        &mut self,
+        payload: RaftPayload,
+        summary: &str,
+    ) -> Result<RaftResponse, RaftNetErr> {
         let Some(addr) = self.dir.addr_of(self.target) else {
-            return Err(RPCError::Unreachable(Unreachable::new(&ConnectionError::new(format!(
-                "no address known for node {}",
-                self.target
-            )))));
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &ConnectionError::new(format!("no address known for node {}", self.target)),
+            )));
         };
         // The envelope wrapper is mandatory: receivers deserialize
         // `Envelope { from, message }` (the join path wraps; so must this).
@@ -130,19 +138,19 @@ impl RaftNetClient {
                 payload,
             }),
         };
-        let bytes = bincode::serialize(&req)
-            .map_err(|e| RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string()))))?;
+        let bytes = bincode::serialize(&req).map_err(|e| {
+            RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string())))
+        })?;
         // Pooled request→reply: the raft heartbeat cadence must not churn
         // fresh TCP connections (ephemeral-port exhaustion under load).
-        let back = self
-            .channel
-            .rpc(&addr, &bytes)
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&ConnectionError::new(format!(
+        let back = self.channel.rpc(&addr, &bytes).await.map_err(|e| {
+            RPCError::Unreachable(Unreachable::new(&ConnectionError::new(format!(
                 "rpc {addr}: {e}"
-            )))))?;
-        let msg: InternalMessage = bincode::deserialize(&back)
-            .map_err(|e| RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string()))))?;
+            ))))
+        })?;
+        let msg: InternalMessage = bincode::deserialize(&back).map_err(|e| {
+            RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string())))
+        })?;
         match msg {
             InternalMessage::Response(InternalResponse::Raft(r)) => Ok(r),
             InternalMessage::Response(InternalResponse::Error(e)) => {
@@ -199,10 +207,12 @@ impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RaftNetErr> {
         let summary = req.summary();
-        let resp = self.rpc(RaftPayload::AppendEntries(Box::new(req)), &summary).await?;
+        let resp = self
+            .rpc(RaftPayload::AppendEntries(Box::new(req)), &summary)
+            .await?;
         match resp {
             RaftResponse::AppendEntries(r) => Ok(*r),
-            other => Err(Self::net_err(mismatched(other, "append_entries")))
+            other => Err(Self::net_err(mismatched(other, "append_entries"))),
         }
     }
 
@@ -214,7 +224,10 @@ impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
         // Snapshot transfers are idempotent; every failure maps onto the
         // shared (E-free) variants so openraft retries the whole transfer.
         let resp = match self
-            .rpc(RaftPayload::InstallSnapshot(Box::new(req)), "install_snapshot")
+            .rpc(
+                RaftPayload::InstallSnapshot(Box::new(req)),
+                "install_snapshot",
+            )
             .await
         {
             Ok(r) => r,
@@ -222,7 +235,10 @@ impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
         };
         match resp {
             RaftResponse::InstallSnapshot(r) => Ok(*r),
-            other => Err(snap_of(Self::net_err(mismatched(other, "install_snapshot"))))
+            other => Err(snap_of(Self::net_err(mismatched(
+                other,
+                "install_snapshot",
+            )))),
         }
     }
 
@@ -235,7 +251,7 @@ impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
         let resp = self.rpc(RaftPayload::Vote(Box::new(req)), &summary).await?;
         match resp {
             RaftResponse::Vote(r) => Ok(*r),
-            other => Err(Self::net_err(mismatched(other, "vote")))
+            other => Err(Self::net_err(mismatched(other, "vote"))),
         }
     }
 }
@@ -243,11 +259,8 @@ impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
 /// Error type of `append_entries`/`vote` for this type config.
 type RaftNetErr = RPCError<NodeId, openraft::impls::BasicNode, RaftError<NodeId>>;
 /// Error type of `install_snapshot` for this type config.
-type SnapNetErr = RPCError<
-    NodeId,
-    openraft::impls::BasicNode,
-    RaftError<NodeId, InstallSnapshotError>,
->;
+type SnapNetErr =
+    RPCError<NodeId, openraft::impls::BasicNode, RaftError<NodeId, InstallSnapshotError>>;
 
 fn snap_of(e: RaftNetErr) -> SnapNetErr {
     match e {
@@ -257,12 +270,9 @@ fn snap_of(e: RaftNetErr) -> SnapNetErr {
         RPCError::Network(n) => RPCError::Network(n),
         // A peer-side raft failure during snapshot transfer: report as a
         // network condition; openraft restarts the transfer.
-        RPCError::RemoteError(r) => {
-            RPCError::Network(NetworkError::new(&ConnectionError::new(format!(
-                "peer {} failed snapshot transfer: {}",
-                r.target, r.source
-            ))))
-        }
+        RPCError::RemoteError(r) => RPCError::Network(NetworkError::new(&ConnectionError::new(
+            format!("peer {} failed snapshot transfer: {}", r.target, r.source),
+        ))),
     }
 }
 
@@ -301,7 +311,9 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut conn = crate::transport::accept(tcp, None).await.unwrap();
             let _frame = conn.read_frame_full().await.unwrap();
-            conn.write_frame(&bincode::serialize(&reply).unwrap()).await.unwrap();
+            conn.write_frame(&bincode::serialize(&reply).unwrap())
+                .await
+                .unwrap();
         });
         addr
     }
@@ -328,7 +340,10 @@ mod tests {
     async fn rpc_error_and_unexpected_replies_map_to_network_errors() {
         let dir = Arc::new(Directory::new());
         // A peer that answers with a bare error string.
-        let peer = fake_peer(InternalMessage::Response(InternalResponse::Error("boom".into()))).await;
+        let peer = fake_peer(InternalMessage::Response(InternalResponse::Error(
+            "boom".into(),
+        )))
+        .await;
         dir.update(9, peer);
         let mut c = client(dir.clone(), 9);
         let err = format!("{}", c.rpc(vote_payload(2), "vote").await.unwrap_err());
@@ -356,20 +371,22 @@ mod tests {
         dir.update(9, peer);
         let mut c = client(dir.clone(), 9);
         let req = openraft::raft::VoteRequest::new(Vote::new(4, 1), None);
-        let err = format!("{}", c.vote(req, RPCOption::new(Duration::from_secs(5))).await.unwrap_err());
+        let err = format!(
+            "{}",
+            c.vote(req, RPCOption::new(Duration::from_secs(5)))
+                .await
+                .unwrap_err()
+        );
         assert!(err.contains("mismatched vote response"), "{err}");
     }
 
     #[tokio::test]
     async fn append_entries_rejects_mismatched_replies() {
         let dir = Arc::new(Directory::new());
-        let wrong: InternalMessage = InternalMessage::Response(InternalResponse::Raft(
-            RaftResponse::Vote(Box::new(openraft::raft::VoteResponse::new(
-                Vote::new(1, 1),
-                None,
-                false,
-            ))),
-        ));
+        let wrong: InternalMessage =
+            InternalMessage::Response(InternalResponse::Raft(RaftResponse::Vote(Box::new(
+                openraft::raft::VoteResponse::new(Vote::new(1, 1), None, false),
+            ))));
         let peer = fake_peer(wrong).await;
         dir.update(9, peer);
         let mut c = client(dir, 9);
@@ -391,13 +408,10 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_maps_mismatched_replies() {
         let dir = Arc::new(Directory::new());
-        let wrong: InternalMessage = InternalMessage::Response(InternalResponse::Raft(
-            RaftResponse::Vote(Box::new(openraft::raft::VoteResponse::new(
-                Vote::new(1, 1),
-                None,
-                false,
-            ))),
-        ));
+        let wrong: InternalMessage =
+            InternalMessage::Response(InternalResponse::Raft(RaftResponse::Vote(Box::new(
+                openraft::raft::VoteResponse::new(Vote::new(1, 1), None, false),
+            ))));
         let peer = fake_peer(wrong).await;
         dir.update(9, peer);
         let mut c = client(dir, 9);
@@ -408,19 +422,22 @@ mod tests {
             data: Vec::new(),
             done: true,
         };
-        let r = c.install_snapshot(req, RPCOption::new(Duration::from_secs(5))).await;
+        let r = c
+            .install_snapshot(req, RPCOption::new(Duration::from_secs(5)))
+            .await;
         let err = format!("{:?}", r.unwrap_err());
-        assert!(err.contains("mismatched") || err.contains("install_snapshot"), "{err}");
+        assert!(
+            err.contains("mismatched") || err.contains("install_snapshot"),
+            "{err}"
+        );
     }
 
     #[test]
     fn snap_of_maps_remote_errors_to_network_errors() {
         use openraft::error::RemoteError;
-        let e: RPCError<u64, openraft::impls::BasicNode, RaftError<u64>> =
-            RPCError::RemoteError(RemoteError::new(
-                9u64,
-                RaftError::Fatal(openraft::error::Fatal::Stopped),
-            ));
+        let e: RPCError<u64, openraft::impls::BasicNode, RaftError<u64>> = RPCError::RemoteError(
+            RemoteError::new(9u64, RaftError::Fatal(openraft::error::Fatal::Stopped)),
+        );
         let mapped = snap_of(e);
         let err = format!("{mapped:?}");
         assert!(err.contains("snapshot transfer"), "{err}");

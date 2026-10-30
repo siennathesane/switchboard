@@ -24,7 +24,11 @@ use crate::config::BrokerConfig;
 use crate::config::EmbeddedLimits;
 use crate::config::JoinSpec;
 use crate::conn::EmbeddedConnection;
-use crate::driver;
+use crate::driver::ConnShared;
+use crate::driver::WriteMsg;
+use crate::driver::driver_task;
+use crate::driver::handshake;
+use crate::driver::writer_task;
 use crate::error::AdminError;
 use crate::error::ConnectError;
 use crate::error::StartError;
@@ -272,7 +276,7 @@ impl Broker {
         ));
 
         let (client_read, client_write) = tokio::io::split(client_io);
-        let (agreed, client_read, client_write) = driver::handshake(
+        let (agreed, client_read, client_write) = handshake(
             client_read,
             client_write,
             user,
@@ -287,15 +291,11 @@ impl Broker {
 
         // Writer task owns the client write half; the driver owns the
         // read half and demultiplexes inbound frames (§4.3).
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<driver::WriteMsg>();
-        tokio::spawn(driver::writer_task(
-            client_write,
-            writer_rx,
-            agreed.heartbeat,
-        ));
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<WriteMsg>();
+        tokio::spawn(writer_task(client_write, writer_rx, agreed.heartbeat));
         let (returns_tx, returns_rx) = mpsc::unbounded_channel::<ReturnedMessage>();
         let (close_tx, close_rx) = tokio::sync::watch::channel(false);
-        let conn = Arc::new(driver::ConnShared {
+        let conn = Arc::new(ConnShared {
             writer: writer_tx,
             valid: AtomicBool::new(true),
             closing: AtomicBool::new(false),
@@ -311,7 +311,7 @@ impl Broker {
             frame_max: agreed.frame_max,
             pending: Mutex::new(HashMap::new()),
         });
-        tokio::spawn(driver::driver_task(client_read, conn.clone(), close_rx));
+        tokio::spawn(driver_task(client_read, conn.clone(), close_rx));
 
         // Register with the broker: `stop` closes the connection through
         // the watch trigger and joins the SERVER task, whose completion

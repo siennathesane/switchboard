@@ -12,7 +12,14 @@ fn nine_nodes_nine_groups_of_three() {
     assert_eq!(w.len(), 9);
     for (g, members) in &w {
         assert_eq!(members.len(), 3, "group {g}");
-        assert_eq!(members.iter().collect::<std::collections::HashSet<_>>().len(), members.len(), "no duplicate voters in {g}");
+        assert_eq!(
+            members
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            members.len(),
+            "no duplicate voters in {g}"
+        );
     }
     // Every node participates in exactly 3 groups.
     let mut count = HashMap::new();
@@ -60,17 +67,24 @@ fn every_group_stays_within_the_voter_cap() {
 // Node-level behavior: watchers, admin arms, join refusal, forward mapping.
 // ---------------------------------------------------------------------------
 
-use crate::proto::{
-    AdminRequest, AdminResponse, Envelope, ForwardError, InternalMessage, InternalRequest,
-    InternalResponse,
-};
+use crate::proto::AdminRequest;
+use crate::proto::AdminResponse;
+use crate::proto::Envelope;
+use crate::proto::ForwardError;
+use crate::proto::InternalMessage;
+use crate::proto::InternalRequest;
+use crate::proto::InternalResponse;
 use switchboard_core::error::BrokerError;
-use switchboard_core::model::{ConnectionId, QueueOptions, StoredMessage, SubscriptionId};
-use switchboard_core::shard::{QueuePolicy, ShardCmd};
-use switchboard_core::topology::{MetaCmd, NodeInfo};
+use switchboard_core::model::ConnectionId;
+use switchboard_core::model::QueueOptions;
+use switchboard_core::model::StoredMessage;
+use switchboard_core::model::SubscriptionId;
+use switchboard_core::shard::QueuePolicy;
+use switchboard_core::shard::ShardCmd;
+use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::NodeInfo;
 use switchboard_wire::BasicProperties;
-
 
 fn set_test_tempo(scale: &str) {
     unsafe { std::env::set_var("SB_TIME_SCALE", scale) };
@@ -84,18 +98,21 @@ fn free_port() -> u16 {
         .port()
 }
 
-
 async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
     let cfg = NodeConfig {
         id,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-{tag}-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-{tag}-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     ClusterNode::start(cfg).await.unwrap()
 }
@@ -127,13 +144,8 @@ async fn within<F: std::future::Future>(secs: u64, f: F) -> F::Output {
     }
 }
 
-
 /// Wait until `node` observes `leader` leading the meta group.
-async fn wait_leader_seen(
-    node: &std::sync::Arc<ClusterNode>,
-    leader: NodeId,
-    secs: u64,
-) {
+async fn wait_leader_seen(node: &std::sync::Arc<ClusterNode>, leader: NodeId, secs: u64) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {
         if node.leader_hint_of(crate::META_GROUP).await == Some(leader) {
@@ -141,7 +153,10 @@ async fn wait_leader_seen(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("node {} never saw node {leader} lead meta within {secs}s", node.id);
+    panic!(
+        "node {} never saw node {leader} lead meta within {secs}s",
+        node.id
+    );
 }
 
 async fn wait_for(what: &str, secs: u64, mut check: impl FnMut() -> bool) {
@@ -183,12 +198,16 @@ async fn handle_request_admin_arms() {
     let node = bootstrap_node("admin", 1).await;
     // A Response where a Request was expected.
     let resp = node
-        .handle_request(InternalMessage::Response(InternalResponse::Admin(AdminResponse::Pong)))
+        .handle_request(InternalMessage::Response(InternalResponse::Admin(
+            AdminResponse::Pong,
+        )))
         .await;
     assert!(matches!(resp, InternalResponse::Error(e) if e.contains("expected request")));
     // Liveness.
     let resp = node
-        .handle_request(InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping)))
+        .handle_request(InternalMessage::Request(InternalRequest::Admin(
+            AdminRequest::Ping,
+        )))
         .await;
     assert!(matches!(resp, InternalResponse::Admin(AdminResponse::Pong)));
 }
@@ -207,7 +226,9 @@ async fn join_one_seed_refuses_non_join_reply() {
         let frame = conn.read_frame_full().await.unwrap();
         let _req: Envelope = bincode::deserialize(&frame).unwrap();
         let reply = InternalMessage::Response(InternalResponse::Admin(AdminResponse::Pong));
-        conn.write_frame(&bincode::serialize(&reply).unwrap()).await.unwrap();
+        conn.write_frame(&bincode::serialize(&reply).unwrap())
+            .await
+            .unwrap();
     });
     let node = bootstrap_node("refuse", 1).await;
     let err = node.join_one_seed(&addr, &test_info()).await.unwrap_err();
@@ -249,12 +270,15 @@ async fn fake_peer(reply: InternalMessage) -> String {
 async fn forward_write_maps_every_failure_shape() {
     set_test_tempo("10");
     let node = bootstrap_node("fwd", 1).await;
-    let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode { node: 42, info: test_info() });
+    let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode {
+        node: 42,
+        info: test_info(),
+    });
 
     // A broker-level rejection from the peer stays a broker error.
-    let peer = fake_peer(InternalMessage::Response(InternalResponse::Forward(BrokerReply::Error(
-        BrokerError::not_found("nope"),
-    ))))
+    let peer = fake_peer(InternalMessage::Response(InternalResponse::Forward(
+        BrokerReply::Error(BrokerError::not_found("nope")),
+    )))
     .await;
     node.reroute_peer(42, peer).await;
     match node.forward_write(42, crate::META_GROUP, cmd.clone()).await {
@@ -270,7 +294,10 @@ async fn forward_write_maps_every_failure_shape() {
         (ForwardError::Broker(BrokerError::not_found("nf")), "broker"),
         (ForwardError::Other("odd".into()), "other"),
     ] {
-        let peer = fake_peer(InternalMessage::Response(InternalResponse::ForwardFailed(fe.clone()))).await;
+        let peer = fake_peer(InternalMessage::Response(InternalResponse::ForwardFailed(
+            fe.clone(),
+        )))
+        .await;
         node.reroute_peer(42, peer).await;
         let r = node.forward_write(42, crate::META_GROUP, cmd.clone()).await;
         let msg = format!("{:?}", r.as_ref().err());
@@ -279,20 +306,29 @@ async fn forward_write_maps_every_failure_shape() {
             "unreachable" => assert!(matches!(r, Err(ClusterError::Unreachable { .. })), "{msg}"),
             "not joined" => assert!(matches!(r, Err(ClusterError::NotJoined)), "{msg}"),
             "broker" => assert!(matches!(r, Err(ClusterError::Broker(_))), "{msg}"),
-            _ => assert!(matches!(r, Err(ClusterError::Codec(m)) if m.contains("odd")), "{msg}"),
+            _ => assert!(
+                matches!(r, Err(ClusterError::Codec(m)) if m.contains("odd")),
+                "{msg}"
+            ),
         }
     }
 
     // A bare error string and a wrong reply type both decode as codec
     // errors.
-    let peer = fake_peer(InternalMessage::Response(InternalResponse::Error("boom".into()))).await;
+    let peer = fake_peer(InternalMessage::Response(InternalResponse::Error(
+        "boom".into(),
+    )))
+    .await;
     node.reroute_peer(42, peer).await;
     assert!(matches!(
         node.forward_write(42, crate::META_GROUP, cmd.clone()).await,
         Err(ClusterError::Codec(m)) if m.contains("boom")
     ));
 
-    let peer = fake_peer(InternalMessage::Response(InternalResponse::Admin(AdminResponse::Pong))).await;
+    let peer = fake_peer(InternalMessage::Response(InternalResponse::Admin(
+        AdminResponse::Pong,
+    )))
+    .await;
     node.reroute_peer(42, peer).await;
     assert!(matches!(
         node.forward_write(42, crate::META_GROUP, cmd).await,
@@ -307,24 +343,36 @@ async fn unjoined_write_reports_unreachable() {
     set_test_tempo("10");
     let cfg = NodeConfig {
         id: 7,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-pending-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-pending-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
-    let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode { node: 42, info: test_info() });
+    let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode {
+        node: 42,
+        info: test_info(),
+    });
     let r = tokio::time::timeout(
         std::time::Duration::from_secs(45),
         node.write(crate::META_GROUP, cmd),
     )
     .await
     .expect("write must fail, not hang");
-    assert!(matches!(r, Err(ClusterError::Unreachable { group: crate::META_GROUP })));
+    assert!(matches!(
+        r,
+        Err(ClusterError::Unreachable {
+            group: crate::META_GROUP
+        })
+    ));
 }
 
 /// Direct inter-node consumer data path: a consumer registered on node 2
@@ -337,17 +385,24 @@ async fn deliver_and_cancel_cross_nodes() {
     let internal1 = node1.cfg.internal_addr.clone();
     let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-x2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-x2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![internal1],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
+    wait_for("node2 joins", 60, || {
+        node1.topology().nodes.contains_key(&2)
+    })
+    .await;
     wait_meta_ready(&node1).await;
     wait_meta_ready(&node2).await;
 
@@ -380,7 +435,13 @@ async fn deliver_and_cancel_cross_nodes() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
     let (ctx_tx, mut crx) = tokio::sync::mpsc::unbounded_channel();
     node2
-        .attach_consumer(sub, ConsumerSink { deliveries: dtx, cancelled: ctx_tx })
+        .attach_consumer(
+            sub,
+            ConsumerSink {
+                deliveries: dtx,
+                cancelled: ctx_tx,
+            },
+        )
         .await;
     node2
         .write(
@@ -401,10 +462,7 @@ async fn deliver_and_cancel_cross_nodes() {
     node2
         .write(
             shard,
-            BrokerCommand::Shard(ShardCmd::Credit {
-                sub,
-                count: 10,
-            }),
+            BrokerCommand::Shard(ShardCmd::Credit { sub, count: 10 }),
         )
         .await
         .unwrap();
@@ -438,7 +496,9 @@ async fn deliver_and_cancel_cross_nodes() {
     node2
         .write(
             shard,
-            BrokerCommand::Shard(ShardCmd::DeleteQueueData { queue: "cross".into() }),
+            BrokerCommand::Shard(ShardCmd::DeleteQueueData {
+                queue: "cross".into(),
+            }),
         )
         .await
         .unwrap();
@@ -469,25 +529,38 @@ async fn pending_node_logs_and_write_times_out() {
     init_log();
     let cfg = NodeConfig {
         id: 8,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-pend2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-pend2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node = ClusterNode::start(cfg).await.unwrap();
 
     // Calls to unknown peers are unreachable; a request-shaped reply is a
     // codec error.
     assert!(matches!(
-        node.call(42, InternalRequest::Admin(AdminRequest::Ping)).await,
-        Err(ClusterError::Unreachable { group: crate::META_GROUP })
+        node.call(42, InternalRequest::Admin(AdminRequest::Ping))
+            .await,
+        Err(ClusterError::Unreachable {
+            group: crate::META_GROUP
+        })
     ));
     let writes_to_unknown_group = node
-        .write(999, BrokerCommand::Meta(MetaCmd::RegisterNode { node: 42, info: test_info() }))
+        .write(
+            999,
+            BrokerCommand::Meta(MetaCmd::RegisterNode {
+                node: 42,
+                info: test_info(),
+            }),
+        )
         .await;
     assert!(matches!(
         writes_to_unknown_group,
@@ -520,7 +593,9 @@ async fn call_rejects_a_request_shaped_reply() {
         }
     });
     node.reroute_peer(30, addr).await;
-    let r = node.call(30, InternalRequest::Admin(AdminRequest::Ping)).await;
+    let r = node
+        .call(30, InternalRequest::Admin(AdminRequest::Ping))
+        .await;
     assert!(
         matches!(&r, Err(ClusterError::Codec(m)) if m.contains("unexpected")),
         "expected a codec rejection of the request-shaped reply, got {r:?}"
@@ -546,10 +621,21 @@ async fn ensure_group_reuses_cached_handles() {
     assert!(Arc::ptr_eq(&h1, &h2));
     // Weak-cache path: evict from the map; the process-global LIVE cache
     // still holds the live handle and re-installs it.
-    node.groups.write().expect("groups lock").remove(&crate::META_GROUP);
+    node.groups
+        .write()
+        .expect("groups lock")
+        .remove(&crate::META_GROUP);
     let h3 = node.ensure_group(crate::META_GROUP).await.unwrap();
-    assert!(Arc::ptr_eq(&h1, &h3), "LIVE cache must resurrect the handle");
-    assert!(node.groups.read().expect("groups lock").contains_key(&crate::META_GROUP));
+    assert!(
+        Arc::ptr_eq(&h1, &h3),
+        "LIVE cache must resurrect the handle"
+    );
+    assert!(
+        node.groups
+            .read()
+            .expect("groups lock")
+            .contains_key(&crate::META_GROUP)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -560,11 +646,9 @@ async fn controller_reinstalls_evicted_group_handles() {
     // Evict a shard group handle: the controller (400 ms tick) drives
     // convergence, which re-runs ensure_group for every meta group.
     node.groups.write().expect("groups lock").remove(&1);
-    wait_for(
-        "controller reinstalls the evicted handle",
-        15,
-        || node.groups.read().expect("groups lock").contains_key(&1),
-    )
+    wait_for("controller reinstalls the evicted handle", 15, || {
+        node.groups.read().expect("groups lock").contains_key(&1)
+    })
     .await;
 }
 
@@ -582,10 +666,16 @@ async fn raft_payload_relays_and_reconfigure_relay_errors() {
         None,
     )));
     let resp = node
-        .handle_request(InternalMessage::Request(InternalRequest::Raft { group: 999, payload: vote }))
+        .handle_request(InternalMessage::Request(InternalRequest::Raft {
+            group: 999,
+            payload: vote,
+        }))
         .await;
     assert!(
-        matches!(resp, InternalResponse::Raft(crate::proto::RaftResponse::Vote(_))),
+        matches!(
+            resp,
+            InternalResponse::Raft(crate::proto::RaftResponse::Vote(_))
+        ),
         "{resp:?}"
     );
 
@@ -599,12 +689,19 @@ async fn raft_payload_relays_and_reconfigure_relay_errors() {
             },
         )))
         .await;
-    assert!(matches!(resp, InternalResponse::Admin(AdminResponse::Attached)));
+    assert!(matches!(
+        resp,
+        InternalResponse::Admin(AdminResponse::Attached)
+    ));
 
     // Reconfigure of a group this node cannot host fails without a hint.
     let resp = node
         .handle_request(InternalMessage::Request(InternalRequest::Admin(
-            AdminRequest::ReconfigureGroup { group: 999, voters: vec![1], forwarded: false },
+            AdminRequest::ReconfigureGroup {
+                group: 999,
+                voters: vec![1],
+                forwarded: false,
+            },
         )))
         .await;
     assert!(
@@ -622,17 +719,24 @@ async fn reconfigure_relay_maps_leader_reply_errors() {
     let internal1 = node1.cfg.internal_addr.clone();
     let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-rr2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-rr2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![internal1],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
+    wait_for("node2 joins", 60, || {
+        node1.topology().nodes.contains_key(&2)
+    })
+    .await;
     wait_meta_ready(&node2).await;
     wait_leader_seen(&node2, 1, 30).await;
 
@@ -648,10 +752,16 @@ async fn reconfigure_relay_maps_leader_reply_errors() {
     };
 
     // Leader peer replies with a bare error → surfaced verbatim.
-    let err_peer = fake_peer(InternalMessage::Response(InternalResponse::Error("nope".into()))).await;
+    let err_peer = fake_peer(InternalMessage::Response(InternalResponse::Error(
+        "nope".into(),
+    )))
+    .await;
     node2.reroute_peer(1, err_peer).await;
     let resp = node2.handle_request(req(false)).await;
-    assert!(matches!(resp, InternalResponse::Error(ref e) if e.contains("nope")), "{resp:?}");
+    assert!(
+        matches!(resp, InternalResponse::Error(ref e) if e.contains("nope")),
+        "{resp:?}"
+    );
 
     // Leader peer replies with the wrong admin kind → bad-reply error.
     let pong_peer = fake_peer(InternalMessage::Response(InternalResponse::Admin(
@@ -710,17 +820,24 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
     let internal1 = node1.cfg.internal_addr.clone();
     let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-pw2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-pw2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![internal1],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
+    wait_for("node2 joins", 60, || {
+        node1.topology().nodes.contains_key(&2)
+    })
+    .await;
     wait_meta_ready(&node2).await;
     // Make sure node2 is the FOLLOWER (its writes must hop to node1).
     loop {
@@ -749,13 +866,17 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
         client_addr: "127.0.0.1:1".into(),
         internal_addr: "127.0.0.1:1".into(),
     };
-    node2.try_write_depth(
-        crate::META_GROUP,
-        &BrokerCommand::Meta(MetaCmd::RegisterNode { node: 1, info: dead }),
-        0,
-    )
-    .await
-    .expect("meta poison write itself must land (node1 still reachable)");
+    node2
+        .try_write_depth(
+            crate::META_GROUP,
+            &BrokerCommand::Meta(MetaCmd::RegisterNode {
+                node: 1,
+                info: dead,
+            }),
+            0,
+        )
+        .await
+        .expect("meta poison write itself must land (node1 still reachable)");
     node2.reroute_peer(1, "127.0.0.1:1".into()).await;
     let cmd = BrokerCommand::Meta(MetaCmd::DeclareQueue {
         vhost: "/".into(),
@@ -793,11 +914,9 @@ async fn controller_initializes_hand_extended_groups_and_skips_empty() {
     )
     .await
     .unwrap();
-    wait_for(
-        "controller initializes the hand-extended group",
-        20,
-        || node.groups.read().expect("groups lock").contains_key(&90),
-    )
+    wait_for("controller initializes the hand-extended group", 20, || {
+        node.groups.read().expect("groups lock").contains_key(&90)
+    })
     .await;
 }
 
@@ -808,12 +927,19 @@ async fn evicted_meta_handle_is_tolerated_by_the_controller() {
     wait_meta_ready(&node).await;
     // Evicting the meta handle must not wedge the controller: the tick
     // skips (no handle) and the LIVE cache restores it on demand.
-    node.groups.write().expect("groups lock").remove(&crate::META_GROUP);
+    node.groups
+        .write()
+        .expect("groups lock")
+        .remove(&crate::META_GROUP);
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let h = node.ensure_group(crate::META_GROUP).await.unwrap();
     assert!(Arc::ptr_eq(
         &h,
-        node.groups.read().expect("groups lock").get(&crate::META_GROUP).unwrap()
+        node.groups
+            .read()
+            .expect("groups lock")
+            .get(&crate::META_GROUP)
+            .unwrap()
     ));
 }
 
@@ -854,17 +980,24 @@ async fn follower_forwarded_write_is_transient() {
     let internal1 = node1.cfg.internal_addr.clone();
     let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-fw2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-fw2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![internal1],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
+    wait_for("node2 joins", 60, || {
+        node1.topology().nodes.contains_key(&2)
+    })
+    .await;
     wait_meta_ready(&node2).await;
     wait_leader_seen(&node2, 1, 30).await;
 
@@ -881,7 +1014,10 @@ async fn follower_forwarded_write_is_transient() {
         }))
         .await;
     assert!(
-        matches!(resp, InternalResponse::ForwardFailed(crate::proto::ForwardError::Transient)),
+        matches!(
+            resp,
+            InternalResponse::ForwardFailed(crate::proto::ForwardError::Transient)
+        ),
         "{resp:?}"
     );
 }
@@ -894,17 +1030,24 @@ async fn reconfigure_relay_success_arm() {
     let internal1 = node1.cfg.internal_addr.clone();
     let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!("sb-nt-rs2-{}-{}", std::process::id(), free_port())),
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-rs2-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![internal1],
         bootstrap: false,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    wait_for("node2 joins", 60, || node1.topology().nodes.contains_key(&2)).await;
+    wait_for("node2 joins", 60, || {
+        node1.topology().nodes.contains_key(&2)
+    })
+    .await;
     wait_meta_ready(&node2).await;
     wait_leader_seen(&node2, 1, 30).await;
 
@@ -927,7 +1070,10 @@ async fn reconfigure_relay_success_arm() {
         )))
         .await;
     assert!(
-        matches!(resp, InternalResponse::Admin(crate::proto::AdminResponse::Reconfigured)),
+        matches!(
+            resp,
+            InternalResponse::Admin(crate::proto::AdminResponse::Reconfigured)
+        ),
         "{resp:?}"
     );
 }
@@ -967,7 +1113,9 @@ async fn stale_pooled_conn_retries_and_silence_times_out() {
             let _ = conn.write_frame(&bincode::serialize(&pong).unwrap()).await;
         }
         loop {
-            let Ok((tcp, _)) = listener.accept().await else { return };
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 if let Ok(conn) = crate::transport::accept(tcp, None).await {
                     // Hold it: no read, no reply.
@@ -981,7 +1129,8 @@ async fn stale_pooled_conn_retries_and_silence_times_out() {
 
     // First call: answered, connection parked for reuse.
     assert!(matches!(
-        node.call(42, InternalRequest::Admin(AdminRequest::Ping)).await,
+        node.call(42, InternalRequest::Admin(AdminRequest::Ping))
+            .await,
         Ok(InternalResponse::Admin(AdminResponse::Pong))
     ));
 
@@ -989,7 +1138,10 @@ async fn stale_pooled_conn_retries_and_silence_times_out() {
     // the transport failure retries over a fresh dial; the fresh conn is
     // answered with silence, which must surface as a bounded timeout —
     // never a park.
-    match node.call(42, InternalRequest::Admin(AdminRequest::Ping)).await {
+    match node
+        .call(42, InternalRequest::Admin(AdminRequest::Ping))
+        .await
+    {
         Err(ClusterError::Io(e)) => {
             assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}")
         }

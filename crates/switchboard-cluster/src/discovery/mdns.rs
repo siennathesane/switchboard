@@ -9,13 +9,17 @@
 
 use std::sync::Arc;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use tracing::{debug, info, warn};
+use mdns_sd::ServiceDaemon;
+use mdns_sd::ServiceEvent;
+use mdns_sd::ServiceInfo;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::node::ClusterNode;
 
-use super::DiscoveryConfig;
 use super::DiscoveredPeer;
+use super::DiscoveryConfig;
 
 pub const SERVICE_TYPE: &str = "_switchboard._tcp.local.";
 
@@ -31,11 +35,7 @@ fn advertise_ip() -> std::net::IpAddr {
         .into_iter()
         .find_map(|i| {
             let ip = i.ip();
-            if !ip.is_loopback() {
-                Some(ip)
-            } else {
-                None
-            }
+            if !ip.is_loopback() { Some(ip) } else { None }
         })
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]))
 }
@@ -47,7 +47,10 @@ fn instance_name(cfg: &DiscoveryConfig, node_id: u64) -> String {
 }
 
 fn internal_port(addr: &str) -> u16 {
-    addr.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(5673)
+    addr.rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5673)
 }
 
 fn host_name(cfg: &DiscoveryConfig, node_id: u64) -> String {
@@ -111,7 +114,10 @@ pub fn spawn(
                     }
                 };
                 debug!(%addr, ?peer_id, "mdns peer discovered");
-                let _ = tx.send(DiscoveredPeer { internal_addr: addr, node_id: peer_id });
+                let _ = tx.send(DiscoveredPeer {
+                    internal_addr: addr,
+                    node_id: peer_id,
+                });
             }
         }
         warn!("mdns browse stream ended");

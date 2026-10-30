@@ -8,7 +8,9 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
-use switchboard_bench::soak;
+use switchboard_bench::soak::ScaleMode;
+use switchboard_bench::soak::SoakConfig;
+use switchboard_bench::soak::run;
 
 #[derive(Parser, Debug)]
 #[command(name = "switchboard-soak")]
@@ -93,7 +95,7 @@ async fn main() -> Result<()> {
     if args.size == 0 {
         bail!("--size must be positive");
     }
-    let mut cfg = soak::SoakConfig {
+    let mut cfg = SoakConfig {
         hosts: args.hosts.clone(),
         user: args.user,
         password: args.password,
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
             if parts.len() != 3 {
                 bail!("--scale wants ns/deployment:min:max");
             }
-            cfg.scale = soak::ScaleMode::K8s {
+            cfg.scale = ScaleMode::K8s {
                 namespace: parts[0].split('/').next().unwrap_or("soak").to_string(),
                 deployment: parts[0].split('/').nth(1).unwrap_or(parts[0]).to_string(),
                 min: parts[1].parse()?,
@@ -146,7 +148,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let report = soak::run(cfg).await;
+    let report = run(cfg).await;
     if !report.passed {
         std::process::exit(1);
     }

@@ -56,9 +56,15 @@ pub struct Envelope {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum InternalRequest {
     /// openraft RPC between members of `group`.
-    Raft { group: GroupId, payload: RaftPayload },
+    Raft {
+        group: GroupId,
+        payload: RaftPayload,
+    },
     /// Apply `command` on `group` (used for cross-group writes and reads).
-    Forward { group: GroupId, command: BrokerCommand },
+    Forward {
+        group: GroupId,
+        command: BrokerCommand,
+    },
     Admin(AdminRequest),
 }
 
@@ -120,7 +126,11 @@ pub enum RaftResponse {
 pub enum AdminRequest {
     /// "I am node `node` at these addresses; please add me to the cluster
     /// directory (and to my assigned groups)."
-    Join { node: NodeId, info: NodeInfo, bootstrap: bool },
+    Join {
+        node: NodeId,
+        info: NodeInfo,
+        bootstrap: bool,
+    },
     /// Hand a delivered message to the node hosting the consumer.
     Deliver {
         sub: SubscriptionId,
@@ -131,9 +141,16 @@ pub enum AdminRequest {
         deleted: bool,
     },
     /// The consumer's queue was deleted: cancel the consumer.
-    CancelConsumer { sub: SubscriptionId, consumer_tag: String },
+    CancelConsumer {
+        sub: SubscriptionId,
+        consumer_tag: String,
+    },
     /// Register a local channel as the recipient for `sub`'s deliveries.
-    AttachConsumer { sub: SubscriptionId, conn: ConnectionId, reply: bool },
+    AttachConsumer {
+        sub: SubscriptionId,
+        conn: ConnectionId,
+        reply: bool,
+    },
     /// Liveness signal (in-memory on the receiving side, not raft).
     Ping,
     /// Ask for the peer's local applied meta state (eventually consistent
@@ -143,7 +160,11 @@ pub enum AdminRequest {
     /// member list): missing nodes are added as learners and promoted, and
     /// the voter set is replaced wholesale. Sent by the meta controller
     /// after a departure heals a group; `forwarded` bounds the leader hop.
-    ReconfigureGroup { group: GroupId, voters: Vec<NodeId>, forwarded: bool },
+    ReconfigureGroup {
+        group: GroupId,
+        voters: Vec<NodeId>,
+        forwarded: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +220,10 @@ mod tests {
         let msg = InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping));
         let bytes = bincode::serialize(&msg).unwrap();
         let back: InternalMessage = bincode::deserialize(&bytes).unwrap();
-        assert!(matches!(back, InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping))));
+        assert!(matches!(
+            back,
+            InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping))
+        ));
 
         let msg = InternalMessage::Request(InternalRequest::Forward {
             group: 2,

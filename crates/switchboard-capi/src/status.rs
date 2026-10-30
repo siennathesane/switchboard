@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::fmt;
+use std::fmt::Display;
 
 /// The status code every `sb_*` entry point returns. The numeric values
 /// are part of the ABI (frozen for 1.0): C callers may switch on them.
@@ -138,7 +138,7 @@ pub(crate) fn record_error(msg: String) {
 
 /// Set the thread-local error message and return `status` — the standard
 /// failure path of every entry point.
-pub(crate) fn fail(status: SbStatus, msg: impl fmt::Display) -> SbStatus {
+pub(crate) fn fail(status: SbStatus, msg: impl Display) -> SbStatus {
     record_error(format!("{}: {msg}", status_name(status)));
     status
 }

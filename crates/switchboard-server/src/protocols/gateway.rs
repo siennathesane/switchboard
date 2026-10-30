@@ -13,7 +13,7 @@ use tokio::io::ReadBuf;
 use switchboard_cluster::ClusterNode;
 
 use crate::channel::ConnectionLimits;
-use crate::session;
+use crate::session::serve_rw;
 
 use super::amqp10;
 use super::detect::Classify;
@@ -143,7 +143,7 @@ where
     match detected {
         Detected::Amqp091 => {
             let (r, w) = tokio::io::split(io);
-            session::serve_rw(r, w, node, limits).await
+            serve_rw(r, w, node, limits).await
         }
         Detected::Mqtt => mqtt::serve(io, node, limits.clone()).await,
         Detected::Stomp => stomp::serve(io, node, limits.clone()).await,

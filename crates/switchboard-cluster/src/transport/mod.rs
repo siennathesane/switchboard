@@ -243,10 +243,7 @@ impl PeerConn {
 }
 
 /// Accept one internal connection (TLS wrapped when configured).
-pub async fn accept(
-    tcp: TcpStream,
-    tls: Option<&TlsAcceptor>,
-) -> std::io::Result<Accepted> {
+pub async fn accept(tcp: TcpStream, tls: Option<&TlsAcceptor>) -> std::io::Result<Accepted> {
     tcp.set_nodelay(true).ok();
     match tls {
         Some(a) => Ok(Accepted::Tls(Box::new(a.accept(tcp).await?))),
@@ -308,10 +305,7 @@ impl fmt::Debug for Accepted {
 }
 
 /// Build a TLS server acceptor from PEM cert chain + key.
-pub fn tls_acceptor(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<TlsAcceptor, String> {
+pub fn tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor, String> {
     let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
         .collect::<Result<_, _>>()
         .map_err(|e| format!("bad certificate PEM: {e}"))?;
@@ -386,7 +380,9 @@ mod tests {
         let chan = PeerChannel::new(None, "localhost".into());
         let mut conn = chan.connect(&addr.to_string()).await.unwrap();
         // Announce a 100 MB frame.
-        conn.send(&(100u32 * 1024 * 1024).to_le_bytes()).await.unwrap();
+        conn.send(&(100u32 * 1024 * 1024).to_le_bytes())
+            .await
+            .unwrap();
         let res = conn.recv().await;
         assert!(res.is_err(), "oversized frame must be rejected");
         server.await.unwrap();
