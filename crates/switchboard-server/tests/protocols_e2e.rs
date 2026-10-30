@@ -2869,7 +2869,6 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
     // message on amq.topic (bound "#"), so the denied one must never
     // appear there while the allowed one does.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut saw_allowed = false;
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -2881,13 +2880,11 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
         {
             Some((_, b)) => {
                 assert_eq!(b, b"allowed");
-                saw_allowed = true;
                 break;
             }
             None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
-    assert!(saw_allowed);
     c8.write_all(&gateway_support::mqtt_publish(
         "other/feed",
         b"denied",

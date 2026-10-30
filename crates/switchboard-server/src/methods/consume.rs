@@ -56,6 +56,9 @@ impl Channel {
                 })?
             }
         };
+        // Exclusive-queue ownership (code-scanning alert #13): consuming
+        // another connection's exclusive queue is 405 RESOURCE_LOCKED.
+        self.assert_queue_ownership(&qi)?;
         let shard = qi.shard;
         let (prefetch, prefetch_size) = {
             let inner = self.inner.lock().unwrap();

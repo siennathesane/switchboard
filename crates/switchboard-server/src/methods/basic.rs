@@ -31,6 +31,10 @@ impl Channel {
         queue: &str,
         no_ack: bool,
     ) -> ChannelResult<()> {
+        // Exclusive-queue ownership (code-scanning alert #13): a get from
+        // another connection's exclusive queue is 405 RESOURCE_LOCKED.
+        let qi = self.queue_info(node, queue).await?;
+        self.assert_queue_ownership(&qi)?;
         let shard = self.queue_shard(node, queue).await?;
         let get_id = self
             .sub_counter

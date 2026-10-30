@@ -17,6 +17,57 @@ use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
 
 impl Channel {
+    /// Exclusive-queue ownership guard (code-scanning alert #13): a
+    /// queue declared exclusive may only be USED by the connection that
+    /// declared it. Any other connection — even one whose ACLs would
+    /// allow the resource — gets 405 RESOURCE_LOCKED (RabbitMQ
+    /// behavior), so exclusivity cannot be sidestepped by merely knowing
+    /// the queue name. Ownership is per-connection (same connection,
+    /// other channels: allowed).
+    pub(crate) fn assert_queue_ownership(
+        &self,
+        qi: &switchboard_core::model::QueueInfo,
+    ) -> ChannelResult<()> {
+        if !qi.options.exclusive {
+            return Ok(());
+        }
+        let conn = self.inner.lock().unwrap().conn;
+        if qi.owner == Some(conn) {
+            return Ok(());
+        }
+        Err(BrokerError::resource_locked(format!(
+            "queue {:?} is exclusive to another connection",
+            qi.name
+        )))
+    }
+
+    /// Resolve the full queue info (ownership included), refreshing the
+    /// local view once when it lags a just-replicated declare — the same
+    /// discipline as [`Channel::queue_shard`].
+    pub(crate) async fn queue_info(
+        &self,
+        node: &Arc<ClusterNode>,
+        queue: &str,
+    ) -> ChannelResult<switchboard_core::model::QueueInfo> {
+        let resolve = |topo: &switchboard_core::topology::MetaState| {
+            topo.vhosts
+                .get(&inner_vhost(self))
+                .and_then(|v| v.queues.get(queue))
+                .cloned()
+        };
+        if let Some(qi) = resolve(&node.topology()) {
+            return Ok(qi);
+        }
+        node.refresh_topology().await;
+        resolve(&node.topology()).ok_or_else(|| {
+            BrokerError::not_found(format!(
+                "no queue {queue:?} in vhost {:?}",
+                inner_vhost(self)
+            ))
+            .channel_level()
+        })
+    }
+
     pub(crate) async fn queue_declare(
         &self,
         node: &Arc<ClusterNode>,
@@ -114,6 +165,9 @@ impl Channel {
         node: &Arc<ClusterNode>,
         queue: &str,
     ) -> ChannelResult<u32> {
+        // Exclusive-queue ownership (code-scanning alert #13).
+        let qi = self.queue_info(node, queue).await?;
+        self.assert_queue_ownership(&qi)?;
         let shard = self.queue_shard(node, queue).await?;
         match shard_call(
             node,
@@ -138,6 +192,9 @@ impl Channel {
         if_unused: bool,
         if_empty: bool,
     ) -> ChannelResult<u32> {
+        // Exclusive-queue ownership (code-scanning alert #13).
+        let qi = self.queue_info(node, queue).await?;
+        self.assert_queue_ownership(&qi)?;
         let shard = self.queue_shard(node, queue).await?;
         // Linearizable stats feed the if_empty/if_unused assertions, which
         // the meta state machine re-checks under raft. A 404 from the shard

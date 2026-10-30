@@ -398,6 +398,9 @@ impl Channel {
                 ..
             } => {
                 authorize_ch(self, node, Perm::Configure, &queue)?;
+                // Exclusive-queue ownership (code-scanning alert #13).
+                let qi = self.queue_info(node, &queue).await?;
+                self.assert_queue_ownership(&qi)?;
                 meta_call(
                     node,
                     MetaCmd::Bind {
@@ -422,6 +425,9 @@ impl Channel {
                 ..
             } => {
                 authorize_ch(self, node, Perm::Configure, &queue)?;
+                // Exclusive-queue ownership (code-scanning alert #13).
+                let qi = self.queue_info(node, &queue).await?;
+                self.assert_queue_ownership(&qi)?;
                 meta_call(
                     node,
                     MetaCmd::Unbind {

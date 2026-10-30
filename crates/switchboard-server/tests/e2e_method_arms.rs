@@ -599,3 +599,215 @@ async fn queue_unbind_and_nowait_variants() {
         Method::BasicQosOk { .. }
     ));
 }
+
+/// Alert #13: an exclusive queue is usable ONLY by the connection that
+/// declared it — every other connection gets 405 RESOURCE_LOCKED on
+/// consume/get/purge/bind/delete, while the owner keeps full access.
+#[tokio::test(flavor = "multi_thread")]
+async fn exclusive_queue_use_is_locked_to_its_owner_connection() {
+    let (_node, addr) = start_broker("excl-lock").await;
+
+    // Owner declares an exclusive queue and parks one message in it.
+    let mut owner = connect_and_open(&addr, "/").await.unwrap();
+    owner
+        .send_method(
+            1,
+            &Method::QueueDeclare {
+                ticket: 0,
+                queue: "excl-q".into(),
+                passive: false,
+                durable: true,
+                exclusive: true,
+                auto_delete: false,
+                nowait: false,
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner.expect(1).await.unwrap(),
+        Method::QueueDeclareOk { .. }
+    ));
+    publish(
+        &mut owner,
+        1,
+        "",
+        "excl-q",
+        &BasicProperties::new(),
+        b"secret",
+        false,
+    )
+    .await
+    .unwrap();
+
+    // A second connection that knows the name: every use is refused
+    // with 405 (each denial closes the channel, so use a fresh
+    // connection per operation).
+    // consume
+    let mut other = connect_and_open(&addr, "/").await.unwrap();
+    other
+        .send_method(
+            1,
+            &Method::BasicConsume {
+                ticket: 0,
+                queue: "excl-q".into(),
+                consumer_tag: String::new(),
+                no_local: false,
+                no_ack: true,
+                exclusive: false,
+                nowait: false,
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let got = other.expect(1).await.unwrap();
+    assert!(
+        matches!(
+            &got,
+            Method::ChannelClose {
+                reply_code: 405,
+                ..
+            }
+        ),
+        "second-connection consume must be 405, got {got:?}"
+    );
+    let _ = other.send_method(1, &Method::ChannelCloseOk {}).await;
+
+    // get (support's basic_get answers the channel close itself)
+    let mut other = connect_and_open(&addr, "/").await.unwrap();
+    let got = support::basic_get(&mut other, 1, "excl-q", true).await;
+    match got {
+        Err(text) => assert!(text.contains("405"), "expected 405, got: {text}"),
+        ok => panic!("second-connection get on exclusive queue answered {ok:?}"),
+    }
+
+    // purge
+    let mut other = connect_and_open(&addr, "/").await.unwrap();
+    other
+        .send_method(
+            1,
+            &Method::QueuePurge {
+                ticket: 0,
+                queue: "excl-q".into(),
+                nowait: false,
+            },
+        )
+        .await
+        .unwrap();
+    let got = other.expect(1).await.unwrap();
+    assert!(
+        matches!(
+            &got,
+            Method::ChannelClose {
+                reply_code: 405,
+                ..
+            }
+        ),
+        "second-connection purge must be 405, got {got:?}"
+    );
+    let _ = other.send_method(1, &Method::ChannelCloseOk {}).await;
+
+    // bind
+    let mut other = connect_and_open(&addr, "/").await.unwrap();
+    other
+        .send_method(
+            1,
+            &Method::QueueBind {
+                ticket: 0,
+                queue: "excl-q".into(),
+                exchange: "amq.topic".into(),
+                routing_key: "x".into(),
+                nowait: false,
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let got = other.expect(1).await.unwrap();
+    assert!(
+        matches!(
+            &got,
+            Method::ChannelClose {
+                reply_code: 405,
+                ..
+            }
+        ),
+        "second-connection bind must be 405, got {got:?}"
+    );
+    let _ = other.send_method(1, &Method::ChannelCloseOk {}).await;
+
+    // delete
+    let mut other = connect_and_open(&addr, "/").await.unwrap();
+    other
+        .send_method(
+            1,
+            &Method::QueueDelete {
+                ticket: 0,
+                queue: "excl-q".into(),
+                if_unused: false,
+                if_empty: false,
+                nowait: false,
+            },
+        )
+        .await
+        .unwrap();
+    let got = other.expect(1).await.unwrap();
+    assert!(
+        matches!(
+            &got,
+            Method::ChannelClose {
+                reply_code: 405,
+                ..
+            }
+        ),
+        "second-connection delete must be 405, got {got:?}"
+    );
+    let _ = other.send_method(1, &Method::ChannelCloseOk {}).await;
+
+    // The owner is unaffected: the message survived every refused
+    // access, consume works, and delete works.
+    let got = support::basic_get(&mut owner, 1, "excl-q", true)
+        .await
+        .unwrap()
+        .expect("owner get must still see the message");
+    assert_eq!(got.1, b"secret");
+    owner
+        .send_method(
+            1,
+            &Method::BasicConsume {
+                ticket: 0,
+                queue: "excl-q".into(),
+                consumer_tag: String::new(),
+                no_local: false,
+                no_ack: true,
+                exclusive: false,
+                nowait: false,
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner.expect(1).await.unwrap(),
+        Method::BasicConsumeOk { .. }
+    ));
+    owner
+        .send_method(
+            1,
+            &Method::QueueDelete {
+                ticket: 0,
+                queue: "excl-q".into(),
+                if_unused: false,
+                if_empty: false,
+                nowait: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner.expect(1).await.unwrap(),
+        Method::QueueDeleteOk { .. }
+    ));
+}
