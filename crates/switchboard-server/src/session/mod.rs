@@ -166,13 +166,28 @@ impl From<std::io::Error> for HandshakeError {
     }
 }
 
+/// Fallback bound for frames read during the handshake
+/// (pre-authentication; code-scanning alert #24).
+///
+/// `next_frame(0)` means "no limit", and until Tune-Ok completes no
+/// frame-max has been negotiated — Start-Ok/Tune-Ok/Open are all read
+/// with the limit disabled, so an unauthenticated peer could otherwise
+/// buffer a frame of up to 4 GiB before any credentials were checked.
+/// The connection's configured `ConnectionLimits::frame_max` applies
+/// when set; when it is configured as 0 ("no limit") this generous
+/// fixed bound stands in instead, since clients legitimately place
+/// sizable `client_properties` tables in Start-Ok before learning any
+/// server limit.
+const HANDSHAKE_FRAME_MAX: u32 = 1 << 20;
+
 /// Sequential method read during the handshake. Returns Ok(None) on EOF.
 async fn read_method<R: AsyncRead + Unpin>(
     reader: &mut R,
     fr: &mut FrameReader,
+    frame_max: u32,
 ) -> std::io::Result<Option<Method>> {
     loop {
-        if let Some(f) = fr.next_frame(0).map_err(io_err)? {
+        if let Some(f) = fr.next_frame(frame_max).map_err(io_err)? {
             if matches!(f.frame_type, switchboard_wire::FrameType::Method) {
                 let m = f.decode_method().map_err(io_err)?;
                 return Ok(Some(m));
@@ -236,8 +251,15 @@ where
     )
     .await?;
 
-    // 2. Connection.Start-Ok — authenticate via meta.
-    let got = read_method(reader, fr).await?;
+    // 2. Connection.Start-Ok — authenticate via meta. Every handshake
+    // read is bounded: the configured frame_max when set, otherwise the
+    // HANDSHAKE_FRAME_MAX fallback (never the old unbounded 0).
+    let hs_frame_max = if limits.frame_max == 0 {
+        HANDSHAKE_FRAME_MAX
+    } else {
+        limits.frame_max
+    };
+    let got = read_method(reader, fr, hs_frame_max).await?;
     let Some(Method::ConnectionStartOk {
         client_properties: _,
         mechanism,
@@ -288,7 +310,7 @@ where
         },
     )
     .await?;
-    let got2 = read_method(reader, fr).await?;
+    let got2 = read_method(reader, fr, hs_frame_max).await?;
     let Some(Method::ConnectionTuneOk {
         channel_max: client_channel_max,
         frame_max: client_frame_max,
@@ -305,7 +327,7 @@ where
     // 4. Connection.Open — vhost selection (§3.1.2). Per the amqp-uri
     // convention every client library follows, an empty vhost names the
     // default "/" (RabbitMQ behavior).
-    let got3 = read_method(reader, fr).await?;
+    let got3 = read_method(reader, fr, hs_frame_max).await?;
     let Some(Method::ConnectionOpen { virtual_host, .. }) = got3 else {
         return Err(HandshakeError::Rejected);
     };

@@ -376,3 +376,22 @@ async fn split_frames_are_reassembled() {
 }
 
 
+
+/// A handshake frame whose declared size dwarfs frame_max must be
+/// rejected at once, before authentication — the handshake reader used
+/// to pass 0 ("no limit") and would happily buffer it (code-scanning
+/// alert #24).
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_handshake_frame_is_rejected_before_auth() {
+    let (_node, addr) = start_broker("sa-hs-oversize").await;
+    let mut c = TestClient::connect(&addr).await.unwrap();
+    let _ = read_start(&mut c).await;
+    // Raw method-frame header (type=1, channel 0) announcing a 16 MiB
+    // payload; the connection's frame_max is the 131072 default, so this
+    // must fail the frame check immediately instead of buffering.
+    let mut hostile = vec![1u8, 0, 0];
+    hostile.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+    c.writer.write_all(&hostile).await.unwrap();
+    c.writer.flush().await.unwrap();
+    expect_closed(&mut c).await;
+}
