@@ -1,0 +1,20 @@
+[package]
+name = "switchboard-embedded"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process Switchboard broker + typed AMQP 0-9-1 client for embedding"
+
+[dependencies]
+switchboard-wire = { workspace = true }
+switchboard-core = { workspace = true }
+switchboard-cluster = { workspace = true }
+switchboard-server = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

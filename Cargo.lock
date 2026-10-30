@@ -2369,6 +2369,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchboard-embedded"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "switchboard-cluster",
+ "switchboard-core",
+ "switchboard-server",
+ "switchboard-wire",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "switchboard-server"
 version = "0.1.0"
 dependencies = [

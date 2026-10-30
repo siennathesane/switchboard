@@ -8,6 +8,7 @@ members = [
     "crates/switchboard-server",
     "crates/switchboard",
     "crates/switchboard-bench",
+    "crates/switchboard-embedded",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ switchboard-core = { path = "crates/switchboard-core" }
 switchboard-store = { path = "crates/switchboard-store" }
 switchboard-cluster = { path = "crates/switchboard-cluster" }
 switchboard-server = { path = "crates/switchboard-server" }
+switchboard-embedded = { path = "crates/switchboard-embedded" }
 switchboard-bench = { path = "crates/switchboard-bench" }
 
 tokio = { version = "1.53", features = ["full"] }
