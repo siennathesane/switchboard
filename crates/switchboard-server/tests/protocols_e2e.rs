@@ -279,7 +279,7 @@ async fn stomp_client_ack_removes_message() {
 }
 
 // ---------------------------------------------------------------------
-// Pre-auth allocation caps (code-scanning alert #10)
+// Pre-auth allocation caps (code-scanning alerts #10/#12)
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -302,6 +302,23 @@ async fn stomp_preauth_oversized_content_length_closes_the_connection() {
         "no giant body may be echoed; got {} bytes",
         buf.len()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_preauth_oversized_remaining_length_closes_the_connection() {
+    let _gateway_guard = lock().await;
+    let addr = gateway_support::shared_gateway().await;
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    // CONNECT header byte + the maximal 4-byte varint (268,435,455): the
+    // server must refuse before allocating the ~256 MiB body.
+    c.write_all(&[0x10, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        c.read_to_end(&mut buf),
+    )
+    .await
+    .expect("server must close the connection");
 }
 
 // ---------------------------------------------------------------------

@@ -258,6 +258,19 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
             ));
         }
     }
+    // The varint encoding is capped at 4 bytes but not its value: a
+    // 4-byte varint announces up to 268,435,455 bytes (~256 MiB), and
+    // this read covers the CONNECT that precedes any authentication.
+    // Cap the allocation before it happens (code-scanning alert #12).
+    if remaining > crate::protocols::PREAUTH_MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "mqtt: remaining length {remaining} exceeds the pre-auth frame cap {}",
+                crate::protocols::PREAUTH_MAX_FRAME_BYTES
+            ),
+        ));
+    }
     let mut body = vec![0u8; remaining];
     r.read_exact(&mut body).await?;
     let mut full = vec![head[0]];
@@ -633,5 +646,44 @@ mod edge_tests {
         let mut r: &[u8] = &[0x30, 0x02, 0x00, 0x05];
         let err = read_packet(&mut r).await.unwrap_err();
         assert!(err.to_string().contains("short packet") || err.to_string().contains("truncated"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod preauth_cap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_packet_rejects_oversized_remaining_length_before_allocating() {
+        // CONNECT header byte + the maximal 4-byte varint (268,435,455 =
+        // ~256 MiB): must fail fast with InvalidData, never allocate.
+        let mut r: &[u8] = &[0x10, 0xFF, 0xFF, 0xFF, 0x7F];
+        let err = read_packet(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("pre-auth frame cap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_packet_rejects_remaining_length_just_above_the_cap() {
+        let cap = crate::protocols::PREAUTH_MAX_FRAME_BYTES;
+        // Split (cap + 1) into a full 4-byte varint.
+        let over = (cap + 1) as u32;
+        let mut r: &[u8] = &[
+            0x10,
+            (0x80 | (over & 0x7F)) as u8,
+            (0x80 | ((over >> 7) & 0x7F)) as u8,
+            (0x80 | ((over >> 14) & 0x7F)) as u8,
+            ((over >> 21) & 0x7F) as u8,
+        ];
+        let err = read_packet(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_packet_still_accepts_a_small_packet() {
+        // PINGREQ: fixed header, zero remaining length.
+        let mut r: &[u8] = &[0xC0, 0x00];
+        let p = read_packet(&mut r).await.unwrap().unwrap();
+        assert!(matches!(p, Packet::PingReq));
     }
 }
