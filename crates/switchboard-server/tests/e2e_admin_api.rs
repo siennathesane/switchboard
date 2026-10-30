@@ -852,3 +852,172 @@ async fn restricted_user_cannot_bind_or_unbind_out_of_scope_exchanges() {
     // Cleanup via the API under test.
     let _ = api_delete("/api/users/svc-xb", &admin).await;
 }
+
+// ---------------------------------------------------------------------
+// 6) Admin gate: is_admin flag + grandfathering + strict mode
+//     (code-scanning alert #19)
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_requires_the_admin_flag_with_grandfathering() {
+    let _guard = lock().await;
+    light_hashing();
+    support::init_tracing();
+    let admin = basic_auth_header("guest", "guest");
+
+    // guest (the bootstrap-created user) is admin-flagged at formation:
+    // the whole suite's admin traffic depends on it.
+    let (code, text) = api_get("/api/users", Some(&admin)).await;
+    assert_eq!(code, 200, "bootstrap user lost admin: {text}");
+    assert!(
+        body_of(&text).contains(r#""name":"guest""#)
+            && body_of(&text).contains(r#""administrator":true"#),
+        "guest not listed as administrator: {}",
+        body_of(&text)
+    );
+
+    // A plain newly-created user (no permissions entry) is NOT admin —
+    // the exact escalation path the alert describes.
+    let (code, text) = api_put("/api/users/plainuser", &admin, r#"{"password":"ppw"}"#).await;
+    assert_eq!(code, 200, "create plainuser failed: {text}");
+    let plain = basic_auth_header("plainuser", "ppw");
+    let (code, text) = api_get("/api/users", Some(&plain)).await;
+    assert_eq!(code, 403, "plain user listed users: {text}");
+    let (code, text) = api_get("/api/queues", Some(&plain)).await;
+    assert_eq!(code, 403, "plain user listed queues: {text}");
+    let (code, text) = api_put("/api/users/other", &plain, r#"{"password":"x"}"#).await;
+    assert_eq!(code, 403, "plain user created a user: {text}");
+
+    // …but the broker itself still serves them: give them a scoped
+    // permissions entry and prove ordinary AMQP use works end to end.
+    let (code, text) = api_put(
+        "/api/permissions/%2F/plainuser",
+        &admin,
+        r#"{"configure":"^plainuser-.*","write":"^plainuser-.*|^$","read":"^plainuser-.*"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "set plainuser permissions failed: {text}");
+    let addr = gateway_support::shared_gateway().await;
+    let mut c = connect_and_open_creds(&addr, "/", "plainuser", "ppw")
+        .await
+        .expect("non-admin user connects to the broker");
+    let got = declare(&mut c, 1, "plainuser-q").await;
+    assert!(
+        matches!(got, Method::QueueDeclareOk { .. }),
+        "non-admin declare failed: {got:?}"
+    );
+    support::publish(
+        &mut c,
+        1,
+        "",
+        "plainuser-q",
+        &BasicProperties::default(),
+        b"still-a-user",
+        false,
+    )
+    .await
+    .unwrap();
+    let got = support::basic_get(&mut c, 1, "plainuser-q", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.expect("message must be readable").1,
+        b"still-a-user",
+        "non-admin broker traffic must keep working"
+    );
+
+    // Grandfathering: an explicit configure-".*" entry is the
+    // conventional full-power grant — that user stays admin.
+    let (code, text) = api_put("/api/users/legacy-admin", &admin, r#"{"password":"lpw"}"#).await;
+    assert_eq!(code, 200, "create legacy-admin failed: {text}");
+    let (code, text) = api_put(
+        "/api/permissions/%2F/legacy-admin",
+        &admin,
+        r#"{"configure":".*","write":".*","read":".*"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "set legacy-admin permissions failed: {text}");
+    let legacy = basic_auth_header("legacy-admin", "lpw");
+    let (code, text) = api_get("/api/users", Some(&legacy)).await;
+    assert_eq!(code, 200, "grandfathered configure-.* user refused: {text}");
+
+    // A restricted user (narrow regex) is NOT admin under either rule.
+    let (code, text) = api_put("/api/users/narrow", &admin, r#"{"password":"npw"}"#).await;
+    assert_eq!(code, 200, "create narrow failed: {text}");
+    let (code, text) = api_put(
+        "/api/permissions/%2F/narrow",
+        &admin,
+        r#"{"configure":"^x-.*","write":"^x-.*","read":"^x-.*"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "set narrow permissions failed: {text}");
+    let narrow = basic_auth_header("narrow", "npw");
+    let (code, text) = api_get("/api/users", Some(&narrow)).await;
+    assert_eq!(code, 403, "restricted user got in: {text}");
+
+    // Grant/revoke round-trip through the new admin route.
+    let (code, text) = api_put("/api/users/plainuser/admin", &admin, r#"{"admin":true}"#).await;
+    assert_eq!(code, 200, "grant admin failed: {text}");
+    let (code, text) = api_get("/api/users", Some(&plain)).await;
+    assert_eq!(code, 200, "granted user still refused: {text}");
+    let (code, text) = api_put("/api/users/plainuser/admin", &admin, r#"{"admin":false}"#).await;
+    assert_eq!(code, 200, "revoke admin failed: {text}");
+    let (code, text) = api_get("/api/users", Some(&plain)).await;
+    assert_eq!(code, 403, "revoked user kept admin: {text}");
+
+    // Cleanup via the API under test.
+    let _ = api_delete("/api/users/plainuser", &admin).await;
+    let _ = api_delete("/api/users/legacy-admin", &admin).await;
+    let _ = api_delete("/api/users/narrow", &admin).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_strict_mode_makes_the_flag_the_only_path() {
+    let _guard = lock().await;
+    light_hashing();
+    support::init_tracing();
+    let admin = basic_auth_header("guest", "guest");
+
+    // A grandfathered-shape user: configure-".*" entry, never flagged.
+    let (code, text) = api_put("/api/users/strict-legacy", &admin, r#"{"password":"slpw"}"#).await;
+    assert_eq!(code, 200, "create strict-legacy failed: {text}");
+    let (code, text) = api_put(
+        "/api/permissions/%2F/strict-legacy",
+        &admin,
+        r#"{"configure":".*","write":".*","read":".*"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "set strict-legacy permissions failed: {text}");
+
+    // Baseline (default mode): grandfathering admits them…
+    let legacy = basic_auth_header("strict-legacy", "slpw");
+    let (code, text) = api_get("/api/users", Some(&legacy)).await;
+    assert_eq!(
+        code, 200,
+        "grandfathered user refused before strict mode: {text}"
+    );
+
+    // …strict mode does not: only the flag counts. The env var is read
+    // per request, so flipping it while holding the suite lock is
+    // visible immediately (and always reset on the way out).
+    unsafe {
+        std::env::set_var("SWITCHBOARD_ADMIN_STRICT", "1");
+    }
+    let (code, text) = api_get("/api/users", Some(&legacy)).await;
+    assert_eq!(
+        code, 403,
+        "strict mode must refuse a non-flagged user: {text}"
+    );
+    // The flagged bootstrap user still passes strict mode.
+    let (code, text) = api_get("/api/users", Some(&admin)).await;
+    assert_eq!(code, 200, "flagged user refused under strict mode: {text}");
+    unsafe {
+        std::env::remove_var("SWITCHBOARD_ADMIN_STRICT");
+    }
+    // …and removing the variable restores grandfathering.
+    let (code, text) = api_get("/api/users", Some(&legacy)).await;
+    assert_eq!(code, 200, "grandfathering did not come back: {text}");
+
+    // Cleanup via the API under test.
+    let _ = api_delete("/api/users/strict-legacy", &admin).await;
+}

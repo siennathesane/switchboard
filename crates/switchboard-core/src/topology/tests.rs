@@ -996,3 +996,66 @@ fn fanout_done_moves_the_id_to_recent_and_out_of_pending() {
     );
     assert!(s.recent_fanouts.contains(&id));
 }
+
+/// Alert #19: the admin flag is replicated state with SetPermissions-shaped
+/// semantics (missing user refused, revoke clears, delete cascades) and
+/// serde-defaults empty for pre-flag snapshots.
+#[test]
+fn admin_flag_grant_revoke_and_cascade() {
+    let mut s = state();
+    assert!(
+        s.admins.contains("guest"),
+        "the bootstrap user is admin-flagged from the start"
+    );
+    s.apply(&MetaCmd::CreateUser {
+        name: "boss".into(),
+        password: "pw".into(),
+    })
+    .unwrap();
+
+    // Granting for a user that does not exist is refused, like SetPermissions.
+    let e = s
+        .apply(&MetaCmd::SetAdmin {
+            user: "ghost".into(),
+            admin: true,
+        })
+        .unwrap_err();
+    assert_eq!(e.code, 403);
+    assert!(!s.admins.contains("ghost"));
+
+    // Grant, then revoke.
+    s.apply(&MetaCmd::SetAdmin {
+        user: "boss".into(),
+        admin: true,
+    })
+    .unwrap();
+    assert!(s.admins.contains("boss"));
+    s.apply(&MetaCmd::SetAdmin {
+        user: "boss".into(),
+        admin: false,
+    })
+    .unwrap();
+    assert!(!s.admins.contains("boss"));
+
+    // Deleting a user cascades the flag with their other access.
+    s.apply(&MetaCmd::SetAdmin {
+        user: "boss".into(),
+        admin: true,
+    })
+    .unwrap();
+    s.apply(&MetaCmd::DeleteUser {
+        name: "boss".into(),
+    })
+    .unwrap();
+    assert!(!s.admins.contains("boss"));
+
+    // Pre-flag snapshots (no `admins` key) deserialize with nobody flagged.
+    let mut value = serde_json::to_value(&s).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("admins")
+        .expect("admins is serialized");
+    let back: MetaState = serde_json::from_value(value).unwrap();
+    assert!(back.admins.is_empty());
+}

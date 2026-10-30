@@ -63,6 +63,15 @@ pub struct MetaState {
     /// so pre-ACL deployments keep working; the moment any entry exists
     /// for a user, everything not granted is denied.
     pub permissions: BTreeMap<String, BTreeMap<String, Permissions>>,
+    /// Admin-flagged users (code-scanning alert #19): the admin HTTP API
+    /// (`/api`) is limited to these — plus, unless strict mode is enabled
+    /// at the server, grandfathered full-power users (see the admin module
+    /// docs). The bootstrap user is flagged at formation; grants/revokes
+    /// go through [`MetaCmd::SetAdmin`]. Serde-defaulted empty so
+    /// pre-flag snapshots deserialize unchanged (nobody is flagged, and
+    /// grandfathering carries them).
+    #[serde(default)]
+    pub admins: std::collections::BTreeSet<String>,
     pub nodes: BTreeMap<u64, NodeInfo>,
     /// Shard group map: group id → member node ids. Computed by the
     /// membership controller and applied through [`MetaCmd::SetGroups`].
@@ -158,6 +167,9 @@ pub fn bootstrap() -> MetaState {
         DEFAULT_USER.into(),
         crate::auth::hash_password(DEFAULT_PASSWORD),
     );
+    // The bootstrap user is admin-flagged from the start (code-scanning
+    // alert #19): someone must be able to grant the flag to others.
+    s.admins.insert(DEFAULT_USER.into());
     s
 }
 
@@ -253,6 +265,20 @@ impl MetaState {
             MetaCmd::DeleteUser { name } => {
                 self.users.remove(name);
                 self.permissions.remove(name);
+                // Cascade the admin flag with the rest of the user's
+                // access (code-scanning alert #19).
+                self.admins.remove(name);
+                Ok((MetaReply::Ok, vec![]))
+            }
+            MetaCmd::SetAdmin { user, admin } => {
+                if !self.users.contains_key(user) {
+                    return Err(BrokerError::access_refused(format!("no user {user:?}")));
+                }
+                if *admin {
+                    self.admins.insert(user.clone());
+                } else {
+                    self.admins.remove(user);
+                }
                 Ok((MetaReply::Ok, vec![]))
             }
             MetaCmd::CreateUser { name, password } => {
@@ -811,6 +837,13 @@ pub enum MetaCmd {
         vhost: String,
         topic: String,
         message: Option<crate::model::StoredMessage>,
+    },
+    /// Grant or revoke the admin flag for a user (code-scanning alert
+    /// #19); refused for a user that does not exist, exactly like
+    /// [`MetaCmd::SetPermissions`].
+    SetAdmin {
+        user: String,
+        admin: bool,
     },
 }
 

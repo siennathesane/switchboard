@@ -180,6 +180,11 @@ impl BrokerState {
                     name: user.clone(),
                     password: password.clone(),
                 })?;
+                // The formation user is admin-flagged from the start
+                // (code-scanning alert #19): someone must hold the flag
+                // so it can be granted onward. Idempotent like the rest
+                // of the bootstrap entities.
+                self.meta.admins.insert(user.clone());
                 self.bootstrapped = true;
                 let _ = (&r1, &r2);
                 Ok((BrokerReply::Bootstrapped, vec![]))

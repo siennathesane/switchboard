@@ -15,15 +15,27 @@
 //! [`super::shared::authorize`] so the guest-loopback rule applies here
 //! too. Missing/invalid credentials → 401.
 //!
-//! Authorization (consistent with the RabbitMQ-shaped permissions model in
-//! the meta SM): that table's semantics are "no entry anywhere =
-//! UNRESTRICTED (the legacy full-power default); any entry = denied
-//! everything not granted". Control-plane management (users, vhosts,
-//! permissions) has no per-resource regex, so it is reserved for
-//! UNRESTRICTED users — the same class of user the meta SM already trusts
-//! implicitly; a user RESTRICTED by the permissions table gets 403 on
-//! every `/api` operation, listings included (mirroring RabbitMQ, where
-//! the management API requires a management-capable tag).
+//! Authorization (code-scanning alert #19): every `/api` operation —
+//! listings included — requires the caller to be an ADMIN, decided by
+//! the replicated `MetaState::admins` flag (the bootstrap user is
+//! flagged at formation; `PUT /api/users/{name}/admin` grants/revokes
+//! it, admin-only). Previously ANY authenticated user absent from the
+//! permissions table was admin-equivalent, so every newly created user
+//! silently owned the control plane.
+//!
+//! Grandfathering (default) so no existing deployment regresses: a user
+//! is also treated as admin when they have a permissions entry whose
+//! `configure` regex is exactly `".*"` (the conventional full-power
+//! grant) — and, because formation flags it, the bootstrap-created user
+//! carries the flag outright. Setting the environment variable
+//! `SWITCHBOARD_ADMIN_STRICT` to a truthy value (anything but "", "0",
+//! "false", case-insensitive) disables grandfathering: the flag becomes
+//! the only path to the admin API, for strict deployments. Under both
+//! modes a user restricted by the permissions table (without the
+//! full-power entry) gets 403 on every `/api` operation, mirroring
+//! RabbitMQ's management-tag requirement — and non-admin users are
+//! still ordinary broker users: their AMQP/MQTT/STOMP/AMQP-1.0 access
+//! is governed by the same permissions regexes as before.
 //!
 //! Served from [`super::http::serve`] on the client port, next to
 //! `/stats` and `/metrics`; the endpoints ride the same `http` protocol
@@ -33,10 +45,12 @@
 //! addressed as `%2F`):
 //!
 //! ```text
-//! GET    /api/users                      → [{name, permissions}]
-//! GET    /api/users/{name}               → {name, permissions} | 404
+//! GET    /api/users                      → [{name, administrator, permissions}]
+//! GET    /api/users/{name}               → {name, administrator, permissions} | 404
 //! PUT    /api/users/{name}  {"password"} → CreateUser (create or rotate)
 //! DELETE /api/users/{name}               → DeleteUser (cascades permissions)
+//! PUT    /api/users/{name}/admin {"admin": true|false}
+//!                                      → SetAdmin (grant/revoke; admin-only)
 //! GET    /api/vhosts                     → [{name, queues, exchanges, bindings}]
 //! PUT    /api/vhosts/{name}              → DeclareVhost (idempotent)
 //! DELETE /api/vhosts/{name}              → 405 (no meta command exists)
@@ -201,17 +215,44 @@ async fn dispatch(
     .await
     .map_err(|_| ApiError::Unauthorized)?;
 
-    // ---- authorization: the control plane is for UNRESTRICTED users ----
-    if node.topology().permissions.contains_key(&user) {
-        return Err(ApiError::Forbidden(format!(
-            "user {user:?} is restricted by the permissions table; the admin API is limited to unrestricted users"
-        )));
+    // ---- authorization: the control plane is for ADMIN users ----
+    // (code-scanning alert #19). The replicated admin flag is the real
+    // gate; grandfathering keeps pre-flag deployments working (a
+    // configure-".*" permissions entry is the conventional full-power
+    // grant) unless SWITCHBOARD_ADMIN_STRICT disables it. This subsumes
+    // the old "restricted users are refused" rule: a user restricted
+    // without the full-power entry is simply not an admin.
+    {
+        let topo = node.topology();
+        let strict = admin_strict_mode();
+        let flagged = topo.admins.contains(&user);
+        let grandfathered = !strict
+            && (user == switchboard_wire::constants::DEFAULT_USER
+                || topo
+                    .permissions
+                    .get(&user)
+                    .is_some_and(|per_vhost| per_vhost.values().any(|p| p.configure == ".*")));
+        if !flagged && !grandfathered {
+            return Err(ApiError::Forbidden(format!(
+                "user {user:?} is not an admin; the admin API is limited to admin-flagged users{}",
+                if strict {
+                    " (SWITCHBOARD_ADMIN_STRICT is on: the flag is the only path)"
+                } else {
+                    " (grant it with PUT /api/users/{name}/admin)"
+                }
+            )));
+        }
     }
 
     let seg = |i: usize| segments.get(i).map(|s| s.as_str());
     match (method, seg(0), seg(1), seg(2)) {
         ("GET", Some("users"), None, _) => list_users(node),
         ("GET", Some("users"), Some(name), _) => get_user(node, name),
+        // PUT /api/users/{name}/admin — grant/revoke the admin flag. This
+        // arm MUST precede the generic PUT /api/users/{name} arm below,
+        // which would otherwise swallow the third segment (code-scanning
+        // alert #19).
+        ("PUT", Some("users"), Some(name), Some("admin")) => put_user_admin(node, name, body).await,
         ("PUT", Some("users"), Some(name), _) => put_user(node, name, body).await,
         ("DELETE", Some("users"), Some(name), _) => delete_user(node, name).await,
         ("GET", Some("vhosts"), None, _) => list_vhosts(node),
@@ -237,6 +278,18 @@ async fn dispatch(
 }
 
 // ---- request parsing helpers ----
+
+/// `SWITCHBOARD_ADMIN_STRICT` (default off): set to any truthy value —
+/// everything except the empty string, "0", and "false"
+/// (case-insensitive) — the replicated admin flag becomes the ONLY path
+/// to the admin API; grandfathered full-power users stop counting
+/// (code-scanning alert #19, for strict deployments).
+fn admin_strict_mode() -> bool {
+    match std::env::var("SWITCHBOARD_ADMIN_STRICT") {
+        Ok(v) => !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
 
 /// `Authorization: Basic base64(user:password)` → `(user, password)`.
 fn parse_basic_auth(header: Option<&str>) -> Option<(String, String)> {
@@ -407,6 +460,7 @@ fn list_users(node: &Arc<ClusterNode>) -> Result<String, ApiError> {
         .map(|name| {
             serde_json::json!({
                 "name": name,
+                "administrator": topo.admins.contains(name),
                 "permissions": topo
                     .permissions
                     .get(name)
@@ -436,7 +490,12 @@ fn get_user(node: &Arc<ClusterNode>, name: &str) -> Result<String, ApiError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(serde_json::json!({"name": name, "permissions": permissions}).to_string())
+    Ok(serde_json::json!({
+        "name": name,
+        "administrator": topo.admins.contains(name),
+        "permissions": permissions,
+    })
+    .to_string())
 }
 
 fn list_vhosts(node: &Arc<ClusterNode>) -> Result<String, ApiError> {
@@ -554,6 +613,31 @@ async fn put_user(node: &Arc<ClusterNode>, name: &str, body: &[u8]) -> Result<St
     )
     .await?;
     Ok(serde_json::json!({"name": name, "status": "ok"}).to_string())
+}
+
+/// `PUT /api/users/{name}/admin` with `{"admin": true|false}`: grant or
+/// revoke the admin flag through the replicated [`MetaCmd::SetAdmin`]
+/// (code-scanning alert #19). Admin-only (the dispatch gate above) and
+/// refused for a user that does not exist, like SetPermissions.
+async fn put_user_admin(
+    node: &Arc<ClusterNode>,
+    name: &str,
+    body: &[u8],
+) -> Result<String, ApiError> {
+    let payload: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON body: {e}")))?;
+    let admin = payload["admin"]
+        .as_bool()
+        .ok_or_else(|| ApiError::BadRequest("body must carry {\"admin\": true|false}".into()))?;
+    meta_write_then_refresh(
+        node,
+        MetaCmd::SetAdmin {
+            user: name.into(),
+            admin,
+        },
+    )
+    .await?;
+    Ok(serde_json::json!({"name": name, "administrator": admin, "status": "ok"}).to_string())
 }
 
 async fn delete_user(node: &Arc<ClusterNode>, name: &str) -> Result<String, ApiError> {
