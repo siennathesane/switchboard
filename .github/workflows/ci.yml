@@ -29,8 +29,13 @@
 
 name: CI
 
+# PR branches run the matrix exactly once, via the pull_request trigger;
+# push is limited to the trunk branches because a push to a PR head fires
+# both events, and the two runs land in different concurrency groups
+# (refs/heads/* vs refs/pull/*/merge) so neither cancels the other.
 on:
   push:
+    branches: [main, mainline]
   pull_request:
   workflow_dispatch:
 
