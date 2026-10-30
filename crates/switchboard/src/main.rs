@@ -23,6 +23,8 @@ use clap::Parser;
 use switchboard_cluster::NodeConfig;
 use switchboard_server::ConnectionLimits;
 
+mod backup_cmd;
+
 /// Command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "switchboard", version, about = "Multi-master AMQP 0-9-1 broker")]
@@ -185,6 +187,12 @@ pub struct Cli {
     /// AMQP heartbeat offered to clients, in seconds (0 disables).
     #[arg(long, env = "SWITCHBOARD_HEARTBEAT", default_value_t = 60)]
     pub heartbeat: u16,
+
+    /// Offline store tooling. Absent → run the broker (the default):
+    /// every flag above keeps its exact broker meaning when no subcommand
+    /// is given.
+    #[command(subcommand)]
+    pub command: Option<backup_cmd::Command>,
 }
 
 #[global_allocator]
@@ -196,6 +204,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cli.log).unwrap_or_default())
         .init();
+
+    // Offline store tools never boot the broker. Backup/restore operate on
+    // a quiesced data dir; see backup_cmd + switchboard_store::backup docs
+    // for the consistency guarantee and the format-version gate.
+    match cli.command {
+        Some(backup_cmd::Command::Backup(args)) => return backup_cmd::backup(&args),
+        Some(backup_cmd::Command::Restore(args)) => return backup_cmd::restore(&args),
+        None => {}
+    }
 
     let advertise = cli.advertise.clone().unwrap_or_else(|| cli.internal.clone());
     // Formation peers: `--peer id=addr` (repeatable) seeds the directory so

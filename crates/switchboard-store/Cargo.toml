@@ -19,3 +19,13 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+# Backup archive integrity digests (already a workspace dependency).
+sha1 = { workspace = true }
+
+# Tests exercise the backup/restore round-trip through a real embedded
+# broker (dev-dep cycle with switchboard-embedded is intentional and
+# supported by cargo: it depends back on this crate only as a normal dep).
+[dev-dependencies]
+switchboard-embedded = { workspace = true }
+switchboard-cluster = { workspace = true }
+tracing-subscriber = { workspace = true }

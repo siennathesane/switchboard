@@ -10,6 +10,9 @@
 //! * [`sm`] — `RaftStateMachine` over the same RocksDB: the replicated
 //!   [`switchboard_core::topology::MetaState`] and
 //!   [`switchboard_core::shard::ShardState`], plus snapshot install/emit.
+//! * [`backup`] — consistent, versioned single-file backups of the whole
+//!   store (meta raft state + shard logs/state machines + the message
+//!   journal) and the restore path with the storage-format version gate.
 //!
 //! Storage layout: a single RocksDB instance per node; each raft group owns
 //! the key prefix `g{group_id}:`. Under it:
@@ -18,11 +21,13 @@
 //! blob — simple and correct; a per-queue column-family layout is the
 //! documented optimization path.
 
+pub mod backup;
 pub mod kv;
 pub mod logstore;
 pub mod sm;
 pub mod typ;
 
+pub use backup::{backup_store, read_backup_header, restore_store, BackupError, BackupHeader, BackupFileEntry, BACKUP_FORMAT_VERSION};
 pub use kv::RocksKv;
 pub use logstore::LogStore;
 pub use sm::StateMachine;

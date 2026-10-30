@@ -2417,11 +2417,15 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "sha1",
+ "switchboard-cluster",
  "switchboard-core",
+ "switchboard-embedded",
  "switchboard-wire",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

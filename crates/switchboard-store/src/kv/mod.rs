@@ -203,6 +203,17 @@ impl RocksKv {
         self.db.flush_wal(true)
     }
 
+    /// Materialize a consistent, self-contained copy of this database into
+    /// `dest` (a directory) via RocksDB's Checkpoint API: live memtables
+    /// are flushed, SST files are hard-linked, and a fresh MANIFEST +
+    /// CURRENT are written, all reflecting a single sequence number. The
+    /// result is a directory the node can open directly. Used by the
+    /// backup pipeline ([`crate::backup`]), which is the only caller and
+    /// runs against a quiesced store.
+    pub fn create_checkpoint(&self, dest: &Path) -> Result<(), rocksdb::Error> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(dest)
+    }
+
     /// Drop all data (tests).
     pub fn clear_all(&self) -> Result<(), rocksdb::Error> {
         let mut it = self.db.raw_iterator();
