@@ -42,7 +42,7 @@ pub async fn run(
         "gateway listener up"
     );
     loop {
-        let Ok((socket, _peer)) = listener.accept().await else {
+        let Ok((socket, peer)) = listener.accept().await else {
             continue;
         };
         // Per-frame writes (a Deliver method frame followed by its body)
@@ -51,7 +51,12 @@ pub async fn run(
         // before the gateway splits the socket into protocol halves.
         socket.set_nodelay(true).ok();
         let node = node.clone();
-        let limits = limits.clone();
+        let mut limits = limits.clone();
+        // Stamp the peer IP so per-connection rules actually fire on real
+        // connections (code-scanning alert #9): the guest-loopback guard
+        // treats a missing `peer_ip` as "cannot tell" and never refuses,
+        // so without this stamp every production login looked loopback.
+        limits.peer_ip = Some(peer.ip());
         let protocols = protocols.clone();
         match &acceptor {
             Some(a) => {

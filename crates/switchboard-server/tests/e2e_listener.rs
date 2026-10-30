@@ -82,6 +82,101 @@ fn _keep_import_used() {
     let _ = free_port();
 }
 
+/// Discover a non-loopback local IP without sending any packets: a UDP
+/// `connect` only installs a default destination, and `local_addr` then
+/// reports the source IP the kernel would pick for it.
+fn non_loopback_ip() -> Option<std::net::IpAddr> {
+    for target in ["8.8.8.8:80", "1.1.1.1:53", "[2001:4860:4860::8888]:53"] {
+        let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if sock.connect(target).is_ok() {
+            if let Ok(a) = sock.local_addr() {
+                if !a.ip().is_loopback() {
+                    return Some(a.ip());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Alert #9 e2e: the production listener stamps `limits.peer_ip` from the
+/// accepted socket, so the guest-loopback rule must fire on REAL
+/// connections — a non-loopback `guest` login is refused, a loopback one
+/// still works. Both halves go through `listener::run`, not a test harness.
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_run_stamps_peer_ip_for_guest_loopback_rule() {
+    let internal = format!("127.0.0.1:{}", free_port());
+    let client = format!("127.0.0.1:{}", free_port());
+    let (node, _unused) =
+        start_broker_node("peergw", 1, client.clone(), internal, vec![], true, 1, vec![]).await;
+
+    // All-interface bind so the same listener is reachable both via
+    // loopback and via the host's non-loopback address.
+    let port = free_port();
+    let gateway = format!("0.0.0.0:{port}");
+    let listener = tokio::spawn({
+        let node = node.clone();
+        let gateway = gateway.clone();
+        async move {
+            switchboard_server::listener::run(
+                node,
+                &gateway,
+                Default::default(),
+                None,
+                ProtocolConfig::all(),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    // Loopback half: `guest`/`guest` through the real listener succeeds.
+    let loopback = format!("127.0.0.1:{port}");
+    let c = support::connect_and_open(&loopback, "/").await.expect("loopback guest login");
+    drop(c);
+
+    // Non-loopback half: same credentials from the host's LAN address are
+    // refused — Start-Ok gets the socket closed with no further data
+    // (§2.2.4), i.e. EOF instead of Connection.Tune.
+    match non_loopback_ip() {
+        Some(ip) => {
+            let target = format!("{ip}:{port}");
+            let mut c = support::TestClient::connect(&target).await.unwrap();
+            assert!(
+                matches!(c.expect(0).await.unwrap(), Method::ConnectionStart { .. }),
+                "expected Connection.Start from the real listener"
+            );
+            let mut response = vec![0u8];
+            response.extend_from_slice(b"guest");
+            response.push(0);
+            response.extend_from_slice(b"guest");
+            c.send_method(
+                0,
+                &Method::ConnectionStartOk {
+                    client_properties: Default::default(),
+                    mechanism: "PLAIN".into(),
+                    response,
+                    locale: "en_US".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let next = c.expect(0).await;
+            assert!(
+                next.is_err(),
+                "non-loopback guest must be refused, got {next:?}"
+            );
+        }
+        None => {
+            eprintln!("skipping non-loopback half: host has no non-loopback interface");
+        }
+    }
+
+    listener.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_run_serves_amqp_over_tls() {
     use switchboard_server::tls::TlsIdentity;
