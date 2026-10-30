@@ -15,14 +15,25 @@ groups (never more than three voters each) built on
 | `switchboard-store` | RocksDB KV + OpenRaft `RaftLogStorage` / `RaftStateMachine` (feature `storage-v2`). |
 | `switchboard-cluster` | Multi-raft node: raft lifecycle, internal RPC protocol (TCP + optional TLS via rustls/aws-lc-rs), write forwarding, join protocol, shard-map formation. |
 | `switchboard-server` | Client-facing AMQP: TCP/TLS listeners, connection handshake, per-channel state machines, heartbeats, transactions, publisher confirms. |
-| `switchboard` | The binary + CLI. |
+| `switchboard-embedded` | The broker as a library: one in-process `ClusterNode` plus a typed AMQP 0-9-1 client over an in-memory duplex into the unmodified session core (see "Embedded library" below). |
+| `switchboard` | The binary + CLI (including the offline `backup` / `restore` store tools). |
+| `switchboard-bench` | Benchmark + soak library and drivers (not published). |
 
 ## Cluster layout
 
 * **Group 0 — the meta group.** Replicates the control plane
   (`switchboard_core::topology::MetaState`): vhosts, users, exchanges,
   queue metadata, bindings, the node directory, and the shard map. Voters:
-  the first `min(3, N)` registered nodes.
+  the first `min(3, N)` registered nodes. The voter set is *not* frozen
+  there: the membership controller re-votes the meta group through the
+  same `ReconfigureGroup` machinery as shard groups as nodes come and go
+  (`switchboard-cluster/src/node/mod.rs`, the "grow/shrink meta
+  membership" step), keeping 3 voters once ≥3 nodes are registered — at
+  exactly 2 registered the second node stays a learner, because a
+  2-voter meta group loses quorum permanently on one unclean loss. If
+  the meta group is ever leaderless past a 30 s window (quorum lost in
+  one churn event), the smallest registered node rebuilds the group from
+  its applied state (`meta_recovery_loop`).
 * **Groups 1..N — shard groups.** Each owns the message data of the queues
   assigned to it. Assignment is a stable FNV-1a hash of the queue name over
   the sorted group ids, computed inside the replicated meta state machine
@@ -69,6 +80,13 @@ windows (§3.1.7) stay with the channel, not the shard:
    Reject/nack/requeue/recover/cancel/close send `Release`, returning
    messages to *ready*; the next hand-out sets `redelivered`.
 
+Count-based prefetch (`basic.qos` `prefetch_count`) is the credit
+window itself. Byte-based prefetch (`prefetch_size`) is enforced too:
+each subscription carries a `byte_limit`, and hand-out pauses once the
+bytes of unacknowledged held messages reach it
+(`switchboard-core/src/shard/mod.rs`, subscription `byte_limit` /
+`held_bytes`).
+
 Both the message and its unacked marker live in the raft log, so leader
 failover preserves them exactly — at-least-once delivery with no loss of
 acknowledged messages.
@@ -89,6 +107,157 @@ Confirm mode sequences publishes per channel; the confirm for a publish is
 sent once every routed queue's enqueue has been applied by its shard raft
 group (quorum-committed). Unroutable mandatory messages are returned with
 `basic.return` and also confirmed.
+
+## Queue policies: priority, TTL, dead-lettering
+
+Queue declare arguments (`switchboard_core::shard::QueuePolicy`, parsed in
+`crates/switchboard-core/src/shard/mod.rs`) turn on the server-extension
+behaviors the base spec leaves open:
+
+* **Priority.** The `basic` `priority` property orders delivery
+  best-first (priority descending, FIFO within a priority). The shard's
+  ready index is keyed by `(priority, sequence)` so the next message for
+  a queue is an O(log n) lookup (`QueueData::best_ready` /
+  `ShardState::next_ready` in `shard/mod.rs`).
+* **Message TTL.** A queue-level `x-message-ttl` (ms) is the default for
+  messages without their own; a per-message `expiration` property
+  overrides it per message (applied at enqueue, `shard/mod.rs` — the
+  queue TTL "covers messages without their own"). Expired *ready*
+  messages are dropped by the shard's expiry pass via an
+  earliest-deadline-first index and counted in the `expired` lifecycle
+  metric.
+* **Dead-lettering.** `x-dead-letter-exchange` (and optional
+  `x-dead-letter-routing-key`, default: the original key) republishes
+  messages to a DLX instead of dropping them — both expired messages and
+  messages nacked/rejected with `requeue=false`
+  (`ShardQueueData::dead_letter` and the dead-letter target resolution in
+  `shard/mod.rs`). The routing integration is covered end-to-end by
+  `e2e_admin_ops.rs` (priority delivery order, message TTL expiry → DLQ,
+  nack dead-lettering).
+
+## Embedded library
+
+`switchboard-embedded` (crates/switchboard-embedded) is the broker as a
+library: a [`Broker`](crates/switchboard-embedded/src/broker.rs) wraps an
+unmodified in-process `switchboard_cluster::ClusterNode` (raft-replicated
+topology and queues over RocksDB, single-node by default), and
+`Broker::connect` returns a typed AMQP 0-9-1 client whose traffic flows
+through an in-memory duplex into the exact `serve_rw` session core the TCP
+gateways drive — same handshake, same argon2 authentication including the
+guest-loopback rule, same channel state machines. There is no bypass flag
+and no divergence from wire clients.
+
+```rust
+use switchboard_embedded::{Broker, BrokerConfig, QueueOptions};
+
+let broker = Broker::start(BrokerConfig::new(data_dir)).await?;
+let conn = broker.connect("guest", "guest").await?;
+let channel = conn.open_channel().await?;
+channel.queue_declare("tasks", &QueueOptions::new().durable(true)).await?;
+channel.publish("", "tasks", Default::default(), b"hello".to_vec()).await?;
+let delivery = channel.get("tasks", true).await?.expect("message");
+assert_eq!(delivery.body, b"hello");
+conn.close().await;
+broker.stop(std::time::Duration::from_secs(5)).await?;
+```
+
+The typed channel API covers declares/binds/deletes, `publish`,
+`publish_mandatory`, `publish_confirmed`, `get`/`ack`/`nack`, `qos`,
+`consume` (returns a `Consumer` stream with async `next()`), and
+`tx_select`/`tx_commit`/`tx_rollback`. Broker-side administration
+(`declare_vhost`, `create_user`, `delete_user`, `set_permissions`) is on
+the `Broker` itself.
+
+Runtime contract: everything requires a live tokio runtime; restart is a
+new process on the same `data_dir` (the broker holds the RocksDB
+exclusive lock for its whole lifetime, so a second `Broker::start` on a
+live directory fails with `StartError::Storage`); `Broker::stop(grace)`
+closes every tracked connection, then leaves the cluster. Authorization
+parity with the wire path is inherited including its gaps — see "Known
+limitations" for the one publish/exchange-bind gate still open.
+
+## Admin HTTP API
+
+The gateway routes `/api/…` to a JSON-over-HTTP admin API
+(`crates/switchboard-server/src/protocols/admin.rs`), authenticated with
+HTTP basic auth against the same argon2 credential check every protocol
+gateway uses. Authorization mirrors RabbitMQ's management model: the
+`guest` user and any unrestricted user (no permissions-table entry) may
+call it; a user *restricted* by any permissions entry is refused with 403
+— the control plane belongs to administrators. Unknown
+method/path combinations answer 405 rather than improvising.
+
+| route | behavior |
+|---|---|
+| `GET /api/users` | list users with their permissions |
+| `GET /api/users/{name}` | one user, or 404 |
+| `PUT /api/users/{name}` `{"password": …}` | create user or rotate password |
+| `DELETE /api/users/{name}` | delete user (cascades its permissions) |
+| `GET /api/vhosts` | list vhosts with queue/exchange/binding counts |
+| `PUT /api/vhosts/{name}` | declare vhost (idempotent) |
+| `DELETE /api/vhosts/{name}` | 405 — no meta command exists |
+| `GET /api/permissions` | list permission entries |
+| `GET /api/permissions/{vhost}/{user}` | one entry, or 404 |
+| `PUT /api/permissions/{vhost}/{user}` | set the configure/write/read regex triple |
+| `DELETE /api/permissions/{vhost}/{user}` | clear (all-empty clears) |
+| `GET /api/queues`, `GET /api/exchanges` | topology listings |
+
+Every mutating route maps onto a meta state-machine command
+(`CreateUser`, `DeleteUser`, `DeclareVhost`, `SetPermissions`), so admin
+changes are raft-replicated and immediately visible to every gateway.
+
+## Prometheus metrics
+
+`GET /metrics` serves Prometheus text exposition (version 0.0.4,
+hand-rolled — no new dependencies; `crates/switchboard-server/src/protocols/metrics.rs`).
+It rides the same `http` protocol flag as `/health` and `/stats` and
+needs no authentication. Exported:
+
+* `switchboard_messages_{enqueued,handed_out,acked,noack_removed,released,purged,expired,deleted}_total`
+  — the shard state-machine message-lifecycle counters (the same
+  accounting `/stats` trends);
+* `switchboard_queue_ready_messages{queue}` /
+  `switchboard_queue_held_messages{queue}` — per-queue depth gauges;
+* `switchboard_connections{protocol}` — per-protocol connection gauges;
+* node vitals (same sources as `/stats`).
+
+## Backup & restore
+
+`switchboard backup` / `switchboard restore`
+(`crates/switchboard-store/src/backup/`, CLI wiring in
+`crates/switchboard/src/backup_cmd.rs`) produce a consistent, versioned,
+single-file archive of a node's entire durable broker state and restore
+it into a fresh data directory.
+
+* **What is captured.** A node keeps all durable state in one RocksDB
+  instance — meta raft state, every shard group's raft log and state
+  machine, and the per-message journal the shard state machine writes
+  alongside every queue mutation. One atomic store snapshot therefore
+  covers everything, logs included.
+* **Consistency point.** The tool opens the data dir with the same
+  `RocksKv::open` call the broker uses; RocksDB's exclusive lock means a
+  *running* broker cannot be backed up (the open fails with a
+  "stop the broker first" hint). On a quiesced store the snapshot is
+  materialized with RocksDB's Checkpoint API, then archived — a
+  complete, directly-openable staging directory exists before a single
+  byte of archive is written.
+* **The storage version gate.** The archive is `"SWBK"` magic + a `u32`
+  LE format version + a JSON header (file list with lengths and sha1
+  digests) + file records. This build writes and accepts exactly
+  `BACKUP_FORMAT_VERSION = 1` (`backup/mod.rs`); restore validates magic
+  and version *before* touching the target directory and refuses a newer
+  (`VersionTooNew`), unknown/older (`VersionUnknown`), or non-archive
+  (`NotABackup`) file with a clear error. Bump the constant only with a
+  deliberate format change.
+* **Restore.** `switchboard restore <archive> --data <new-dir>` requires
+  a fresh (absent or empty) directory — a restore never clobbers — and
+  reproduces the store exactly; the node opens it like any data dir after
+  a graceful stop and raft resumes from the captured vote/log/applied
+  state.
+* **Multi-node caveat.** An archive carries one member's view; recover a
+  cluster by quiescing every node and restoring members from the same
+  instant, or restore one member and let raft re-form around it. TLS key
+  material and environment are not part of the archive.
 
 ## Internal management protocol
 
@@ -189,11 +358,29 @@ membership controller extends the shard layout to cover them (see
 
 ## Known limitations
 
-* **Meta voter set is fixed at formation** (first `min(3, expected_nodes)`
-  node ids); re-voting the meta group at runtime is admin-driven.
-* **Byte-level prefetch (`prefetch_size`) is rejected** with 540, matching
-  RabbitMQ; count-based prefetch is fully implemented.
-* **`immediate` publishes** require an active consumer on the first
-  destination queue.
-* **Priority queues / TTL / dead-lettering** are not implemented (the spec
-  marks these as server extensions).
+* **`immediate` publishes check only the first destination queue.** The
+  `immediate` arm in `crates/switchboard-server/src/methods/publish.rs`
+  consults an active-consumer `Stats` probe on `destinations[0]` alone —
+  if that queue has a consumer, the message is delivered even when other
+  destination queues have none.
+* **`exchange.bind` is not authorization-gated.** Every other topology
+  operation checks `configure`/`write`/`read` permissions via
+  `authorize_ch` (declares, deletes, queue binds, purge, publish, get,
+  consume), but the `ExchangeBind` arm in
+  `crates/switchboard-server/src/methods/mod.rs` issues the meta bind
+  without a permission check. It is on the `fix(broker):` hardening
+  track; embedded clients inherit the gap with everything else.
+* **Prepared transactions race the janitor.** The shard's
+  `ExpirePrepared` sweep drops prepared transactions older than
+  `tx_timeout_ticks` ticks — a field that defaults to 0
+  (`crates/switchboard-core/src/shard/mod.rs`, `ShardState` derives
+  `Default`) — so a `tx.commit` that arrives after an intervening janitor
+  tick can find its prepared ops silently gone while `commit-ok` still
+  returns. Brokers/embedders running transactions should widen
+  `janitor_interval`/`tx_timeout_ticks` until this is closed.
+
+Formerly-listed limitations that no longer hold: priority queues, message
+TTL, and dead-lettering are implemented (see "Queue policies" above);
+byte-level `prefetch_size` is enforced (see "Delivery protocol"); the
+meta group's voter set is re-voted automatically by the membership
+controller with leaderless self-healing (see "Cluster layout").

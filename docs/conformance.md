@@ -69,8 +69,8 @@ asserted to be rejected).
 | `e2e_autoscale_down.rs` | 9→3 nodes one departure at a time: `Forgetter` + group heal (drop & refill to 3 live voters), raft voter-set convergence, writes keep landing after every round |
 | `e2e_admin_ops.rs` (10) | purge depth, delete preconditions (406/404), passive asserts, exchange delete lifecycle + default-exchange 403, QoS (`prefetch_size` accepted), nack-requeue, recover (`recover-ok` + redelivery), **priority delivery order**, **message TTL expiry → DLQ**, **nack-requeue=false dead-lettering** |
 | `registry_conformance.rs` (wire) | all 62 implemented method payloads decode byte-for-byte per the normative registry JSON |
-| `protocols_e2e.rs` (14) | gateway demux; AMQP over the gateway; HTTP health; unrecognized-preamble close; protocol disable; MQTT pub/sub, QoS 1 PUBACK, bad-credential refusal, cross-protocol to AMQP; STOMP roundtrip + client-ack semantics; WebSocket MQTT and sniffed-STOMP; AMQP 1.0 ANONYMOUS connect/close and publish into an AMQP queue |
-| `discovery_e2e.rs` (2) | DNS-seed discovery joins a zero-config node (registration, layout coverage, voter cap); mDNS multicast self-assembly of two unconfigured nodes |
+| `protocols_e2e.rs` (58) | gateway demux; AMQP over the gateway; HTTP health; unrecognized-preamble close; protocol disable; MQTT pub/sub, QoS 1 PUBACK, bad-credential refusal, cross-protocol to AMQP; STOMP roundtrip + client-ack semantics; WebSocket MQTT and sniffed-STOMP; AMQP 1.0 ANONYMOUS connect/close and publish into an AMQP queue |
+| `crates/switchboard-cluster/tests/discovery_e2e.rs` (6) | DNS-seed discovery joins a zero-config node (registration, layout coverage, voter cap); mDNS multicast self-assembly of two unconfigured nodes; meta voters grow to the first three nodes; unreachable/dead seeds keep the node pending; janitor sweep on an idle node is harmless |
 
 ## Extensions (documented, not in the base spec)
 
