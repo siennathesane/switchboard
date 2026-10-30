@@ -295,6 +295,14 @@ impl Channel {
                 arguments,
                 ..
             } => {
+                // Configure permission on both endpoints, like the
+                // Declare/Delete siblings above (code-scanning alert #6):
+                // a binding mutates the destination's binding set and
+                // draws from the source, so RabbitMQ checks configure on
+                // each. Without this a user could bind/unbind exchanges
+                // their configure regex denies.
+                authorize_ch(self, node, Perm::Configure, &destination)?;
+                authorize_ch(self, node, Perm::Configure, &source)?;
                 meta_call(
                     node,
                     MetaCmd::Bind {
@@ -319,6 +327,11 @@ impl Channel {
                 arguments,
                 ..
             } => {
+                // Same configure gate as ExchangeBind (code-scanning
+                // alert #6): removing a binding is also a mutation of
+                // both endpoints.
+                authorize_ch(self, node, Perm::Configure, &destination)?;
+                authorize_ch(self, node, Perm::Configure, &source)?;
                 meta_call(
                     node,
                     MetaCmd::Unbind {

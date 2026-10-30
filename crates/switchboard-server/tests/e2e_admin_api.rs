@@ -687,3 +687,168 @@ async fn metrics_content_type_and_representative_lines() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 5) Exchange-to-exchange bindings honor the configure regex
+//     (code-scanning alert #6)
+// ---------------------------------------------------------------------
+
+/// Declare a topic exchange on `channel` and return the server's reply.
+async fn declare_exchange(
+    c: &mut support::TestClient,
+    channel: u16,
+    exchange: &str,
+    context: &str,
+) -> Method {
+    c.send_method(
+        channel,
+        &Method::ExchangeDeclare {
+            ticket: 0,
+            exchange: exchange.into(),
+            exchange_type: "topic".into(),
+            passive: false,
+            durable: true,
+            auto_delete: false,
+            internal: false,
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{context}: send failed: {e}"));
+    c.expect(channel)
+        .await
+        .unwrap_or_else(|e| panic!("{context}: expect failed: {e}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_user_cannot_bind_or_unbind_out_of_scope_exchanges() {
+    let _guard = lock().await;
+    light_hashing();
+    support::init_tracing();
+    let admin = basic_auth_header("guest", "guest");
+
+    // A user whose configure regex covers only ^svc-xb-.* exchanges.
+    let (code, text) = api_put("/api/users/svc-xb", &admin, r#"{"password":"xb-pw"}"#).await;
+    assert_eq!(code, 200, "create svc-xb failed: {text}");
+    let (code, text) = api_put(
+        "/api/permissions/%2F/svc-xb",
+        &admin,
+        r#"{"configure":"^svc-xb-.*","write":"^svc-xb-.*","read":"^svc-xb-.*"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "set permissions failed: {text}");
+
+    let addr = gateway_support::shared_gateway().await;
+    // The admin pre-declares the out-of-scope destination exchange.
+    let mut admin_c = support::connect_and_open(&addr, "/").await.unwrap();
+    let got = declare_exchange(&mut admin_c, 1, "denied-xb-dst", "admin declare denied dst").await;
+    assert!(
+        matches!(got, Method::ExchangeDeclareOk { .. }),
+        "admin declare failed: {got:?}"
+    );
+
+    // The restricted user declares both of THEIR exchanges, then binds
+    // them — configure covers both endpoints, so this must succeed.
+    let mut c = connect_and_open_creds(&addr, "/", "svc-xb", "xb-pw")
+        .await
+        .expect("restricted user connects and opens");
+    for ex in ["svc-xb-src", "svc-xb-dst"] {
+        let got = declare_exchange(&mut c, 1, ex, "restricted declare in-scope exchange").await;
+        assert!(
+            matches!(got, Method::ExchangeDeclareOk { .. }),
+            "in-scope exchange declare failed: {got:?}"
+        );
+    }
+    c.send_method(
+        1,
+        &Method::ExchangeBind {
+            ticket: 0,
+            destination: "svc-xb-dst".into(),
+            source: "svc-xb-src".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let got = c.expect(1).await.unwrap();
+    assert!(
+        matches!(got, Method::ExchangeBindOk { .. }),
+        "in-scope bind failed: {got:?}"
+    );
+
+    // Binding an out-of-scope DESTINATION is refused with 403.
+    c.send_method(
+        2,
+        &Method::ExchangeBind {
+            ticket: 0,
+            destination: "denied-xb-dst".into(),
+            source: "svc-xb-src".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    expect_access_refused(&mut c, 2, "bind to denied destination").await;
+
+    // Binding an out-of-scope SOURCE is refused too (RabbitMQ checks
+    // configure on both endpoints).
+    c.send_method(
+        3,
+        &Method::ExchangeBind {
+            ticket: 0,
+            destination: "svc-xb-dst".into(),
+            source: "amq.topic".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    expect_access_refused(&mut c, 3, "bind from denied source").await;
+
+    // Unbinding the out-of-scope destination is equally refused.
+    c.send_method(
+        4,
+        &Method::ExchangeUnbind {
+            ticket: 0,
+            destination: "denied-xb-dst".into(),
+            source: "svc-xb-src".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    expect_access_refused(&mut c, 4, "unbind of denied destination").await;
+
+    // The in-scope unbind still works (proves the gate is not a blanket
+    // denial and the authorized path answers ExchangeUnbindOk).
+    c.send_method(
+        1,
+        &Method::ExchangeUnbind {
+            ticket: 0,
+            destination: "svc-xb-dst".into(),
+            source: "svc-xb-src".into(),
+            routing_key: "#".into(),
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let got = c.expect(1).await.unwrap();
+    assert!(
+        matches!(got, Method::ExchangeUnbindOk { .. }),
+        "in-scope unbind failed: {got:?}"
+    );
+
+    // Cleanup via the API under test.
+    let _ = api_delete("/api/users/svc-xb", &admin).await;
+}
