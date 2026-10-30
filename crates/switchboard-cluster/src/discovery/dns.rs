@@ -22,15 +22,24 @@ pub async fn resolve_srv(domain: &str) -> Result<Vec<String>, String> {
             hickory_resolver::config::ResolverOpts::default(),
         )
     });
-    let resolver = hickory_resolver::AsyncResolver::tokio(config, opts);
+    let resolver = hickory_resolver::Resolver::builder_with_config(
+        config,
+        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    )
+    .with_options(opts)
+    .build()
+    .map_err(|e| format!("resolver for {fqdn}: {e}"))?;
     let lookup = resolver
         .srv_lookup(&fqdn)
         .await
         .map_err(|e| format!("srv {fqdn}: {e}"))?;
     let mut peers = Vec::new();
-    for record in lookup.iter() {
-        let target = record.target().to_string();
-        let port = record.port();
+    for record in lookup.answers() {
+        let Some(srv) = record.try_borrow::<hickory_resolver::proto::rr::rdata::SRV>() else {
+            continue;
+        };
+        let target = srv.data().target.to_string();
+        let port = srv.data().port;
         peers.push(DiscoveredPeer {
             internal_addr: format!("{}:{}", target.trim_end_matches('.'), port),
             node_id: None,
