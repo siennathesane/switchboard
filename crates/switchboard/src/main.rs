@@ -274,6 +274,11 @@ async fn main() -> anyhow::Result<()> {
         bootstrap: cli.bootstrap,
         expected_nodes: cli.expected_nodes,
         peers,
+        // The --user/--password flags finally reach the bootstrap write
+        // (code-scanning alert #16): without them the defaults keep the
+        // historical guest/guest formation byte-for-byte.
+        bootstrap_user: cli.user.clone(),
+        bootstrap_password: cli.password.clone(),
         timeouts,
     };
 

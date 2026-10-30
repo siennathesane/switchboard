@@ -412,6 +412,8 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
+        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
+        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
     };
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
 
@@ -474,6 +476,8 @@ pub async fn start_broker_node(
         expected_nodes,
         peers,
         timeouts: Default::default(),
+        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
+        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
     };
     init_tracing();
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();

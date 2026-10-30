@@ -123,9 +123,16 @@ pub struct NodeConfig {
     /// the meta group; formation of the shard layout starts once this many
     /// nodes have registered.
     pub expected_nodes: u64,
+    /// Credentials installed for the bootstrap user at cluster formation
+    /// (code-scanning alert #16). The CLI wires `--user`/`--password`
+    /// here so deployments get non-default credentials; the defaults
+    /// preserve the historical guest/guest bootstrap byte-for-byte.
+    pub bootstrap_user: String,
+    /// Password half of [`NodeConfig::bootstrap_user`].
+    pub bootstrap_password: String,
     /// Every wait the node can experience, in one place. This is a
     /// realtime distributed system: defaults keep any single operation's
-    /// worst case at five seconds, and everything is configurable.
+    /// worst case at five seconds, and everything is configurable via CLI/env.
     pub timeouts: Timeouts,
 }
 
@@ -636,8 +643,11 @@ impl ClusterNode {
             META_GROUP,
             BrokerCommand::Bootstrap {
                 vhost: switchboard_wire::constants::DEFAULT_VHOST.into(),
-                user: switchboard_wire::constants::DEFAULT_USER.into(),
-                password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+                // Configurable bootstrap credentials (code-scanning alert
+                // #16): the CLI's --user/--password flow through NodeConfig
+                // so deployments are not pinned to the public dev default.
+                user: self.cfg.bootstrap_user.clone(),
+                password: self.cfg.bootstrap_password.clone(),
             },
         )
         .await?;

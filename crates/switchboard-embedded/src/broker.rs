@@ -130,6 +130,12 @@ impl Broker {
             bootstrap,
             expected_nodes: config.expected_nodes,
             peers: vec![],
+            // Formation-level bootstrap stays on the public dev default:
+            // the embedded path configures credentials through
+            // `BrokerConfig::bootstrap_credentials` (ensure-user-if-absent,
+            // post-readiness), which layers on top without clobbering.
+            bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
+            bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
             timeouts: config.timeouts,
         };
         let node = ClusterNode::start(cfg).await.map_err(|e| match e {
