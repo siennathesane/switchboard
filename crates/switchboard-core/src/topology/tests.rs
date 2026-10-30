@@ -461,6 +461,51 @@ fn auth_checks() {
     assert_eq!(e.level, Level::Connection);
 }
 
+/// Alert #20: permission patterns are FULL matches over the resource
+/// name (mirroring RabbitMQ), never substring hits.
+#[test]
+fn permission_patterns_full_match_not_substring() {
+    let p = Permissions {
+        configure: "logs".into(),
+        write: "^app-.*$".into(),
+        read: "a|b".into(),
+    };
+    // Exact resource still matches.
+    assert!(p.allows(Perm::Configure, "logs"));
+    // The substring attack is refused in both directions.
+    assert!(!p.allows(Perm::Configure, "logs-evil"));
+    assert!(!p.allows(Perm::Configure, "xapp-logs-x"));
+    assert!(!p.allows(Perm::Configure, "my-logs"));
+    // Explicitly anchored patterns behave identically (the wrap is
+    // idempotent for the user).
+    assert!(p.allows(Perm::Write, "app-queue"));
+    assert!(!p.allows(Perm::Write, "other-app-queue"));
+    // Alternation without the user writing groups still covers BOTH
+    // arms — the non-capturing wrap must not anchor only the last one.
+    assert!(p.allows(Perm::Read, "a"));
+    assert!(p.allows(Perm::Read, "b"));
+    assert!(!p.allows(Perm::Read, "ab"));
+    assert!(!p.allows(Perm::Read, "c"));
+    // And through `authorize`: a granted user is checked, an ungranted
+    // vhost denies, and a user with no entry stays unrestricted.
+    let mut s = state();
+    s.permissions.insert(
+        "restricted".into(),
+        std::collections::BTreeMap::from([(
+            "/".into(),
+            Permissions {
+                configure: "logs".into(),
+                ..Default::default()
+            },
+        )]),
+    );
+    assert!(s.authorize("restricted", "/", Perm::Configure, "logs"));
+    assert!(!s.authorize("restricted", "/", Perm::Configure, "logs-evil"));
+    assert!(!s.authorize("restricted", "/", Perm::Write, "logs"));
+    assert!(!s.authorize("restricted", "/other", Perm::Read, "anything"));
+    assert!(s.authorize("stranger", "/", Perm::Configure, "whatever"));
+}
+
 #[test]
 fn forget_node_cascades_its_exclusive_queues() {
     let mut s = state();

@@ -129,7 +129,14 @@ impl Permissions {
         if pattern.is_empty() {
             return false;
         }
-        match Regex::new(pattern) {
+        // Anchor at match time so the stored pattern is a FULL match, as
+        // the struct docs promise (RabbitMQ does the same wrapping):
+        // `is_match` alone substring-matches, so a "logs" grant would
+        // also cover "logs-evil" (code-scanning alert #20). The stored
+        // pattern itself is never modified; the non-capturing group keeps
+        // alternation (`a|b`) from anchoring only its last arm.
+        let anchored = format!("^(?:{pattern})$");
+        match Regex::new(&anchored) {
             Ok(re) => re.is_match(resource),
             Err(e) => {
                 tracing::warn!(%pattern, %class, %e, "invalid permission regex; denying");
