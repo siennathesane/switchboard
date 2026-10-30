@@ -1068,3 +1068,69 @@ async fn immediate_publish_without_any_route_returns_312() {
         panic!("unexpected extra frame after Basic.Return");
     }
 }
+
+/// Empty-body publishes are spec-correct — §4.2.6.1 sends no body frame
+/// for zero announced octets — and MUST apply: the content completes on
+/// the header itself, publish "" round-trips through basic.get, and a
+/// following non-empty publish keeps its order (the empty one used to
+/// sit pending forever and was silently never applied).
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_body_publish_applies_and_round_trips() {
+    let (_node, addr) = start_broker("empty-body").await;
+    let mut c = connect_and_open(&addr, "/").await.unwrap();
+    c.send_method(
+        1,
+        &Method::QueueDeclare {
+            ticket: 0,
+            queue: "empty-body-q".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::QueueDeclareOk { .. }
+    ));
+
+    // The test client's send_content skips the body frame for empty
+    // bodies, exactly like the wire spec (and the embedded driver).
+    publish(
+        &mut c,
+        1,
+        "",
+        "empty-body-q",
+        &BasicProperties::new(),
+        b"",
+        false,
+    )
+    .await
+    .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "empty-body-q",
+        &BasicProperties::new(),
+        b"after",
+        false,
+    )
+    .await
+    .unwrap();
+
+    let first = basic_get(&mut c, 1, "empty-body-q", true)
+        .await
+        .unwrap()
+        .expect("empty-body publish must be retrievable");
+    assert_eq!(first.1, b"", "first message must be the empty body");
+    let second = basic_get(&mut c, 1, "empty-body-q", true)
+        .await
+        .unwrap()
+        .expect("the publish after the empty one must apply");
+    assert_eq!(second.1, b"after");
+}

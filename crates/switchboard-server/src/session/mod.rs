@@ -578,7 +578,24 @@ impl Session {
                                 )
                                 .await;
                         }
+                        // An empty body sends NO body frame (§4.2.6.1: the
+                        // body is "the announced number of octets" — zero
+                        // of them), so the content completes HERE. Leaving
+                        // method+header pending waited for a body frame
+                        // that never comes: an empty-body publish sat
+                        // unapplied forever (the embedded driver skips
+                        // body frames for empty bodies too, so it hit the
+                        // same server-side stall).
+                        let empty_body = h.body_size == 0;
                         ch.inner.lock().unwrap().pending_header = Some(h);
+                        if empty_body {
+                            let content = ch.inner.lock().unwrap().take_content();
+                            if let Some((method, props, body)) = content {
+                                return self
+                                    .content_complete(frame.channel, method, props, body)
+                                    .await;
+                            }
+                        }
                         Flow::Continue
                     }
                     Err(e) => self.connection_exception(BrokerError::frame_error(e.to_string())),

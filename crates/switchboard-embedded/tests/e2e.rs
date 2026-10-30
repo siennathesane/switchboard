@@ -845,3 +845,49 @@ async fn in_process_double_start_fails() {
     );
     broker.stop(Duration::from_secs(30)).await.expect("stop");
 }
+
+// ---------------------------------------------------------------------------
+// Empty-body publish regression: the driver sends NO body frame for zero
+// announced octets (spec-correct), and the server must complete the
+// content on the header itself — the publish used to sit pending forever
+// and was silently never applied.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_body_publish_applies_and_round_trips() {
+    init();
+    let broker = start_broker("e2e-empty-body").await;
+    let conn = broker.connect("guest", "guest").await.expect("connect");
+    let ch = conn.open_channel().await.expect("channel");
+
+    ch.queue_declare("empty-body-q", &QueueOptions::new().durable(true))
+        .await
+        .expect("declare");
+
+    // publish("") emits method + header(body_size = 0) and NO body frame.
+    ch.publish("", "empty-body-q", persistent_props(), Vec::new())
+        .await
+        .expect("publish");
+    // A non-empty publish right behind it proves ordering: the empty one
+    // must be the first message, not silently swallowed by the next
+    // method frame.
+    ch.publish("", "empty-body-q", persistent_props(), b"after".to_vec())
+        .await
+        .expect("publish");
+
+    let d1 = ch
+        .get("empty-body-q", true)
+        .await
+        .expect("get")
+        .expect("the empty-body publish must have been applied and be retrievable");
+    assert!(d1.body.is_empty(), "first message must be the empty body");
+    let d2 = ch
+        .get("empty-body-q", true)
+        .await
+        .expect("get")
+        .expect("the publish after the empty one must apply");
+    assert_eq!(d2.body, b"after");
+
+    conn.close().await;
+    broker.stop(Duration::from_secs(30)).await.expect("stop");
+}
