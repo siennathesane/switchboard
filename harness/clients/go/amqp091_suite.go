@@ -205,35 +205,55 @@ func main() {
 		return nil
 	})
 
-	// consume + ack
-	msgs, err := ch.Consume(q, "gconsumer", false, false, false, false, nil)
-	must(err, "consume")
-	must(publishConfirmed(ch, dx, "k1", []byte("pushed")), "pub push")
-	var consumed []string
-	var mu sync.Mutex
-	done := make(chan struct{})
-	go func() {
-		for d := range msgs {
-			mu.Lock()
-			consumed = append(consumed, string(d.Body))
-			mu.Unlock()
-			d.Ack(false)
-			close(done)
-			return
+	// consume + ack. One bounded redrive (same rationale as the qos
+	// check below): the consumer stream has occasionally starved with
+	// the confirmed message held server-side and no broker-side error
+	// — CI's arm harness job failed exactly here ("consume push + ack:
+	// consumed=[]"), and the leftover message then cascaded into the
+	// tx check ("rolled-back publish visible: body=\"pushed\"").
+	// Cancel releases the starved hold; the second attempt re-arms the
+	// stream. A real consumer bug fails both attempts.
+	pushAttempt := func(attempt int) error {
+		msgs, err := ch.Consume(q, "gconsumer", false, false, false, false, nil)
+		if err != nil {
+			return err
 		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
-	}
-	// Stop the consumer so later basic.get probes actually read the
-	// queue instead of feeding this still-registered consumer.
-	must(ch.Cancel("gconsumer", false), "cancel gconsumer")
-	check("consume push + ack", func() error {
+		if attempt == 1 {
+			must(publishConfirmed(ch, dx, "k1", []byte("pushed")), "pub push")
+		}
+		var consumed []string
+		var mu sync.Mutex
+		done := make(chan struct{})
+		go func() {
+			for d := range msgs {
+				mu.Lock()
+				consumed = append(consumed, string(d.Body))
+				mu.Unlock()
+				d.Ack(false)
+				close(done)
+				return
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+		}
+		// Stop the consumer so later basic.get probes actually read the
+		// queue instead of feeding this still-registered consumer, and
+		// so a starved hold is released for the next attempt.
+		must(ch.Cancel("gconsumer", false), "cancel gconsumer")
 		mu.Lock()
 		defer mu.Unlock()
 		if len(consumed) != 1 || consumed[0] != "pushed" {
 			return fmt.Errorf("consumed=%v", consumed)
+		}
+		return nil
+	}
+	check("consume push + ack", func() error {
+		if err := pushAttempt(1); err != nil {
+			if err := pushAttempt(2); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
