@@ -23,15 +23,24 @@ pub mod method;
 pub mod properties;
 pub mod wireio;
 
-pub use error::CodecError;
-pub use field::{FieldValue, FieldTable};
 pub use constants::FrameType;
-pub use frame::{parse_protocol_header, Frame, FrameReader, PROTOCOL_HEADER};
-pub use method::{
-    BASIC_CLASS_ID, CHANNEL_CLASS_ID, CONFIRM_CLASS_ID, CONNECTION_CLASS_ID, EXCHANGE_CLASS_ID,
-    Method, QUEUE_CLASS_ID, TX_CLASS_ID,
-};
-pub use properties::{BasicProperties, ContentHeader};
+pub use error::CodecError;
+pub use field::FieldTable;
+pub use field::FieldValue;
+pub use frame::Frame;
+pub use frame::FrameReader;
+pub use frame::PROTOCOL_HEADER;
+pub use frame::parse_protocol_header;
+pub use method::BASIC_CLASS_ID;
+pub use method::CHANNEL_CLASS_ID;
+pub use method::CONFIRM_CLASS_ID;
+pub use method::CONNECTION_CLASS_ID;
+pub use method::EXCHANGE_CLASS_ID;
+pub use method::Method;
+pub use method::QUEUE_CLASS_ID;
+pub use method::TX_CLASS_ID;
+pub use properties::BasicProperties;
+pub use properties::ContentHeader;
 
 /// The protocol version this implementation speaks: 0-9-1.
 pub const VERSION_MAJOR: u8 = 0;

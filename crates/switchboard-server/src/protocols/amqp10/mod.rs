@@ -16,10 +16,10 @@
 pub mod frames;
 pub mod types;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncRead;
@@ -35,8 +35,8 @@ use crate::protocols::shared::BridgeConsumer;
 use crate::protocols::shared::BridgeContext;
 
 use self::frames::codes;
-use self::types::decode;
 use self::types::Value;
+use self::types::decode;
 use switchboard_core::error::BrokerError;
 
 /// Address mapping (STOMP-compatible).
@@ -48,14 +48,23 @@ enum Dest {
 
 fn resolve_address(addr: &str) -> Dest {
     if let Some(rk) = addr.strip_prefix("/topic/") {
-        return Dest::Topic { exchange: "amq.topic".into(), rk: rk.to_string() };
+        return Dest::Topic {
+            exchange: "amq.topic".into(),
+            rk: rk.to_string(),
+        };
     }
     if let Some(rest) = addr.strip_prefix("/exchange/") {
         if let Some((ex, rk)) = rest.split_once('/') {
-            return Dest::Topic { exchange: ex.to_string(), rk: rk.to_string() };
+            return Dest::Topic {
+                exchange: ex.to_string(),
+                rk: rk.to_string(),
+            };
         }
     }
-    if let Some(q) = addr.strip_prefix("/queue/").or_else(|| addr.strip_prefix("/amq/queue/")) {
+    if let Some(q) = addr
+        .strip_prefix("/queue/")
+        .or_else(|| addr.strip_prefix("/amq/queue/"))
+    {
         return Dest::Queue(q.to_string());
     }
     Dest::Queue(addr.to_string())
@@ -122,7 +131,11 @@ fn parse_message(payload: &[u8]) -> Result<ParsedMessage, String> {
             }
         }
     }
-    Ok(ParsedMessage { body, content_type, to })
+    Ok(ParsedMessage {
+        body,
+        content_type,
+        to,
+    })
 }
 
 /// Encode broker→client message bytes (properties + data sections).
@@ -194,8 +207,14 @@ where
             "PLAIN" => {
                 // response = \0 authzid \0 passwd
                 let parts: Vec<&[u8]> = response.split(|&b| b == 0).collect();
-                let user = parts.get(1).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-                let pass = parts.get(2).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                let user = parts
+                    .get(1)
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                let pass = parts
+                    .get(2)
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
                 (user, pass)
             }
             other => {
@@ -203,15 +222,29 @@ where
                 return Ok(());
             }
         };
-        if shared::authorize(&node, &user, &pass, limits.peer_ip, limits.allow_remote_guest)
-            .await
-            .is_err()
+        if shared::authorize(
+            &node,
+            &user,
+            &pass,
+            limits.peer_ip,
+            limits.allow_remote_guest,
+        )
+        .await
+        .is_err()
         {
-            writer.lock().await.write_all(&frames::sasl_outcome(1)).await?;
+            writer
+                .lock()
+                .await
+                .write_all(&frames::sasl_outcome(1))
+                .await?;
             writer.lock().await.flush().await?;
             return Ok(());
         }
-        writer.lock().await.write_all(&frames::sasl_outcome(0)).await?;
+        writer
+            .lock()
+            .await
+            .write_all(&frames::sasl_outcome(0))
+            .await?;
         writer.lock().await.flush().await?;
         // The client restarts the connection: a fresh protocol header.
         let mut h2 = [0u8; 8];
@@ -226,9 +259,15 @@ where
         // session through the credential gate (guest-loopback rule
         // included) instead of falling through fully unauthenticated
         // (code-scanning alert #7).
-        if shared::authorize(&node, "guest", "guest", limits.peer_ip, limits.allow_remote_guest)
-            .await
-            .is_err()
+        if shared::authorize(
+            &node,
+            "guest",
+            "guest",
+            limits.peer_ip,
+            limits.allow_remote_guest,
+        )
+        .await
+        .is_err()
         {
             tracing::info!("amqp10: SASL skipped and anonymous access refused");
             return Ok(());
@@ -252,11 +291,19 @@ where
         let ch = f.channel;
         match f.code() {
             Some(codes::OPEN) => {
-                writer.lock().await.write_all(&frames::open("switchboard")).await?;
+                writer
+                    .lock()
+                    .await
+                    .write_all(&frames::open("switchboard"))
+                    .await?;
                 writer.lock().await.flush().await?;
             }
             Some(codes::BEGIN) => {
-                writer.lock().await.write_all(&frames::begin(Some(ch), next_outgoing_id)).await?;
+                writer
+                    .lock()
+                    .await
+                    .write_all(&frames::begin(Some(ch), next_outgoing_id))
+                    .await?;
                 writer.lock().await.flush().await?;
                 session_begun = true;
             }
@@ -303,11 +350,7 @@ where
                         }
                         Err(e) => {
                             tracing::debug!(err = %e, "amqp10: attach source failed");
-                            let _ = writer
-                                .lock()
-                                .await
-                                .write_all(&frames::detach(handle))
-                                .await;
+                            let _ = writer.lock().await.write_all(&frames::detach(handle)).await;
                             return Ok(());
                         }
                     }
@@ -363,11 +406,17 @@ where
                     // frame unread.
                     let message = parse_message(&f.payload).unwrap_or_else(|e| {
                         tracing::debug!(err = %e, "amqp10: bad message payload");
-                        ParsedMessage { body: Vec::new(), content_type: None, to: None }
+                        ParsedMessage {
+                            body: Vec::new(),
+                            content_type: None,
+                            to: None,
+                        }
                     });
                     // Destination: link target, else the message's `to`
                     // (anonymous relay).
-                    let dest = target.clone().or_else(|| message.to.as_ref().map(|t| resolve_address(t)));
+                    let dest = target
+                        .clone()
+                        .or_else(|| message.to.as_ref().map(|t| resolve_address(t)));
                     let publish_result = match dest {
                         Some(dest) => publish_to(&ctx, &dest, &message).await,
                         None => Err(BrokerError::invalid_path(
@@ -395,10 +444,7 @@ where
                 // shard re-delivers with `redelivered` set).
                 let role_receiver = f.field(0).and_then(Value::as_bool).unwrap_or(false);
                 let first = f.field(1).and_then(Value::as_uint);
-                let last = f
-                    .field(2)
-                    .and_then(Value::as_uint)
-                    .or(first);
+                let last = f.field(2).and_then(Value::as_uint).or(first);
                 // Receiver-role or malformed dispositions are ignored;
                 // fall through to the frame refill either way.
                 if !role_receiver {
@@ -427,7 +473,11 @@ where
                 if let Some(link) = links.lock().await.remove(&handle) {
                     teardown_link(&ctx, &link).await;
                 }
-                writer.lock().await.write_all(&frames::detach(handle)).await?;
+                writer
+                    .lock()
+                    .await
+                    .write_all(&frames::detach(handle))
+                    .await?;
                 writer.lock().await.flush().await?;
             }
             Some(codes::END) => {
@@ -578,7 +628,12 @@ async fn publish_to(
         }
         Dest::Queue(q) => {
             let topo = ctx.node.topology();
-            if !topo.vhosts.get(&ctx.vhost).map(|v| v.queues.contains_key(q)).unwrap_or(false) {
+            if !topo
+                .vhosts
+                .get(&ctx.vhost)
+                .map(|v| v.queues.contains_key(q))
+                .unwrap_or(false)
+            {
                 shared::declare_queue(ctx, q, true, false, false).await?;
             }
             let msg = StoredMessage {
@@ -606,15 +661,29 @@ async fn start_link_consumer<W>(
     delivery_counter: Arc<AtomicU32>,
     unsettled: bool,
     pending_settlements: Arc<tokio::sync::Mutex<HashMap<u32, (Arc<BridgeConsumer>, u64)>>>,
-) -> Result<(Arc<BridgeConsumer>, Arc<AtomicI64>, Arc<tokio::sync::Notify>), BrokerError>
+) -> Result<
+    (
+        Arc<BridgeConsumer>,
+        Arc<AtomicI64>,
+        Arc<tokio::sync::Notify>,
+    ),
+    BrokerError,
+>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (queue, shard) = ensure_destination(ctx, dest).await?;
     // Unsettled links must HOLD messages until the client's disposition
     // settles them (ack on accepted, requeue on released/rejected).
-    let (consumer, mut rx) =
-        BridgeConsumer::start(ctx, &queue, shard, 0, !unsettled, &format!("amqp10-{handle}")).await?;
+    let (consumer, mut rx) = BridgeConsumer::start(
+        ctx,
+        &queue,
+        shard,
+        0,
+        !unsettled,
+        &format!("amqp10-{handle}"),
+    )
+    .await?;
     let credit_counter = Arc::new(AtomicI64::new(0));
     let notify = Arc::new(tokio::sync::Notify::new());
     let task_consumer = consumer.clone();
@@ -648,7 +717,10 @@ where
             }
             let delivery_id = delivery_counter.fetch_add(1, Ordering::Relaxed);
             let tag = delivery_id.to_be_bytes();
-            let payload = encode_message(d.message.properties.content_type.as_deref(), &d.message.body);
+            let payload = encode_message(
+                d.message.properties.content_type.as_deref(),
+                &d.message.body,
+            );
             let frame = frames::transfer(0, handle, delivery_id, &tag, !unsettled, &payload);
             if unsettled {
                 // Unsettled: remember the delivery until the client's

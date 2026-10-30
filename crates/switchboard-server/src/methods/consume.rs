@@ -9,24 +9,24 @@ use switchboard_wire::method::Method;
 
 use crate::channel::Channel;
 use crate::channel::ChannelResult;
+use crate::methods::authorize_ch;
 use crate::methods::inner_vhost;
 use crate::methods::send_frame;
-use crate::methods::authorize_ch;
 use crate::methods::shard_call;
-use switchboard_core::topology::Perm;
 use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
+use switchboard_core::topology::Perm;
 
 use crate::channel::LocalConsumer;
-use switchboard_cluster::Delivery;
 use crate::channel::Unacked;
 use crate::outbound::message_frames;
 use switchboard_cluster::ConsumerSink;
+use switchboard_cluster::Delivery;
 use switchboard_core::model::ConnectionId;
 use switchboard_core::topology::GroupId;
 
 impl Channel {
-        pub(crate) async fn consume(
+    pub(crate) async fn consume(
         &self,
         node: &Arc<ClusterNode>,
         queue: &str,
@@ -69,7 +69,14 @@ impl Channel {
 
         let (dtx, drx) = mpsc::unbounded_channel::<Delivery>();
         let (ctx, crx) = mpsc::unbounded_channel::<String>();
-        node.attach_consumer(sub, ConsumerSink { deliveries: dtx, cancelled: ctx }).await;
+        node.attach_consumer(
+            sub,
+            ConsumerSink {
+                deliveries: dtx,
+                cancelled: ctx,
+            },
+        )
+        .await;
 
         let tag = {
             let mut inner = self.inner.lock().unwrap();
@@ -146,7 +153,11 @@ impl Channel {
         Ok(tag)
     }
 
-    pub(crate) async fn cancel(&self, node: &Arc<ClusterNode>, consumer_tag: &str) -> ChannelResult<()> {
+    pub(crate) async fn cancel(
+        &self,
+        node: &Arc<ClusterNode>,
+        consumer_tag: &str,
+    ) -> ChannelResult<()> {
         let consumer = self.inner.lock().unwrap().consumers.remove(consumer_tag);
         let Some(c) = consumer else {
             // Unknown tag: RabbitMQ answers cancel-ok anyway.
@@ -162,7 +173,11 @@ impl Channel {
         Ok(())
     }
 
-    pub(crate) async fn set_flow(&self, node: &Arc<ClusterNode>, active: bool) -> ChannelResult<()> {
+    pub(crate) async fn set_flow(
+        &self,
+        node: &Arc<ClusterNode>,
+        active: bool,
+    ) -> ChannelResult<()> {
         let subs: Vec<(SubscriptionId, GroupId)> = {
             let inner = self.inner.lock().unwrap();
             inner.consumers.values().map(|c| (c.sub, c.shard)).collect()
@@ -176,7 +191,6 @@ impl Channel {
         }
         Ok(())
     }
-
 }
 
 /// The delivery pump: shard effects → basic.deliver frames for one

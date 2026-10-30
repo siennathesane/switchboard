@@ -12,8 +12,8 @@
 mod gateway_support;
 mod support;
 
-use switchboard_wire::method::Method;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::method::Method;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
@@ -31,8 +31,12 @@ async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
 /// them; see support::init_tracing for the rationale).
 fn light_hashing() {
     if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
-        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048"); }
-        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_T", "1"); }
+        unsafe {
+            std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+        }
+        unsafe {
+            std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+        }
     }
 }
 
@@ -50,7 +54,12 @@ fn basic_auth_header(user: &str, pass: &str) -> String {
 
 /// Send one HTTP request to the gateway and return
 /// `(status_code, full_response_text)`.
-async fn http_request(method: &str, path: &str, extra_headers: &[String], body: Option<&str>) -> (u16, String) {
+async fn http_request(
+    method: &str,
+    path: &str,
+    extra_headers: &[String],
+    body: Option<&str>,
+) -> (u16, String) {
     let addr = gateway_support::shared_gateway().await;
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     for h in extra_headers {
@@ -69,7 +78,11 @@ async fn http_request(method: &str, path: &str, extra_headers: &[String], body: 
     sock.flush().await.unwrap();
     let mut buf = Vec::new();
     // The server answers `Connection: close` and shuts down; read to EOF.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), sock.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sock.read_to_end(&mut buf),
+    )
+    .await;
     let text = String::from_utf8_lossy(&buf).into_owned();
     let status = text
         .split_whitespace()
@@ -103,16 +116,15 @@ async fn api_delete(path: &str, auth: &str) -> (u16, String) {
 }
 
 fn body_of(response: &str) -> &str {
-    response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
+    response.split("\r\n\r\n").nth(1).unwrap_or("")
 }
 
 fn header_of(response: &str, name: &str) -> Option<String> {
     let head = response.split("\r\n\r\n").next().unwrap_or("");
     for line in head.split("\r\n").skip(1) {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case(name) {
             return Some(v.trim().to_string());
         }
@@ -151,7 +163,9 @@ async fn connect_once(
     user: &str,
     pass: &str,
 ) -> Result<support::TestClient, String> {
-    let mut c = support::TestClient::connect(addr).await.map_err(|e| e.to_string())?;
+    let mut c = support::TestClient::connect(addr)
+        .await
+        .map_err(|e| e.to_string())?;
     let Method::ConnectionStart { mechanisms, .. } = c.expect(0).await? else {
         return Err("expected Connection.Start".into());
     };
@@ -171,12 +185,24 @@ async fn connect_once(
     )
     .await
     .map_err(|e| e.to_string())?;
-    let Method::ConnectionTune { channel_max, frame_max, heartbeat } = c.expect(0).await? else {
+    let Method::ConnectionTune {
+        channel_max,
+        frame_max,
+        heartbeat,
+    } = c.expect(0).await?
+    else {
         return Err("expected Connection.Tune".into());
     };
-    c.send_method(0, &Method::ConnectionTuneOk { channel_max, frame_max, heartbeat })
-        .await
-        .map_err(|e| e.to_string())?;
+    c.send_method(
+        0,
+        &Method::ConnectionTuneOk {
+            channel_max,
+            frame_max,
+            heartbeat,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     c.send_method(
         0,
         &Method::ConnectionOpen {
@@ -195,9 +221,14 @@ async fn connect_once(
     // the scoped-operation tests below use several channels (each denial
     // closes its own channel), so open them all up front.
     for ch in [1u16, 2, 3, 4] {
-        c.send_method(ch, &Method::ChannelOpen { out_of_band: String::new() })
-            .await
-            .map_err(|e| e.to_string())?;
+        c.send_method(
+            ch,
+            &Method::ChannelOpen {
+                out_of_band: String::new(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let Method::ChannelOpenOk { .. } = c.expect(ch).await? else {
             return Err(format!("expected Channel.OpenOk on channel {ch}"));
         };
@@ -210,7 +241,12 @@ async fn declare(c: &mut support::TestClient, channel: u16, queue: &str) -> Meth
     declare_ctx(c, channel, queue, queue).await
 }
 
-async fn declare_ctx(c: &mut support::TestClient, channel: u16, queue: &str, context: &str) -> Method {
+async fn declare_ctx(
+    c: &mut support::TestClient,
+    channel: u16,
+    queue: &str,
+    context: &str,
+) -> Method {
     c.send_method(
         channel,
         &Method::QueueDeclare {
@@ -233,11 +269,22 @@ async fn declare_ctx(c: &mut support::TestClient, channel: u16, queue: &str, con
 
 /// Expect a channel-level ACCESS_REFUSED close (the authz denial shape).
 async fn expect_access_refused(c: &mut support::TestClient, channel: u16, context: &str) {
-    let got = c.expect(channel).await.unwrap_or_else(|e| panic!("{context}: {e}"));
-    let Method::ChannelClose { reply_code, reply_text, .. } = got else {
+    let got = c
+        .expect(channel)
+        .await
+        .unwrap_or_else(|e| panic!("{context}: {e}"));
+    let Method::ChannelClose {
+        reply_code,
+        reply_text,
+        ..
+    } = got
+    else {
         panic!("{context}: expected Channel.Close, got {got:?}");
     };
-    assert_eq!(reply_code, 403, "{context}: expected 403, got {reply_code} ({reply_text})");
+    assert_eq!(
+        reply_code, 403,
+        "{context}: expected 403, got {reply_code} ({reply_text})"
+    );
     let _ = c.send_method(channel, &Method::ChannelCloseOk {}).await;
 }
 
@@ -271,7 +318,13 @@ async fn admin_api_refuses_missing_or_bad_credentials() {
     assert_eq!(code, 401, "got: {text}");
 
     // Malformed Authorization header.
-    let (code, text) = http_request("GET", "/api/users", &["Authorization: Basic !!!notb64!!!".into()], None).await;
+    let (code, text) = http_request(
+        "GET",
+        "/api/users",
+        &["Authorization: Basic !!!notb64!!!".into()],
+        None,
+    )
+    .await;
     assert_eq!(code, 401, "got: {text}");
 }
 
@@ -289,7 +342,12 @@ async fn permissions_crud_round_trip() {
     let perms = r#"{"configure":"^svc-crud-.*","write":"^svc-crud-.*|^$","read":"^svc-crud-.*"}"#;
 
     // Create the user.
-    let (code, text) = api_put(&format!("/api/users/{user}"), &admin, r#"{"password":"s3cret"}"#).await;
+    let (code, text) = api_put(
+        &format!("/api/users/{user}"),
+        &admin,
+        r#"{"password":"s3cret"}"#,
+    )
+    .await;
     assert_eq!(code, 200, "PUT user failed: {text}");
 
     // A user with no permissions entry yet may not be listed as restricted;
@@ -297,7 +355,11 @@ async fn permissions_crud_round_trip() {
     // only once an entry exists — until then they are unrestricted).
     let (code, text) = api_get("/api/users", Some(&admin)).await;
     assert_eq!(code, 200, "GET users failed: {text}");
-    assert!(body_of(&text).contains(user), "user missing from listing: {}", body_of(&text));
+    assert!(
+        body_of(&text).contains(user),
+        "user missing from listing: {}",
+        body_of(&text)
+    );
 
     // Set permissions on the default vhost (%2F == "/").
     let (code, text) = api_put("/api/permissions/%2F/svc-crud", &admin, perms).await;
@@ -307,14 +369,27 @@ async fn permissions_crud_round_trip() {
     let (code, text) = api_get("/api/permissions/%2F/svc-crud", Some(&admin)).await;
     assert_eq!(code, 200, "GET permission failed: {text}");
     let body = body_of(&text);
-    assert!(body.contains(r#""configure":"^svc-crud-.*""#), "configure regex missing: {body}");
-    assert!(body.contains(r#""write":"^svc-crud-.*|^$""#), "write regex missing: {body}");
-    assert!(body.contains(r#""read":"^svc-crud-.*""#), "read regex missing: {body}");
+    assert!(
+        body.contains(r#""configure":"^svc-crud-.*""#),
+        "configure regex missing: {body}"
+    );
+    assert!(
+        body.contains(r#""write":"^svc-crud-.*|^$""#),
+        "write regex missing: {body}"
+    );
+    assert!(
+        body.contains(r#""read":"^svc-crud-.*""#),
+        "read regex missing: {body}"
+    );
 
     // The aggregate listing carries it too.
     let (code, text) = api_get("/api/permissions", Some(&admin)).await;
     assert_eq!(code, 200);
-    assert!(body_of(&text).contains(user), "aggregate listing lacks {user}: {}", body_of(&text));
+    assert!(
+        body_of(&text).contains(user),
+        "aggregate listing lacks {user}: {}",
+        body_of(&text)
+    );
 
     // GET for a user/vhost pair with no entry is a 404.
     let (code, _) = api_get("/api/permissions/%2F/svc-nobody", Some(&admin)).await;
@@ -337,7 +412,11 @@ async fn permissions_crud_round_trip() {
     assert_eq!(code, 200, "PUT vhost failed: {text}");
     let (code, text) = api_get("/api/vhosts", Some(&admin)).await;
     assert_eq!(code, 200);
-    assert!(body_of(&text).contains("e2e-crud-vh"), "vhost missing: {}", body_of(&text));
+    assert!(
+        body_of(&text).contains("e2e-crud-vh"),
+        "vhost missing: {}",
+        body_of(&text)
+    );
     let (code, text) = api_get("/api/exchanges", Some(&admin)).await;
     assert_eq!(code, 200);
     assert!(
@@ -352,11 +431,15 @@ async fn permissions_crud_round_trip() {
     let addr = gateway_support::shared_gateway().await;
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
     let got = declare(&mut c, 1, "crud-listing-q").await;
-    assert!(matches!(got, Method::QueueDeclareOk { .. }), "declare failed: {got:?}");
+    assert!(
+        matches!(got, Method::QueueDeclareOk { .. }),
+        "declare failed: {got:?}"
+    );
     let (code, text) = api_get("/api/queues", Some(&admin)).await;
     assert_eq!(code, 200);
     assert!(
-        body_of(&text).contains(r#""name":"crud-listing-q""#) && body_of(&text).contains(r#""vhost":"/""#),
+        body_of(&text).contains(r#""name":"crud-listing-q""#)
+            && body_of(&text).contains(r#""vhost":"/""#),
         "queue listing lacks crud-listing-q: {}",
         body_of(&text)
     );
@@ -408,20 +491,42 @@ async fn restricted_user_can_only_publish_and_read_within_their_regexes() {
 
     // Configure: allowed queue passes.
     let got = declare_ctx(&mut c, 1, "svc-app-inbox", "restricted declare in-scope").await;
-    assert!(matches!(got, Method::QueueDeclareOk { .. }), "in-scope declare failed: {got:?}");
+    assert!(
+        matches!(got, Method::QueueDeclareOk { .. }),
+        "in-scope declare failed: {got:?}"
+    );
 
     // Configure: anything outside the regex is refused (403 channel close).
     let got = declare(&mut c, 2, "other-people-q").await;
-    assert!(matches!(got, Method::ChannelClose { reply_code: 403, .. }), "out-of-scope declare allowed: {got:?}");
+    assert!(
+        matches!(
+            got,
+            Method::ChannelClose {
+                reply_code: 403,
+                ..
+            }
+        ),
+        "out-of-scope declare allowed: {got:?}"
+    );
     let _ = c.send_method(2, &Method::ChannelCloseOk {}).await;
 
     // Write: publishing to the default exchange (write regex matches "").
-    support::publish(&mut c, 1, "", "svc-app-inbox", &BasicProperties::default(), b"scoped-payload", false)
-        .await
-        .unwrap();
+    support::publish(
+        &mut c,
+        1,
+        "",
+        "svc-app-inbox",
+        &BasicProperties::default(),
+        b"scoped-payload",
+        false,
+    )
+    .await
+    .unwrap();
 
     // Read: get from the in-scope queue delivers that message.
-    let got = support::basic_get(&mut c, 1, "svc-app-inbox", true).await.unwrap();
+    let got = support::basic_get(&mut c, 1, "svc-app-inbox", true)
+        .await
+        .unwrap();
     let (tag, body) = got.expect("in-scope get must see the published message");
     assert_eq!(body, b"scoped-payload");
     let _ = tag;
@@ -450,13 +555,20 @@ async fn restricted_user_can_only_publish_and_read_within_their_regexes() {
     )
     .await
     .unwrap();
-    c.send_content(4, &BasicProperties::default(), b"denied").await.unwrap();
+    c.send_content(4, &BasicProperties::default(), b"denied")
+        .await
+        .unwrap();
     expect_access_refused(&mut c, 4, "out-of-scope topic publish").await;
 
     // The forbidden queue really did not receive anything through the
     // denied publish paths.
-    let got = support::basic_get(&mut admin_c, 1, "off-limits-q", true).await.unwrap();
-    assert!(got.is_none(), "forbidden queue unexpectedly contains a message");
+    let got = support::basic_get(&mut admin_c, 1, "off-limits-q", true)
+        .await
+        .unwrap();
+    assert!(
+        got.is_none(),
+        "forbidden queue unexpectedly contains a message"
+    );
 
     // Cleanup via the API under test.
     let _ = api_delete("/api/users/svc-app", &admin).await;
@@ -480,9 +592,17 @@ async fn metrics_content_type_and_representative_lines() {
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
     let got = declare(&mut c, 1, "metrics-traffic-q").await;
     assert!(matches!(got, Method::QueueDeclareOk { .. }));
-    support::publish(&mut c, 1, "", "metrics-traffic-q", &BasicProperties::default(), b"m1", false)
-        .await
-        .unwrap();
+    support::publish(
+        &mut c,
+        1,
+        "",
+        "metrics-traffic-q",
+        &BasicProperties::default(),
+        b"m1",
+        false,
+    )
+    .await
+    .unwrap();
 
     let (code, text) = http_request("GET", "/metrics", &[], None).await;
     assert_eq!(code, 200, "GET /metrics failed");
@@ -496,8 +616,14 @@ async fn metrics_content_type_and_representative_lines() {
 
     // Representative message-lifecycle lines (the counters the soak engine
     // already computes), with HELP/TYPE metadata.
-    assert!(body.contains("# TYPE switchboard_messages_enqueued_total counter"), "no enqueued counter: {body}");
-    assert!(body.contains("# TYPE switchboard_messages_acked_total counter"), "no acked counter");
+    assert!(
+        body.contains("# TYPE switchboard_messages_enqueued_total counter"),
+        "no enqueued counter: {body}"
+    );
+    assert!(
+        body.contains("# TYPE switchboard_messages_acked_total counter"),
+        "no acked counter"
+    );
     let enqueued_line = body
         .lines()
         .find(|l| l.starts_with("switchboard_messages_enqueued_total "))
@@ -507,7 +633,10 @@ async fn metrics_content_type_and_representative_lines() {
         .nth(1)
         .and_then(|v| v.parse().ok())
         .expect("unparseable enqueued value");
-    assert!(enqueued >= 1, "enqueued counter did not observe our publish: {enqueued_line}");
+    assert!(
+        enqueued >= 1,
+        "enqueued counter did not observe our publish: {enqueued_line}"
+    );
 
     // Per-queue depth gauges carry our traffic queue with its message.
     assert!(
@@ -517,7 +646,8 @@ async fn metrics_content_type_and_representative_lines() {
 
     // Per-protocol connection lines (gauge + since-start counter).
     assert!(
-        body.lines().any(|l| l.starts_with("switchboard_connections{protocol=\"amqp091\"} ")),
+        body.lines()
+            .any(|l| l.starts_with("switchboard_connections{protocol=\"amqp091\"} ")),
         "no amqp091 connection gauge: {body}"
     );
     let accepted = body
@@ -529,17 +659,28 @@ async fn metrics_content_type_and_representative_lines() {
         .nth(1)
         .and_then(|v| v.parse().ok())
         .expect("unparseable connection total");
-    assert!(accepted_n >= 1, "amqp091 total did not observe our connection: {accepted}");
+    assert!(
+        accepted_n >= 1,
+        "amqp091 total did not observe our connection: {accepted}"
+    );
 
     // Node vitals and identity.
-    assert!(body.lines().any(|l| l.starts_with("switchboard_uptime_seconds ")), "no uptime gauge: {body}");
     assert!(
-        body.lines().any(|l| l.starts_with("switchboard_node_info{node=") && l.ends_with("} 1")),
+        body.lines()
+            .any(|l| l.starts_with("switchboard_uptime_seconds ")),
+        "no uptime gauge: {body}"
+    );
+    assert!(
+        body.lines()
+            .any(|l| l.starts_with("switchboard_node_info{node=") && l.ends_with("} 1")),
         "no node info line: {body}"
     );
     // Counters/gauges are plain integers; nothing non-numeric leaked in.
     for line in body.lines().filter(|l| !l.starts_with('#')) {
-        let value = line.split_whitespace().nth(1).expect("sample without value");
+        let value = line
+            .split_whitespace()
+            .nth(1)
+            .expect("sample without value");
         assert!(
             value.parse::<f64>().map(|v| v.is_finite()).unwrap_or(false),
             "non-finite sample in {line}"

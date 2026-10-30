@@ -31,7 +31,13 @@ pub struct BrokerError {
 
 impl BrokerError {
     fn new(code: u16, text: impl Into<String>, level: Level) -> Self {
-        BrokerError { code, text: text.into(), level, class_id: 0, method_id: 0 }
+        BrokerError {
+            code,
+            text: text.into(),
+            level,
+            class_id: 0,
+            method_id: 0,
+        }
     }
 
     /// Attach the offending method, as Connection.Close/Channel.Close want.
@@ -185,8 +191,7 @@ mod tests {
 
     #[test]
     fn levels_and_method_attachment() {
-        let e = BrokerError::not_found("no exchange 'x'")
-            .for_method(40, 20);
+        let e = BrokerError::not_found("no exchange 'x'").for_method(40, 20);
         assert_eq!(e.level, Level::Channel);
         assert_eq!((e.class_id, e.method_id), (40, 20));
         assert_eq!(BrokerError::frame_error("x").level, Level::Connection);
@@ -201,7 +206,9 @@ mod level_tests {
 
     #[test]
     fn connection_level_forces_connection() {
-        let e = BrokerError::not_found("x").channel_level().connection_level();
+        let e = BrokerError::not_found("x")
+            .channel_level()
+            .connection_level();
         assert_eq!(e.level, Level::Connection);
     }
 

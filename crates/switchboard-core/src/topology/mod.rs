@@ -12,14 +12,19 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use switchboard_wire::constants::naming;
 use switchboard_wire::field::FieldTable;
 
 use crate::error::BrokerError;
-use crate::model::{
-    binding_key, exchange, Binding, Exchange, ExchangeKind, QueueInfo, QueueOptions,
-};
+use crate::model::Binding;
+use crate::model::Exchange;
+use crate::model::ExchangeKind;
+use crate::model::QueueInfo;
+use crate::model::QueueOptions;
+use crate::model::binding_key;
+use crate::model::exchange;
 use crate::routing::TopologyView;
 
 /// Identifies a raft group in this broker. Group 0 is the meta group; the
@@ -137,10 +142,15 @@ impl Permissions {
 /// Bootstrap state for a fresh cluster: default vhost, mandatory exchanges,
 /// default user (§3.1.3 "The server will create a set of exchanges...").
 pub fn bootstrap() -> MetaState {
-    use switchboard_wire::constants::{DEFAULT_PASSWORD, DEFAULT_USER, DEFAULT_VHOST};
+    use switchboard_wire::constants::DEFAULT_PASSWORD;
+    use switchboard_wire::constants::DEFAULT_USER;
+    use switchboard_wire::constants::DEFAULT_VHOST;
     let mut s = MetaState::default();
     s.declare_default_entities(DEFAULT_VHOST);
-    s.users.insert(DEFAULT_USER.into(), crate::auth::hash_password(DEFAULT_PASSWORD));
+    s.users.insert(
+        DEFAULT_USER.into(),
+        crate::auth::hash_password(DEFAULT_PASSWORD),
+    );
     s
 }
 
@@ -157,14 +167,15 @@ impl MetaState {
             ("amq.topic", ExchangeKind::Topic),
             ("amq.match", ExchangeKind::Headers),
         ] {
-            v.exchanges.insert(name.to_string(), exchange(name, kind, true));
+            v.exchanges
+                .insert(name.to_string(), exchange(name, kind, true));
         }
     }
 
     pub fn vhost(&self, name: &str) -> Result<&Vhost, BrokerError> {
-        self.vhosts.get(name).ok_or_else(|| BrokerError::invalid_path(format!(
-            "no vhost {name:?}"
-        )))
+        self.vhosts
+            .get(name)
+            .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {name:?}")))
     }
 
     /// May `user` perform `perm` on `resource` in `vhost`? Users without
@@ -211,19 +222,19 @@ impl MetaState {
                 self.declare_default_entities(name);
                 Ok((MetaReply::Ok, vec![]))
             }
-            MetaCmd::SetPermissions { user, vhost, permissions } => {
+            MetaCmd::SetPermissions {
+                user,
+                vhost,
+                permissions,
+            } => {
                 if !self.users.contains_key(user) {
-                    return Err(BrokerError::access_refused(format!(
-                        "no user {user:?}"
-                    )));
+                    return Err(BrokerError::access_refused(format!("no user {user:?}")));
                 }
                 let empty = permissions.configure.is_empty()
                     && permissions.write.is_empty()
                     && permissions.read.is_empty();
                 if empty {
-                    self.permissions
-                        .get_mut(user)
-                        .map(|m| m.remove(vhost));
+                    self.permissions.get_mut(user).map(|m| m.remove(vhost));
                 } else {
                     self.permissions
                         .entry(user.clone())
@@ -242,7 +253,8 @@ impl MetaState {
                 // only in this command (and thus the raft log — rotate
                 // users rather than in-place password changes when that
                 // matters).
-                self.users.insert(name.clone(), crate::auth::hash_password(password));
+                self.users
+                    .insert(name.clone(), crate::auth::hash_password(password));
                 Ok((MetaReply::Ok, vec![]))
             }
             MetaCmd::SetGroups { groups } => {
@@ -272,12 +284,20 @@ impl MetaState {
                 let mut effects = Vec::new();
                 for q in dead_queues {
                     self.remove_queue(&q.name);
-                    effects.push(MetaEffect::QueueDeleted { queue: q.name.clone(), shard: q.shard });
+                    effects.push(MetaEffect::QueueDeleted {
+                        queue: q.name.clone(),
+                        shard: q.shard,
+                    });
                 }
                 Ok((MetaReply::Ok, effects))
             }
 
-            MetaCmd::FanoutBegin { id, vhost, message, queues } => {
+            MetaCmd::FanoutBegin {
+                id,
+                vhost,
+                message,
+                queues,
+            } => {
                 // Idempotent: a re-applied Begin (dedup missed across a
                 // snapshot boundary) must not enqueue the fanout twice.
                 if self.pending_fanouts.iter().any(|f| &f.id == id) {
@@ -304,16 +324,26 @@ impl MetaState {
                 Ok((MetaReply::FanoutDone, vec![]))
             }
 
-            MetaCmd::DeclareExchange { vhost, name, kind, passive, durable, auto_delete, internal, arguments } => {
+            MetaCmd::DeclareExchange {
+                vhost,
+                name,
+                kind,
+                passive,
+                durable,
+                auto_delete,
+                internal,
+                arguments,
+            } => {
                 if name.starts_with(naming::RESERVED_PREFIX) && !is_bootstrap_exchange(name) {
                     return Err(BrokerError::access_refused(format!(
                         "exchange name {name:?} contains reserved prefix {:?}",
                         naming::RESERVED_PREFIX
                     )));
                 }
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 match v.exchanges.get(name) {
                     Some(existing) => {
                         if *passive {
@@ -353,15 +383,20 @@ impl MetaState {
                 }
             }
 
-            MetaCmd::DeleteExchange { vhost, name, if_unused } => {
+            MetaCmd::DeleteExchange {
+                vhost,
+                name,
+                if_unused,
+            } => {
                 if name.is_empty() {
                     return Err(BrokerError::access_refused(
                         "the default exchange cannot be deleted",
                     ));
                 }
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 if !v.exchanges.contains_key(name) {
                     return Err(BrokerError::not_found(format!(
                         "no exchange {name:?} in vhost {vhost:?}"
@@ -378,7 +413,13 @@ impl MetaState {
                 Ok((MetaReply::Ok, vec![]))
             }
 
-            MetaCmd::DeclareQueue { vhost, name, passive, options, owner } => {
+            MetaCmd::DeclareQueue {
+                vhost,
+                name,
+                passive,
+                options,
+                owner,
+            } => {
                 // The caller resolves server-named queues BEFORE issuing the
                 // command: every replica must apply byte-identical commands,
                 // so randomness never lives inside apply().
@@ -400,7 +441,14 @@ impl MetaState {
                         )));
                     }
                     if *passive {
-                        return Ok((MetaReply::QueueDeclared { name: name.clone(), shard: existing.shard, created: false }, vec![]));
+                        return Ok((
+                            MetaReply::QueueDeclared {
+                                name: name.clone(),
+                                shard: existing.shard,
+                                created: false,
+                            },
+                            vec![],
+                        ));
                     }
                     let equivalent = existing.options.durable == options.durable
                         && existing.options.exclusive == options.exclusive
@@ -411,7 +459,14 @@ impl MetaState {
                             "queue {name:?} in vhost {vhost:?} exists with different durability, exclusivity, auto-delete or arguments"
                         )));
                     }
-                    return Ok((MetaReply::QueueDeclared { name: name.clone(), shard: existing.shard, created: false }, vec![]));
+                    return Ok((
+                        MetaReply::QueueDeclared {
+                            name: name.clone(),
+                            shard: existing.shard,
+                            created: false,
+                        },
+                        vec![],
+                    ));
                 }
                 if *passive {
                     return Err(BrokerError::not_found(format!(
@@ -420,9 +475,7 @@ impl MetaState {
                 }
                 // `amq.` is reserved for the server, but its own generated
                 // names (amq.gen-...) are exactly the sanctioned users of it.
-                if name.starts_with(naming::RESERVED_PREFIX)
-                    && !name.starts_with("amq.gen-")
-                {
+                if name.starts_with(naming::RESERVED_PREFIX) && !name.starts_with("amq.gen-") {
                     return Err(BrokerError::access_refused(format!(
                         "queue name {name:?} contains reserved prefix {:?}",
                         naming::RESERVED_PREFIX
@@ -433,25 +486,45 @@ impl MetaState {
                         "no shard groups are configured yet",
                     ));
                 };
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 v.queues.insert(
                     name.clone(),
                     QueueInfo {
                         name: name.clone(),
                         options: options.clone(),
-                        owner: if options.exclusive { Some(*owner) } else { None },
+                        owner: if options.exclusive {
+                            Some(*owner)
+                        } else {
+                            None
+                        },
                         shard,
                     },
                 );
-                Ok((MetaReply::QueueDeclared { name: name.clone(), shard, created: true }, vec![]))
+                Ok((
+                    MetaReply::QueueDeclared {
+                        name: name.clone(),
+                        shard,
+                        created: true,
+                    },
+                    vec![],
+                ))
             }
 
-            MetaCmd::DeleteQueue { vhost, name, if_unused, if_empty, depth, consumers } => {
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+            MetaCmd::DeleteQueue {
+                vhost,
+                name,
+                if_unused,
+                if_empty,
+                depth,
+                consumers,
+            } => {
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 let Some(info) = v.queues.get(name) else {
                     return Err(BrokerError::not_found(format!(
                         "no queue {name:?} in vhost {vhost:?}"
@@ -473,15 +546,27 @@ impl MetaState {
                 let purged = *depth;
                 self.remove_queue(name);
                 Ok((
-                    MetaReply::QueueDeleted { message_count: purged as u32 },
-                    vec![MetaEffect::QueueDeleted { queue: name.clone(), shard }],
+                    MetaReply::QueueDeleted {
+                        message_count: purged as u32,
+                    },
+                    vec![MetaEffect::QueueDeleted {
+                        queue: name.clone(),
+                        shard,
+                    }],
                 ))
             }
 
-            MetaCmd::Bind { vhost, exchange: ex_name, queue, routing_key, arguments } => {
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+            MetaCmd::Bind {
+                vhost,
+                exchange: ex_name,
+                queue,
+                routing_key,
+                arguments,
+            } => {
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 if ex_name.is_empty() {
                     return Err(BrokerError::access_refused(
                         "cannot bind to the default exchange",
@@ -514,10 +599,17 @@ impl MetaState {
                 Ok((MetaReply::Bound { existed }, vec![]))
             }
 
-            MetaCmd::Unbind { vhost, exchange: ex_name, queue, routing_key, arguments } => {
-                let v = self.vhosts.get_mut(vhost).ok_or_else(|| {
-                    BrokerError::invalid_path(format!("no vhost {vhost:?}"))
-                })?;
+            MetaCmd::Unbind {
+                vhost,
+                exchange: ex_name,
+                queue,
+                routing_key,
+                arguments,
+            } => {
+                let v = self
+                    .vhosts
+                    .get_mut(vhost)
+                    .ok_or_else(|| BrokerError::invalid_path(format!("no vhost {vhost:?}")))?;
                 if ex_name.is_empty() {
                     return Err(BrokerError::access_refused(
                         "cannot unbind from the default exchange",
@@ -554,10 +646,15 @@ impl MetaState {
                 Ok((MetaReply::Ok, effects))
             }
 
-            MetaCmd::SetRetained { vhost, topic, message } => {
+            MetaCmd::SetRetained {
+                vhost,
+                topic,
+                message,
+            } => {
                 match message {
                     Some(m) => {
-                        self.retained.insert((vhost.clone(), topic.clone()), m.clone());
+                        self.retained
+                            .insert((vhost.clone(), topic.clone()), m.clone());
                     }
                     None => {
                         self.retained.remove(&(vhost.clone(), topic.clone()));
@@ -585,7 +682,10 @@ impl MetaState {
 }
 
 fn is_bootstrap_exchange(name: &str) -> bool {
-    matches!(name, "amq.direct" | "amq.fanout" | "amq.topic" | "amq.match")
+    matches!(
+        name,
+        "amq.direct" | "amq.fanout" | "amq.topic" | "amq.match"
+    )
 }
 
 /// Deterministic 64-bit FNV-1a: stable across builds and processes, unlike
@@ -602,14 +702,26 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 /// Topology mutations, applied through the meta raft group.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetaCmd {
-    DeclareVhost { name: String },
-    CreateUser { name: String, password: String },
+    DeclareVhost {
+        name: String,
+    },
+    CreateUser {
+        name: String,
+        password: String,
+    },
     /// Install the shard group map (membership controller output).
-    SetGroups { groups: Vec<(GroupId, Vec<u64>)> },
-    RegisterNode { node: u64, info: NodeInfo },
+    SetGroups {
+        groups: Vec<(GroupId, Vec<u64>)>,
+    },
+    RegisterNode {
+        node: u64,
+        info: NodeInfo,
+    },
     /// Node left the cluster (crash or shutdown). Cascades cleanup of the
     /// exclusive queues its connections owned.
-    ForgetNode { node: u64 },
+    ForgetNode {
+        node: u64,
+    },
     /// Accept a multi-destination publish into the pending-fanout queue
     /// (total-order broadcast: the meta leader executes pending fanouts
     /// strictly in this log's order).
@@ -621,7 +733,9 @@ pub enum MetaCmd {
     },
     /// Every destination of the fanout has been enqueued; drop it from the
     /// pending queue.
-    FanoutDone { id: uuid::Uuid },
+    FanoutDone {
+        id: uuid::Uuid,
+    },
     DeclareExchange {
         vhost: String,
         name: String,
@@ -632,7 +746,11 @@ pub enum MetaCmd {
         internal: bool,
         arguments: FieldTable,
     },
-    DeleteExchange { vhost: String, name: String, if_unused: bool },
+    DeleteExchange {
+        vhost: String,
+        name: String,
+        if_unused: bool,
+    },
     /// Declare (create or assert) a queue. `depth`/`consumers` accompany
     /// DeleteQueue because queue live-data lives in shards; DeclareQueue
     /// needs none of it.
@@ -676,7 +794,9 @@ pub enum MetaCmd {
         permissions: Permissions,
     },
     /// Remove a user and their permissions.
-    DeleteUser { name: String },
+    DeleteUser {
+        name: String,
+    },
     /// Store (or clear, `message = None`) a retained MQTT message,
     /// replicated through meta so every node serves the same retained
     /// state. Keyed by vhost + MQTT topic.
@@ -694,10 +814,20 @@ pub enum MetaReply {
     FanoutBegun,
     FanoutDone,
     Authorized,
-    ExchangeDeclared { existed: bool },
-    QueueDeclared { name: String, shard: GroupId, created: bool },
-    QueueDeleted { message_count: u32 },
-    Bound { existed: bool },
+    ExchangeDeclared {
+        existed: bool,
+    },
+    QueueDeclared {
+        name: String,
+        shard: GroupId,
+        created: bool,
+    },
+    QueueDeleted {
+        message_count: u32,
+    },
+    Bound {
+        existed: bool,
+    },
 }
 
 /// Cross-group follow-ups the meta leader (or applying node) must perform.

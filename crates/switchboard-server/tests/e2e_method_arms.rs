@@ -4,13 +4,15 @@
 
 mod support;
 
+use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
-use switchboard_wire::BasicProperties;
 
-use support::{
-    connect_and_open, publish, start_broker, with_timeout, TestClient,
-};
+use support::TestClient;
+use support::connect_and_open;
+use support::publish;
+use support::start_broker;
+use support::with_timeout;
 
 async fn declare(c: &mut TestClient, queue: &str) {
     c.send_method(
@@ -28,7 +30,10 @@ async fn declare(c: &mut TestClient, queue: &str) {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::QueueDeclareOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::QueueDeclareOk { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -73,7 +78,10 @@ async fn exchange_bind_unbind_exchange_to_exchange() {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::QueueBindOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::QueueBindOk { .. }
+    ));
 
     // Bind destination exchange to source exchange.
     c.send_method(
@@ -89,16 +97,37 @@ async fn exchange_bind_unbind_exchange_to_exchange() {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::ExchangeBindOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::ExchangeBindOk { .. }
+    ));
 
     // Publish to src → routed into dst → bound queue gets it.
-    publish(&mut c, 1, "src-ex", "k", &BasicProperties::new(), b"via-ex", false)
-        .await
-        .unwrap();
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "xx-q".into(), no_ack: true })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicGetOk { .. }));
+    publish(
+        &mut c,
+        1,
+        "src-ex",
+        "k",
+        &BasicProperties::new(),
+        b"via-ex",
+        false,
+    )
+    .await
+    .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "xx-q".into(),
+            no_ack: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicGetOk { .. }
+    ));
 
     // Unbind, then delete the exchange (nowait variant: no reply comes).
     c.send_method(
@@ -161,10 +190,18 @@ async fn invalid_exchange_types_are_rejected() {
     assert_eq!(reply_code, 540);
     // Client MUST answer Channel.Close-Ok before reopening (§4.8.1).
     c.send_method(1, &Method::ChannelCloseOk {}).await.unwrap();
-    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::ChannelOpenOk { .. }));
+    c.send_method(
+        1,
+        &Method::ChannelOpen {
+            out_of_band: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::ChannelOpenOk { .. }
+    ));
 
     // Plain invalid type → 503 command invalid.
     c.send_method(
@@ -201,7 +238,9 @@ async fn channel_flow_pauses_and_resumes_delivery() {
     declare(&mut c, "fq").await;
 
     // Pause BEFORE consuming.
-    c.send_method(1, &Method::ChannelFlow { active: false }).await.unwrap();
+    c.send_method(1, &Method::ChannelFlow { active: false })
+        .await
+        .unwrap();
     assert!(matches!(
         c.expect(1).await.unwrap(),
         Method::ChannelFlowOk { active: false }
@@ -222,13 +261,24 @@ async fn channel_flow_pauses_and_resumes_delivery() {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicConsumeOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicConsumeOk { .. }
+    ));
 
     // Publish while paused: the consumer must not receive them.
     for i in 0..2u32 {
-        publish(&mut c, 1, "", "fq", &BasicProperties::new(), format!("m{i}").as_bytes(), false)
-            .await
-            .unwrap();
+        publish(
+            &mut c,
+            1,
+            "",
+            "fq",
+            &BasicProperties::new(),
+            format!("m{i}").as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
     }
     // While paused, an ack-mode consumer would have held them; with no_ack
     // they stay ready. Prove the pause held by reading nothing for a beat.
@@ -236,11 +286,16 @@ async fn channel_flow_pauses_and_resumes_delivery() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Resume and read the two deliveries straight off the socket.
-    c.send_method(1, &Method::ChannelFlow { active: true }).await.unwrap();
+    c.send_method(1, &Method::ChannelFlow { active: true })
+        .await
+        .unwrap();
     let mut bodies: Vec<Vec<u8>> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while bodies.len() < 2 {
-        assert!(tokio::time::Instant::now() < deadline, "paused messages never flowed");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "paused messages never flowed"
+        );
         let (m, content) = with_timeout(c.expect_method(1), 30).await.unwrap();
         match m {
             Method::BasicDeliver { .. } => {
@@ -268,10 +323,18 @@ async fn tx_and_confirm_mode_transitions() {
     assert_eq!(reply_code, 406);
 
     // Channel is closed after the error; reopen.
-    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::ChannelOpenOk { .. }));
+    c.send_method(
+        1,
+        &Method::ChannelOpen {
+            out_of_band: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::ChannelOpenOk { .. }
+    ));
 
     // TxRollback without select → same 406.
     c.send_method(1, &Method::TxRollback {}).await.unwrap();
@@ -281,12 +344,25 @@ async fn tx_and_confirm_mode_transitions() {
     assert_eq!(reply_code, 406);
 
     // Reopen, select confirm, then switching to tx is refused.
-    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() })
+    c.send_method(
+        1,
+        &Method::ChannelOpen {
+            out_of_band: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::ChannelOpenOk { .. }
+    ));
+    c.send_method(1, &Method::ConfirmSelect { nowait: false })
         .await
         .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::ChannelOpenOk { .. }));
-    c.send_method(1, &Method::ConfirmSelect { nowait: false }).await.unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::ConfirmSelectOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::ConfirmSelectOk { .. }
+    ));
     c.send_method(1, &Method::TxSelect {}).await.unwrap();
     let Method::ChannelClose { reply_code, .. } = c.expect(1).await.unwrap() else {
         panic!("expected Channel.Close");
@@ -302,17 +378,38 @@ async fn tx_publish_rollback_discards_buffered_message() {
 
     c.send_method(1, &Method::TxSelect {}).await.unwrap();
     c.expect(1).await.unwrap();
-    publish(&mut c, 1, "", "txbuf", &BasicProperties::new(), b"buffered", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "txbuf",
+        &BasicProperties::new(),
+        b"buffered",
+        false,
+    )
+    .await
+    .unwrap();
     c.send_method(1, &Method::TxRollback {}).await.unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::TxRollbackOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::TxRollbackOk { .. }
+    ));
 
     // Nothing was delivered (the buffered publish never hit the shard).
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "txbuf".into(), no_ack: true })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicGetEmpty { .. }));
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "txbuf".into(),
+            no_ack: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicGetEmpty { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -322,19 +419,48 @@ async fn ack_and_reject_unknown_tags_are_noops() {
     declare(&mut c, "uq").await;
 
     // Unknown delivery tags: neither errors nor disturbs the channel.
-    c.send_method(1, &Method::BasicAck { delivery_tag: 999, multiple: false })
-        .await
-        .unwrap();
-    c.send_method(1, &Method::BasicReject { delivery_tag: 998, requeue: false })
-        .await
-        .unwrap();
-    c.send_method(1, &Method::BasicNack { delivery_tag: 997, multiple: true, requeue: true })
-        .await
-        .unwrap();
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "uq".into(), no_ack: true })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicGetEmpty { .. }));
+    c.send_method(
+        1,
+        &Method::BasicAck {
+            delivery_tag: 999,
+            multiple: false,
+        },
+    )
+    .await
+    .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicReject {
+            delivery_tag: 998,
+            requeue: false,
+        },
+    )
+    .await
+    .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicNack {
+            delivery_tag: 997,
+            multiple: true,
+            requeue: true,
+        },
+    )
+    .await
+    .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "uq".into(),
+            no_ack: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicGetEmpty { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -342,22 +468,46 @@ async fn recover_async_requeues() {
     let (_node, addr) = start_broker("recasync").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
     declare(&mut c, "raq").await;
-    publish(&mut c, 1, "", "raq", &BasicProperties::new(), b"ra", false).await.unwrap();
-
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "raq".into(), no_ack: false })
+    publish(&mut c, 1, "", "raq", &BasicProperties::new(), b"ra", false)
         .await
         .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicGetOk { .. }));
 
-    c.send_method(1, &Method::BasicRecoverAsync { requeue: true }).await.unwrap();
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "raq".into(),
+            no_ack: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicGetOk { .. }
+    ));
+
+    c.send_method(1, &Method::BasicRecoverAsync { requeue: true })
+        .await
+        .unwrap();
     c.expect(1).await.unwrap(); // Recover-Ok (implementation replies to both variants)
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "message never returned");
-        c.send_method(1, &Method::BasicGet { ticket: 0, queue: "raq".into(), no_ack: true })
-            .await
-            .unwrap();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "message never returned"
+        );
+        c.send_method(
+            1,
+            &Method::BasicGet {
+                ticket: 0,
+                queue: "raq".into(),
+                no_ack: true,
+            },
+        )
+        .await
+        .unwrap();
         match c.expect(1).await.unwrap() {
             Method::BasicGetOk { redelivered, .. } => {
                 assert!(redelivered);
@@ -405,12 +555,22 @@ async fn queue_unbind_and_nowait_variants() {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::QueueUnbindOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::QueueUnbindOk { .. }
+    ));
 
     // nowait purge/delete: no reply follows.
-    c.send_method(1, &Method::QueuePurge { ticket: 0, queue: "uqq".into(), nowait: true })
-        .await
-        .unwrap();
+    c.send_method(
+        1,
+        &Method::QueuePurge {
+            ticket: 0,
+            queue: "uqq".into(),
+            nowait: true,
+        },
+    )
+    .await
+    .unwrap();
     c.send_method(
         1,
         &Method::QueueDelete {
@@ -424,8 +584,18 @@ async fn queue_unbind_and_nowait_variants() {
     .await
     .unwrap();
     // Channel still healthy.
-    c.send_method(1, &Method::BasicQos { prefetch_size: 0, prefetch_count: 5, global_: true })
-        .await
-        .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::BasicQosOk { .. }));
+    c.send_method(
+        1,
+        &Method::BasicQos {
+            prefetch_size: 0,
+            prefetch_count: 5,
+            global_: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::BasicQosOk { .. }
+    ));
 }

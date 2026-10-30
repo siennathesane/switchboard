@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::io::AsyncBufRead;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
@@ -43,7 +43,10 @@ pub struct Frame {
 
 impl Frame {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Encode to wire bytes (with content-length for binary safety).
@@ -116,7 +119,11 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
     let command = command.trim_end_matches(['\n', '\r']).to_string();
     if command.is_empty() {
         // Heartbeat or stray newline.
-        return Ok(Some(Frame { command: String::new(), headers: Vec::new(), body: Vec::new() }));
+        return Ok(Some(Frame {
+            command: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }));
     }
     let mut headers = Vec::new();
     loop {
@@ -133,8 +140,10 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
             headers.push((unescape(k), unescape(v)));
         }
     }
-    let content_length: Option<usize> =
-        headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok());
+    let content_length: Option<usize> = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok());
     // The body length is peer-controlled and this frame may still be the
     // unauthenticated CONNECT: cap it before the allocation instead of
     // letting a bogus content-length (e.g. 999999999999) OOM the node
@@ -180,7 +189,11 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
             }
         }
     }
-    Ok(Some(Frame { command, headers, body }))
+    Ok(Some(Frame {
+        command,
+        headers,
+        body,
+    }))
 }
 
 /// Destination mapping: (exchange, routing key) or (None, queue name).
@@ -194,7 +207,10 @@ pub enum Destination {
 
 fn parse_destination(dest: &str) -> Result<Destination, BrokerError> {
     if let Some(rest) = dest.strip_prefix("/topic/") {
-        return Ok(Destination::Topic { exchange: "amq.topic".into(), rk: rest.to_string() });
+        return Ok(Destination::Topic {
+            exchange: "amq.topic".into(),
+            rk: rest.to_string(),
+        });
     }
     if let Some(rest) = dest.strip_prefix("/queue/") {
         return Ok(Destination::Queue(rest.to_string()));
@@ -211,7 +227,10 @@ fn parse_destination(dest: &str) -> Result<Destination, BrokerError> {
                 "destination {dest:?} names no exchange"
             )));
         }
-        return Ok(Destination::Topic { exchange: ex.to_string(), rk: rk.to_string() });
+        return Ok(Destination::Topic {
+            exchange: ex.to_string(),
+            rk: rk.to_string(),
+        });
     }
     Err(BrokerError::invalid_path(format!(
         "unsupported destination {dest:?} (use /topic/, /queue/, /exchange/ or /amq/queue/)"
@@ -249,7 +268,9 @@ where
     let writer: SharedWriter<_> = Arc::new(tokio::sync::Mutex::new(writer));
 
     // ---- CONNECT / STOMP ----
-    let Some(hello) = read_frame(&mut reader).await? else { return Ok(()) };
+    let Some(hello) = read_frame(&mut reader).await? else {
+        return Ok(());
+    };
     if hello.command != "CONNECT" && hello.command != "STOMP" {
         let err = Frame {
             command: "ERROR".into(),
@@ -346,7 +367,9 @@ where
     let mut transactions: HashMap<String, Vec<(Destination, StoredMessage)>> = HashMap::new();
 
     loop {
-        let Some(frame) = read_frame(&mut reader).await? else { break };
+        let Some(frame) = read_frame(&mut reader).await? else {
+            break;
+        };
         if frame.command.is_empty() {
             continue; // heartbeat
         }
@@ -393,7 +416,10 @@ where
                     persistent,
                 };
                 if let Some(tx_name) = frame.header("transaction") {
-                    transactions.entry(tx_name.to_string()).or_default().push((dest, message));
+                    transactions
+                        .entry(tx_name.to_string())
+                        .or_default()
+                        .push((dest, message));
                 } else {
                     if let Err(e) = deliver(&ctx, &dest, message).await {
                         send_error(&writer, &e.to_string()).await?;
@@ -418,8 +444,7 @@ where
                         continue;
                     }
                 };
-                match start_subscription(&ctx, &dest, &sub_id, &ack, &writer, &pending_acks).await
-                {
+                match start_subscription(&ctx, &dest, &sub_id, &ack, &writer, &pending_acks).await {
                     Ok(consumer) => {
                         subscriptions.lock().await.insert(sub_id, consumer);
                     }
@@ -457,7 +482,9 @@ where
             }
             "COMMIT" => {
                 if let Some(t) = frame.header("transaction").map(str::to_string) {
-                    let Some(batch) = transactions.remove(&t) else { continue };
+                    let Some(batch) = transactions.remove(&t) else {
+                        continue;
+                    };
                     if let Err(e) = commit_transaction(&ctx, &t, batch).await {
                         send_error(&writer, &format!("commit failed: {e}")).await?;
                     }
@@ -521,7 +548,12 @@ async fn deliver(
         Destination::Queue(q) => {
             // Default-exchange publish; create the queue if missing.
             let topo = ctx.node.topology();
-            if !topo.vhosts.get(&ctx.vhost).map(|v| v.queues.contains_key(q)).unwrap_or(false) {
+            if !topo
+                .vhosts
+                .get(&ctx.vhost)
+                .map(|v| v.queues.contains_key(q))
+                .unwrap_or(false)
+            {
                 shared::declare_queue(ctx, q, true, false, false).await?;
             }
             message.exchange = String::new();
@@ -594,7 +626,10 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
             ];
             if !no_ack {
                 let ack_id = format!("{}:{}", consumer.sub.sub, d.seq);
-                pending.lock().await.insert(ack_id.clone(), (consumer.clone(), d.seq));
+                pending
+                    .lock()
+                    .await
+                    .insert(ack_id.clone(), (consumer.clone(), d.seq));
                 headers.push(("id".to_string(), ack_id));
             }
             let f = Frame {
@@ -664,12 +699,13 @@ async fn commit_transaction(
                     })?;
                 message.exchange = String::new();
                 message.routing_key = q.clone();
-                per_shard.entry(shard).or_default().push(
-                    switchboard_core::shard::TxOp::Enqueue {
+                per_shard
+                    .entry(shard)
+                    .or_default()
+                    .push(switchboard_core::shard::TxOp::Enqueue {
                         queue: q.clone(),
                         message: message.clone(),
-                    },
-                );
+                    });
             }
         }
     }
@@ -707,7 +743,10 @@ async fn commit_transaction(
     Ok(())
 }
 
-async fn send_error<W: AsyncWrite + Unpin>(writer: &SharedWriter<W>, msg: &str) -> std::io::Result<()> {
+async fn send_error<W: AsyncWrite + Unpin>(
+    writer: &SharedWriter<W>,
+    msg: &str,
+) -> std::io::Result<()> {
     write_frame(
         writer,
         &Frame {
@@ -725,7 +764,14 @@ mod tests {
 
     #[test]
     fn escape_roundtrips_specials() {
-        for s in ["plain", "with\\back", "with:colon", "with\nnewline", "with\rcr", "\\:n\\"] {
+        for s in [
+            "plain",
+            "with\\back",
+            "with:colon",
+            "with\nnewline",
+            "with\rcr",
+            "\\:n\\",
+        ] {
             assert_eq!(unescape(&escape(s)), s);
         }
     }
@@ -772,12 +818,21 @@ mod tests {
     fn destination_parsing_covers_all_flavors() {
         assert_eq!(
             parse_destination("/topic/news").unwrap(),
-            Destination::Topic { exchange: "amq.topic".into(), rk: "news".into() }
+            Destination::Topic {
+                exchange: "amq.topic".into(),
+                rk: "news".into()
+            }
         );
-        assert_eq!(parse_destination("/queue/jobs").unwrap(), Destination::Queue("jobs".into()));
+        assert_eq!(
+            parse_destination("/queue/jobs").unwrap(),
+            Destination::Queue("jobs".into())
+        );
         assert_eq!(
             parse_destination("/exchange/custom/rk").unwrap(),
-            Destination::Topic { exchange: "custom".into(), rk: "rk".into() }
+            Destination::Topic {
+                exchange: "custom".into(),
+                rk: "rk".into()
+            }
         );
         assert!(parse_destination("/exchange/nokey").is_err());
         assert!(parse_destination("/weird/x").is_err());

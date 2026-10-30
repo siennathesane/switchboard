@@ -27,11 +27,11 @@ use switchboard_core::auth;
 use switchboard_core::error::BrokerError;
 use switchboard_core::error::Level;
 use switchboard_core::model::ConnectionId;
-use switchboard_wire::constants::reply;
-use switchboard_wire::field::FieldValue;
-use switchboard_wire::field::FieldTable;
-use switchboard_wire::method::Method;
 use switchboard_wire::FrameReader;
+use switchboard_wire::constants::reply;
+use switchboard_wire::field::FieldTable;
+use switchboard_wire::field::FieldValue;
+use switchboard_wire::method::Method;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
@@ -39,10 +39,10 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use tracing::warn;
 
-use crate::channel::close_for;
-use crate::channel::unexpected_content;
 use crate::channel::Channel;
 use crate::channel::ConnectionLimits;
+use crate::channel::close_for;
+use crate::channel::unexpected_content;
 use crate::outbound::OutboundFrame;
 use switchboard_cluster::BrokerCommand;
 use switchboard_core::topology::MetaCmd;
@@ -94,9 +94,7 @@ where
 
     // ---- handshake ----
     let mut session = match handshake(&mut reader, &mut fr, &mut writer, &node, &limits).await {
-        Ok(s) => {
-            s
-        }
+        Ok(s) => s,
         Err(HandshakeError::Io(e)) => {
             return Err(e);
         }
@@ -226,11 +224,19 @@ where
     let mut server_properties = FieldTable::new();
     server_properties.insert(
         "product",
-        FieldValue::LongString(switchboard_wire::constants::PRODUCT_NAME.as_bytes().to_vec()),
+        FieldValue::LongString(
+            switchboard_wire::constants::PRODUCT_NAME
+                .as_bytes()
+                .to_vec(),
+        ),
     );
     server_properties.insert(
         "version",
-        FieldValue::LongString(switchboard_wire::constants::PRODUCT_VERSION.as_bytes().to_vec()),
+        FieldValue::LongString(
+            switchboard_wire::constants::PRODUCT_VERSION
+                .as_bytes()
+                .to_vec(),
+        ),
     );
     let mut capabilities = FieldTable::new();
     capabilities.insert("publisher_confirms", FieldValue::Boolean(true));
@@ -331,13 +337,23 @@ where
     let Some(Method::ConnectionOpen { virtual_host, .. }) = got3 else {
         return Err(HandshakeError::Rejected);
     };
-    let virtual_host = if virtual_host.is_empty() { "/".to_string() } else { virtual_host };
+    let virtual_host = if virtual_host.is_empty() {
+        "/".to_string()
+    } else {
+        virtual_host
+    };
     let vhosts = node.topology().vhosts.clone();
     if !vhosts.contains_key(&virtual_host) {
         // 402 INVALID_PATH (§4.8.2); pre-Open errors close the socket.
         return Err(HandshakeError::Rejected);
     }
-    send_method(writer, &Method::ConnectionOpenOk { known_hosts: String::new() }).await?;
+    send_method(
+        writer,
+        &Method::ConnectionOpenOk {
+            known_hosts: String::new(),
+        },
+    )
+    .await?;
 
     let conn_id = node.new_connection_id().await;
     Ok(Session {
@@ -383,17 +399,11 @@ impl Session {
     // Reader loop
     // ------------------------------------------------------------------
 
-    async fn reader_loop<R: AsyncRead + Unpin>(
-        &mut self,
-        reader: &mut R,
-        fr: &mut FrameReader,
-    ) {
+    async fn reader_loop<R: AsyncRead + Unpin>(&mut self, reader: &mut R, fr: &mut FrameReader) {
         let heartbeat_timeout = if self.limits.heartbeat == 0 {
             Duration::from_secs(u64::MAX)
         } else {
-            switchboard_core::tempo::scale(Duration::from_secs(
-                self.limits.heartbeat as u64 * 2,
-            ))
+            switchboard_core::tempo::scale(Duration::from_secs(self.limits.heartbeat as u64 * 2))
         };
         let mut last_octets = Instant::now();
         loop {
@@ -418,7 +428,10 @@ impl Session {
                         class_id: 0,
                         method_id: 0,
                     };
-                    let _ = self.outbound.send(OutboundFrame::Method { channel: 0, method: m });
+                    let _ = self.outbound.send(OutboundFrame::Method {
+                        channel: 0,
+                        method: m,
+                    });
                     break;
                 }
             }
@@ -438,27 +451,33 @@ impl Session {
             //    With heartbeats disabled (0) the deadline is "never":
             //    checked_add instead of `+`, which overflows Instant and
             //    panics the session task.
-            let deadline = match tokio::time::Instant::from_std(last_octets).checked_add(heartbeat_timeout) {
-                Some(d) => d,
-                None => tokio::time::Instant::now() + std::time::Duration::from_secs(10 * 365 * 24 * 3600),
-            };
+            let deadline =
+                match tokio::time::Instant::from_std(last_octets).checked_add(heartbeat_timeout) {
+                    Some(d) => d,
+                    None => {
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(10 * 365 * 24 * 3600)
+                    }
+                };
             let mut chunk = [0u8; 4096];
             let mut read_buf = ReadBuf::new(&mut chunk);
             let sleep = tokio::time::sleep_until(deadline);
             tokio::pin!(sleep);
             let mut got_octets = false;
-            let read_result = std::future::poll_fn(|cx| loop {
-                // Client octets win whenever they are ready.
-                match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                    Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {}
+            let read_result = std::future::poll_fn(|cx| {
+                loop {
+                    // Client octets win whenever they are ready.
+                    match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                        Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {}
+                    }
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        // Deadline: stop waiting even though the read pends.
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Pending;
                 }
-                if sleep.as_mut().poll(cx).is_ready() {
-                    // Deadline: stop waiting even though the read pends.
-                    return Poll::Ready(Ok(()));
-                }
-                return Poll::Pending;
             })
             .await;
             match read_result {
@@ -516,7 +535,8 @@ impl Session {
             }
             FrameType::Method => {
                 let Ok(method) = frame.decode_method() else {
-                    return self.connection_exception(BrokerError::syntax_error("malformed method"));
+                    return self
+                        .connection_exception(BrokerError::syntax_error("malformed method"));
                 };
                 if frame.channel == 0 {
                     if !crate::channel::method_allowed_on_channel_zero(&method) {
@@ -534,7 +554,8 @@ impl Session {
                         .connection_exception(BrokerError::channel_error("content on channel 0"));
                 }
                 let Some(ch) = self.channels.get(&frame.channel).cloned() else {
-                    return self.connection_exception(crate::channel::unknown_channel(frame.channel));
+                    return self
+                        .connection_exception(crate::channel::unknown_channel(frame.channel));
                 };
                 let expected = {
                     let inner = ch.inner.lock().unwrap();
@@ -576,7 +597,8 @@ impl Session {
                         .connection_exception(BrokerError::channel_error("content on channel 0"));
                 }
                 let Some(ch) = self.channels.get(&frame.channel).cloned() else {
-                    return self.connection_exception(crate::channel::unknown_channel(frame.channel));
+                    return self
+                        .connection_exception(crate::channel::unknown_channel(frame.channel));
                 };
                 let (done, complete) = {
                     let mut inner = ch.inner.lock().unwrap();
@@ -589,7 +611,9 @@ impl Session {
                 if done && complete {
                     let content = ch.inner.lock().unwrap().take_content();
                     if let Some((method, props, body)) = content {
-                        return self.content_complete(frame.channel, method, props, body).await;
+                        return self
+                            .content_complete(frame.channel, method, props, body)
+                            .await;
                     }
                 }
                 Flow::Continue
@@ -606,7 +630,10 @@ impl Session {
             class_id: class,
             method_id: method,
         };
-        let _ = self.outbound.send(OutboundFrame::Method { channel: 0, method: m });
+        let _ = self.outbound.send(OutboundFrame::Method {
+            channel: 0,
+            method: m,
+        });
         Flow::Close
     }
 
@@ -620,7 +647,10 @@ impl Session {
             class_id: class,
             method_id: method,
         };
-        let _ = self.outbound.send(OutboundFrame::Method { channel: id, method: m });
+        let _ = self.outbound.send(OutboundFrame::Method {
+            channel: id,
+            method: m,
+        });
         if let Some(ch) = self.channels.remove(&id) {
             ch.teardown(&self.node).await;
         }
@@ -653,7 +683,10 @@ impl Session {
                     class_id: 0,
                     method_id: 0,
                 };
-                let _ = self.outbound.send(OutboundFrame::Method { channel: 0, method: m });
+                let _ = self.outbound.send(OutboundFrame::Method {
+                    channel: 0,
+                    method: m,
+                });
                 Flow::Close
             }
         }

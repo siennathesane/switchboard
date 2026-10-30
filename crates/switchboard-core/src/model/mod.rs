@@ -3,8 +3,10 @@
 //! All types are `serde`-serializable: they travel inside raft log entries
 //! and live inside the replicated state machines.
 
-use serde::{Deserialize, Serialize};
-use switchboard_wire::field::{FieldValue, FieldTable};
+use serde::Deserialize;
+use serde::Serialize;
+use switchboard_wire::field::FieldTable;
+use switchboard_wire::field::FieldValue;
 
 /// The four standard exchange types (§3.1.3). The optional `system` type of
 /// §3.1.3.5 is not implemented; unknown types are rejected with 540
@@ -192,7 +194,10 @@ mod kind_tests {
         assert_eq!(ExchangeKind::from_str("direct"), Some(ExchangeKind::Direct));
         assert_eq!(ExchangeKind::from_str("fanout"), Some(ExchangeKind::Fanout));
         assert_eq!(ExchangeKind::from_str("topic"), Some(ExchangeKind::Topic));
-        assert_eq!(ExchangeKind::from_str("headers"), Some(ExchangeKind::Headers));
+        assert_eq!(
+            ExchangeKind::from_str("headers"),
+            Some(ExchangeKind::Headers)
+        );
         assert_eq!(ExchangeKind::from_str("banana"), None);
     }
 

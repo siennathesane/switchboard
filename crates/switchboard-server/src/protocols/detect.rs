@@ -38,7 +38,11 @@ pub fn classify(buf: &[u8]) -> Classify {
         b'A' => {
             if buf.len() < SNIFF_LEN {
                 // Could still become any AMQP header.
-                return if "AMQP".as_bytes().iter().enumerate().all(|(i, b)| buf.get(i) == Some(b))
+                return if "AMQP"
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| buf.get(i) == Some(b))
                 {
                     Classify::NeedMore
                 } else {
@@ -72,7 +76,11 @@ pub fn classify(buf: &[u8]) -> Classify {
             // "CONNECT\n…" is a STOMP CONNECT frame; "CONNECT …" (space) is
             // the rare HTTP CONNECT method; "POST"/"OPTIONS" handled below.
             if buf.len() < 8 {
-                return if "CONNECT".as_bytes().iter().enumerate().all(|(i, b)| buf.get(i) == Some(b))
+                return if "CONNECT"
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| buf.get(i) == Some(b))
                 {
                     Classify::NeedMore
                 } else {

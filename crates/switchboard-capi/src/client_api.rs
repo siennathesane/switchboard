@@ -1,10 +1,17 @@
 //! `sb_client_*`: the connection handle — channel opening, graceful
 //! close, free.
 
-use crate::handles::{SbChannel, SbClient, as_client};
-use crate::map::{already_gone, connect_status};
-use crate::status::{SB_ERR_NULL_ARG, SbStatus, entry_status, fail};
-use crate::table::{self, Kind};
+use crate::handles::SbChannel;
+use crate::handles::SbClient;
+use crate::handles::as_client;
+use crate::map::already_gone;
+use crate::map::connect_status;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::entry_status;
+use crate::status::fail;
+use crate::table::Kind;
+use crate::table::{self};
 
 /// Open a new channel on this connection (channel numbers are
 /// connection-scoped, start at 1). On success `*out` receives an owned

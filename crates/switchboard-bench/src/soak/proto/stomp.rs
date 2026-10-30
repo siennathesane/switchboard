@@ -11,9 +11,9 @@
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -21,17 +21,20 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
-use crate::soak::Ctx;
 
 // ---------------------------------------------------------------------
 // Frame codec
 // ---------------------------------------------------------------------
 
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r").replace(':', "\\c")
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace(':', "\\c")
 }
 
 fn frame(command: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
@@ -60,7 +63,10 @@ struct SFrame {
 
 impl SFrame {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
     fn is_heartbeat(&self) -> bool {
         self.command.is_empty()
@@ -93,7 +99,11 @@ async fn read_frame(
         }
     }
     if line.is_empty() {
-        return Ok(SFrame { command: String::new(), headers: vec![], body: vec![] });
+        return Ok(SFrame {
+            command: String::new(),
+            headers: vec![],
+            body: vec![],
+        });
     }
     let command = String::from_utf8_lossy(&line).to_string();
     let mut headers = Vec::new();
@@ -150,7 +160,11 @@ async fn read_frame(
         }
         _ = tokio::time::sleep_until(deadline) => return Err("stomp read deadline (nul)".into()),
     }
-    Ok(SFrame { command, headers, body })
+    Ok(SFrame {
+        command,
+        headers,
+        body,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -201,7 +215,11 @@ async fn raw_dial(host: &str) -> Result<StompConn, String> {
     );
     w.write_all(&connect).await.map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
-    let c = read_frame(&mut r, tokio::time::Instant::now() + Duration::from_secs(10)).await?;
+    let c = read_frame(
+        &mut r,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await?;
     match c.command.as_str() {
         "CONNECTED" => {
             // Reply sx,sy: sx = how often the SERVER will send; expect
@@ -214,9 +232,17 @@ async fn raw_dial(host: &str) -> Result<StompConn, String> {
                 .trim()
                 .parse()
                 .map_err(|_| "bad heart-beat sx")?;
-            Ok(StompConn { r, w, host: host.to_string(), server_hb_ms: sx })
+            Ok(StompConn {
+                r,
+                w,
+                host: host.to_string(),
+                server_hb_ms: sx,
+            })
         }
-        "ERROR" => Err(format!("stomp CONNECT rejected: {}", c.header("message").unwrap_or(""))),
+        "ERROR" => Err(format!(
+            "stomp CONNECT rejected: {}",
+            c.header("message").unwrap_or("")
+        )),
         _ => Err(format!("expected CONNECTED, got {}", c.command)),
     }
 }
@@ -254,7 +280,8 @@ impl Window {
             let e = g.0.pop_front().unwrap();
             g.1.remove(&e);
         }
-        self.committed.fetch_add(seqs.len() as u64, Ordering::Relaxed);
+        self.committed
+            .fetch_add(seqs.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -300,7 +327,12 @@ pub async fn run(ctx: Arc<Ctx>) {
                 _ = ctx.token.cancelled() => return,
             };
             if !got {
-                ctx.error("stomp", "heartbeat", &c.host, format!("no server heartbeat within {wait:?} of idle"));
+                ctx.error(
+                    "stomp",
+                    "heartbeat",
+                    &c.host,
+                    format!("no server heartbeat within {wait:?} of idle"),
+                );
                 continue 'conn;
             }
             ctx.ledger.metrics.add("stomp.heartbeats", 1);
@@ -328,12 +360,14 @@ pub async fn run(ctx: Arc<Ctx>) {
                     }
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                        if !client::alive(&ctx) { return }
-                        // keepalive while gated
-                        if c.heartbeat().await.is_err() {
-                            continue 'conn;
-                        }
-                        continue;
+                if !client::alive(&ctx) {
+                    return;
+                }
+                // keepalive while gated
+                if c.heartbeat().await.is_err() {
+                    continue 'conn;
+                }
+                continue;
             }
             pacer.wait().await;
             n += 1;
@@ -342,7 +376,10 @@ pub async fn run(ctx: Arc<Ctx>) {
             let mut txid = String::new();
             if in_tx {
                 txid = format!("tx{n}");
-                if c.send(&frame("BEGIN", &[("transaction", txid.clone())], b"")).await.is_err() {
+                if c.send(&frame("BEGIN", &[("transaction", txid.clone())], b""))
+                    .await
+                    .is_err()
+                {
                     ctx.infra_bounce("stomp", &c.host, "BEGIN failed".into());
                     continue 'conn;
                 }
@@ -350,9 +387,8 @@ pub async fn run(ctx: Arc<Ctx>) {
             for k in 0..2 {
                 let s = seq + k as u64;
                 let body = check::encode_body("stomp", s, ctx.cfg.msg_size.min(256).max(32));
-                let mut headers = vec![
-                    ("destination".to_string(), "/queue/soak.stomp".to_string()),
-                ];
+                let mut headers =
+                    vec![("destination".to_string(), "/queue/soak.stomp".to_string())];
                 if in_tx {
                     headers.push(("transaction".to_string(), txid.clone()));
                 }
@@ -373,7 +409,10 @@ pub async fn run(ctx: Arc<Ctx>) {
             let commit = !in_tx || n % 3 != 0;
             if in_tx {
                 let cmd = if commit { "COMMIT" } else { "ABORT" };
-                if c.send(&frame(cmd, &[("transaction", txid.clone())], b"")).await.is_err() {
+                if c.send(&frame(cmd, &[("transaction", txid.clone())], b""))
+                    .await
+                    .is_err()
+                {
                     ctx.infra_bounce("stomp", &c.host, format!("{cmd} failed").into());
                     continue 'conn;
                 }
@@ -409,7 +448,10 @@ pub async fn run(ctx: Arc<Ctx>) {
                                     "stomp",
                                     "dup.stale",
                                     &c.host,
-                                    format!("stale redelivery: expected seq {want_seq}, got {}", got_seq.unwrap()),
+                                    format!(
+                                        "stale redelivery: expected seq {want_seq}, got {}",
+                                        got_seq.unwrap()
+                                    ),
                                 );
                             }
                         } else if &body != &batch[delivered.len()].1 {
@@ -436,11 +478,21 @@ pub async fn run(ctx: Arc<Ctx>) {
                         ctx.ledger.metrics.add("stomp.delivered", 1);
                     }
                     Ok(f) if f.command == "ERROR" => {
-                        ctx.error("stomp", "error", &c.host, format!("server ERROR: {}", f.header("message").unwrap_or("")));
+                        ctx.error(
+                            "stomp",
+                            "error",
+                            &c.host,
+                            format!("server ERROR: {}", f.header("message").unwrap_or("")),
+                        );
                         continue 'conn;
                     }
                     Ok(f) => {
-                        ctx.error("stomp", "frame", &c.host, format!("unexpected {}", f.command));
+                        ctx.error(
+                            "stomp",
+                            "frame",
+                            &c.host,
+                            format!("unexpected {}", f.command),
+                        );
                     }
                     Err(e) => {
                         if client::consuming(&ctx) {

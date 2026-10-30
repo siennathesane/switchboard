@@ -5,7 +5,8 @@ use support::start_broker;
 async fn dump_unknown_command_behavior() {
     let (_node, addr) = start_broker("dump2").await;
     let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    use tokio::io::{AsyncWriteExt, AsyncReadExt};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     c.write_all(b"BOGUS\n\n\0").await.unwrap();
     c.flush().await.unwrap();
     let mut buf = Vec::new();

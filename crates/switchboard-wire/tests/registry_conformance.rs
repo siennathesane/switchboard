@@ -12,8 +12,8 @@
 //! or a mistyped integer width fails here.
 
 use serde_json::Value;
-use switchboard_wire::method::Method;
 use switchboard_wire::CodecError;
+use switchboard_wire::method::Method;
 
 /// Methods of the registry this broker intentionally does not implement:
 /// the legacy `access` class (dropped from 0-9-1 servers) and RabbitMQ's
@@ -21,7 +21,10 @@ use switchboard_wire::CodecError;
 const SKIPPED: &[(u16, u16)] = &[(30, 10), (30, 11), (10, 70), (10, 71)];
 
 fn registry() -> Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/amqp-rabbitmq-0.9.1.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/amqp-rabbitmq-0.9.1.json"
+    );
     let raw = std::fs::read_to_string(path).expect("registry json present");
     serde_json::from_str(&raw).expect("registry parses")
 }
@@ -71,14 +74,25 @@ fn filler(base: &str) -> Vec<u8> {
 }
 
 /// Build a method payload exactly as the registry dictates.
-fn synthetic_payload(domains: &std::collections::HashMap<String, String>, args: &[Value]) -> Vec<u8> {
+fn synthetic_payload(
+    domains: &std::collections::HashMap<String, String>,
+    args: &[Value],
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut bit_run = 0usize;
     for arg in args {
-        let domain = arg.get("domain").and_then(|d| d.as_str()).unwrap_or_else(|| {
-            arg.get("type").and_then(|t| t.as_str()).expect("arg has type or domain")
-        });
-        let base = domains.get(domain).cloned().unwrap_or_else(|| domain.to_string());
+        let domain = arg
+            .get("domain")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| {
+                arg.get("type")
+                    .and_then(|t| t.as_str())
+                    .expect("arg has type or domain")
+            });
+        let base = domains
+            .get(domain)
+            .cloned()
+            .unwrap_or_else(|| domain.to_string());
         let (_bytes, is_bit) = arg_bytes(&base);
         if is_bit {
             bit_run += 1;
@@ -113,7 +127,11 @@ fn every_implemented_method_matches_the_registry_byte_for_byte() {
             if SKIPPED.contains(&(class_id, method_id)) {
                 continue;
             }
-            let args = method.get("arguments").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            let args = method
+                .get("arguments")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
             let mut payload = vec![0u8, 0, 0, 0];
             payload[..2].copy_from_slice(&class_id.to_be_bytes());
             payload[2..4].copy_from_slice(&method_id.to_be_bytes());
@@ -125,12 +143,18 @@ fn every_implemented_method_matches_the_registry_byte_for_byte() {
             // Flags agree with the registry.
             assert_eq!(
                 decoded.is_sync_request(),
-                method.get("synchronous").and_then(|s| s.as_bool()).unwrap_or(false),
+                method
+                    .get("synchronous")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false),
                 "{class_id}.{method_id}: synchronous flag"
             );
             assert_eq!(
                 decoded.carries_content(),
-                method.get("content").and_then(|s| s.as_bool()).unwrap_or(false),
+                method
+                    .get("content")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false),
                 "{class_id}.{method_id}: content flag"
             );
             assert_eq!(decoded.class_id(), class_id);
@@ -153,11 +177,23 @@ fn skipped_methods_are_rejected() {
         let mut payload = vec![0, 0, 0, 0];
         payload[..2].copy_from_slice(&class_id.to_be_bytes());
         payload[2..4].copy_from_slice(&method_id.to_be_bytes());
-        let class = reg["classes"].as_array().unwrap().iter().find(|c| c["id"].as_u64().unwrap() as u16 == *class_id).unwrap();
-        if let Some(m) = class["methods"].as_array().unwrap().iter().find(|m| {
-            m["id"].as_u64().unwrap() as u16 == *method_id
-        }) {
-            let args = m.get("arguments").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+        let class = reg["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_u64().unwrap() as u16 == *class_id)
+            .unwrap();
+        if let Some(m) = class["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"].as_u64().unwrap() as u16 == *method_id)
+        {
+            let args = m
+                .get("arguments")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
             payload.extend(synthetic_payload(&domains, &args));
         }
         let err = Method::decode_payload(&payload).unwrap_err();

@@ -4,7 +4,8 @@
 //! Bits accumulate into octets starting from the low bit (§4.2.5.2); a
 //! partially-used bit octet is padded out as soon as a non-bit field follows.
 
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
+use bytes::BytesMut;
 
 use crate::error::CodecError;
 
@@ -20,7 +21,12 @@ pub struct Decoder<'a> {
 
 impl<'a> Decoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Decoder { data, pos: 0, bit_byte: 0, bit_mask: 0 }
+        Decoder {
+            data,
+            pos: 0,
+            bit_byte: 0,
+            bit_mask: 0,
+        }
     }
 
     pub fn remaining(&self) -> usize {
@@ -37,13 +43,18 @@ impl<'a> Decoder<'a> {
         if self.is_empty() {
             Ok(())
         } else {
-            Err(CodecError::TrailingBytes { count: self.remaining() })
+            Err(CodecError::TrailingBytes {
+                count: self.remaining(),
+            })
         }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], CodecError> {
         if self.remaining() < n {
-            return Err(CodecError::Eof { needed: n, had: self.remaining() });
+            return Err(CodecError::Eof {
+                needed: n,
+                had: self.remaining(),
+            });
         }
         // A non-bit read implicitly ends any bit run: the encoder pads the
         // partial octet, so the tail bits are padding, not data.
@@ -69,7 +80,9 @@ impl<'a> Decoder<'a> {
 
     pub fn u64(&mut self) -> Result<u64, CodecError> {
         let b = self.take(8)?;
-        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     pub fn i32(&mut self) -> Result<i32, CodecError> {
@@ -264,8 +277,8 @@ mod tests {
                 Ok(())
             },
             &[
-                0x01, 0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                0x07, 0x08,
+                0x01, 0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                0x08,
             ],
         );
     }
@@ -361,11 +374,17 @@ mod tests {
     #[test]
     fn eof_and_trailing_are_reported() {
         let mut d = Decoder::new(&[0x01]);
-        assert!(matches!(d.u16(), Err(CodecError::Eof { needed: 2, had: 1 })));
+        assert!(matches!(
+            d.u16(),
+            Err(CodecError::Eof { needed: 2, had: 1 })
+        ));
 
         let mut d = Decoder::new(&[0x01, 0x02]);
         assert_eq!(d.u8().unwrap(), 1);
-        assert!(matches!(d.finish(), Err(CodecError::TrailingBytes { count: 1 })));
+        assert!(matches!(
+            d.finish(),
+            Err(CodecError::TrailingBytes { count: 1 })
+        ));
     }
 
     #[test]
@@ -374,6 +393,9 @@ mod tests {
         e.frame_end();
         assert_eq!(&e.finish()[..], &[0xCE]);
         let mut d = Decoder::new(&[0x00]);
-        assert!(matches!(d.frame_end(), Err(CodecError::FrameEnd { actual: 0x00 })));
+        assert!(matches!(
+            d.frame_end(),
+            Err(CodecError::FrameEnd { actual: 0x00 })
+        ));
     }
 }

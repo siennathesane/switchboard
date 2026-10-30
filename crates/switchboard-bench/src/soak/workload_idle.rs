@@ -11,8 +11,8 @@ use std::time::Duration;
 use lapin::options::QueueDeclareOptions;
 use lapin::types::FieldTable;
 
-use crate::soak::client;
 use crate::soak::Ctx;
+use crate::soak::client;
 
 pub async fn run(ctx: Arc<Ctx>) {
     loop {
@@ -39,7 +39,10 @@ pub async fn run(ctx: Arc<Ctx>) {
                 match ch
                     .queue_declare(
                         "soak.control",
-                        QueueDeclareOptions { passive: true, ..Default::default() },
+                        QueueDeclareOptions {
+                            passive: true,
+                            ..Default::default()
+                        },
                         FieldTable::default(),
                     )
                     .await

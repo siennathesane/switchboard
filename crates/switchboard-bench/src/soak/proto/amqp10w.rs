@@ -21,10 +21,10 @@ use tokio_util::sync::CancellationToken;
 use switchboard_server::protocols::amqp10::frames;
 use switchboard_server::protocols::amqp10::types::Value;
 
+use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
-use crate::soak::Ctx;
 
 const HEADER: &[u8; 8] = b"AMQP\0\x01\0\0";
 
@@ -47,8 +47,8 @@ fn attach_receiver_unsettled(name: &str, handle: u32, address: &str) -> Vec<u8> 
         vec![
             Value::String(name.into()),
             Value::UInt(handle),
-            Value::Bool(true),  // role: receiver
-            Value::UByte(0),    // snd-settle-mode: unsettled
+            Value::Bool(true), // role: receiver
+            Value::UByte(0),   // snd-settle-mode: unsettled
             Value::Null,
             source,
             Value::Null,
@@ -142,19 +142,29 @@ async fn raw_dial(host: &str) -> Result<A10Conn, String> {
     // Server offers SASL mechanisms; we proceed without SASL (guest).
     let (ft, _ch, code, _) = read_frame(&mut r, deadline).await?;
     if ft != frames::FRAME_TYPE_SASL || code != Some(frames::codes::SASL_MECHANISMS) {
-        return Err(format!("expected sasl-mechanisms, got type={ft} code={code:?}"));
+        return Err(format!(
+            "expected sasl-mechanisms, got type={ft} code={code:?}"
+        ));
     }
-    w.write_all(&frames::open("switchboard-soak")).await.map_err(|e| e.to_string())?;
+    w.write_all(&frames::open("switchboard-soak"))
+        .await
+        .map_err(|e| e.to_string())?;
     let (ft, _ch, code, _) = read_frame(&mut r, deadline).await?;
     if ft != 0 || code != Some(frames::codes::OPEN) {
         return Err(format!("expected open, got type={ft} code={code:?}"));
     }
-    w.write_all(&frames::begin(None, 0)).await.map_err(|e| e.to_string())?;
+    w.write_all(&frames::begin(None, 0))
+        .await
+        .map_err(|e| e.to_string())?;
     let (ft, _ch, code, _) = read_frame(&mut r, deadline).await?;
     if ft != 0 || code != Some(frames::codes::BEGIN) {
         return Err(format!("expected begin, got type={ft} code={code:?}"));
     }
-    Ok(A10Conn { r, w, host: host.to_string() })
+    Ok(A10Conn {
+        r,
+        w,
+        host: host.to_string(),
+    })
 }
 
 impl A10Conn {
@@ -182,8 +192,20 @@ pub async fn run(ctx: Arc<Ctx>) {
         let deadline0 = tokio::time::Instant::now() + Duration::from_secs(10);
         // Receiver link (unsettled) with credit, and sender link
         // (settled), both onto the same queue.
-        if c.send(&attach_receiver_unsettled("soak-a10-rx", 0, "/queue/soak.a10")).await.is_err()
-            || c.send(&frames::attach_sender("soak-a10-tx", 1, Some("/queue/soak.a10"))).await.is_err()
+        if c.send(&attach_receiver_unsettled(
+            "soak-a10-rx",
+            0,
+            "/queue/soak.a10",
+        ))
+        .await
+        .is_err()
+            || c.send(&frames::attach_sender(
+                "soak-a10-tx",
+                1,
+                Some("/queue/soak.a10"),
+            ))
+            .await
+            .is_err()
             || c.send(&frames::flow_credit(0, 0, 64)).await.is_err()
         {
             ctx.infra_bounce("amqp10", &c.host, "attach/flow write failed".into());
@@ -197,11 +219,21 @@ pub async fn run(ctx: Arc<Ctx>) {
                 Ok((0, _, Some(frames::codes::ATTACH), _)) => attach_acks += 1,
                 Ok((0, _, Some(frames::codes::FLOW), _)) => {}
                 Ok((_, _, Some(frames::codes::DETACH), _)) => {
-                    ctx.error("amqp10", "attach", &c.host, "server detached our link".into());
+                    ctx.error(
+                        "amqp10",
+                        "attach",
+                        &c.host,
+                        "server detached our link".into(),
+                    );
                     continue 'conn;
                 }
                 Ok(other) => {
-                    ctx.error("amqp10", "attach", &c.host, format!("unexpected frame {other:?}"));
+                    ctx.error(
+                        "amqp10",
+                        "attach",
+                        &c.host,
+                        format!("unexpected frame {other:?}"),
+                    );
                     continue 'conn;
                 }
                 Err(e) => {
@@ -219,7 +251,9 @@ pub async fn run(ctx: Arc<Ctx>) {
                     }
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                if !client::consuming(&ctx) { return }
+                if !client::consuming(&ctx) {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -259,7 +293,11 @@ pub async fn run(ctx: Arc<Ctx>) {
                             // disposition accepted (unsettled path).
                             let d = frames::disposition_accepted(0, delivery_id, delivery_id);
                             if c.send(&d).await.is_err() {
-                                ctx.infra_bounce("amqp10", &c.host, "disposition write failed".into());
+                                ctx.infra_bounce(
+                                    "amqp10",
+                                    &c.host,
+                                    "disposition write failed".into(),
+                                );
                                 continue 'conn;
                             }
                             ctx.ledger.metrics.add("amqp10.delivered", 1);
@@ -272,14 +310,24 @@ pub async fn run(ctx: Arc<Ctx>) {
                             ctx.ledger.legal_dup();
                             ctx.ledger.metrics.add("dup.legal", 1);
                         } else {
-                            ctx.error("amqp10", "body", &c.host, "delivered payload mismatch".into());
+                            ctx.error(
+                                "amqp10",
+                                "body",
+                                &c.host,
+                                "delivered payload mismatch".into(),
+                            );
                             got = true;
                         }
                     }
                     Ok((0, _, Some(frames::codes::FLOW), _)) => {}
                     Ok((0, _, Some(frames::codes::DISPOSITION), _)) => {}
                     Ok((_, _, Some(frames::codes::DETACH), _)) => {
-                        ctx.error("amqp10", "link", &c.host, "server detached mid-stream".into());
+                        ctx.error(
+                            "amqp10",
+                            "link",
+                            &c.host,
+                            "server detached mid-stream".into(),
+                        );
                         continue 'conn;
                     }
                     Ok(other) => {

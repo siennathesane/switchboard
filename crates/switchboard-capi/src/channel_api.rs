@@ -1,18 +1,31 @@
 //! `sb_channel_*`: queue/exchange topology, publish paths, polling get,
 //! ack/nack/qos, consumer creation, cancellation, and transactions.
 
-use std::ffi::{c_char, c_int};
+use std::ffi::c_char;
+use std::ffi::c_int;
 
-use switchboard_embedded::{
-    ConsumeOptions, ExchangeDeleteOptions, ExchangeKind, ExchangeOptions, MessageProperties,
-    QueueDeleteOptions, QueueOptions,
-};
+use switchboard_embedded::ConsumeOptions;
+use switchboard_embedded::ExchangeDeleteOptions;
+use switchboard_embedded::ExchangeKind;
+use switchboard_embedded::ExchangeOptions;
+use switchboard_embedded::MessageProperties;
+use switchboard_embedded::QueueDeleteOptions;
+use switchboard_embedded::QueueOptions;
 
-use crate::handles::{SbChannel, as_channel};
+use crate::handles::SbChannel;
+use crate::handles::as_channel;
 use crate::map::op_status;
-use crate::message::{SbMessage, alloc_string, bytes, cstr, opt_cstr};
-use crate::status::{SB_ERR_NULL_ARG, SbStatus, entry_status, fail};
-use crate::table::{self, Kind};
+use crate::message::SbMessage;
+use crate::message::alloc_string;
+use crate::message::bytes;
+use crate::message::cstr;
+use crate::message::opt_cstr;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::entry_status;
+use crate::status::fail;
+use crate::table::Kind;
+use crate::table::{self};
 
 /// Exchange-kind argument values for `sb_channel_exchange_declare` (part
 /// of the ABI; frozen).

@@ -21,10 +21,12 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::error::CodecError;
-use crate::wireio::{Decoder, Encoder};
+use crate::wireio::Decoder;
+use crate::wireio::Encoder;
 
 /// Maximum nesting depth accepted while decoding field tables and arrays
 /// (code-scanning alert #18).
@@ -186,7 +188,10 @@ impl FieldTable {
         let _depth = DepthGuard::enter()?;
         let len = d.u32()? as usize;
         if len > d.remaining() {
-            return Err(CodecError::Eof { needed: len, had: d.remaining() });
+            return Err(CodecError::Eof {
+                needed: len,
+                had: d.remaining(),
+            });
         }
         let inner = d.bytes(len)?;
         let mut td = Decoder::new(inner);
@@ -322,7 +327,10 @@ impl FieldValue {
             b'A' => {
                 let len = d.u32()? as usize;
                 if len > d.remaining() {
-                    return Err(CodecError::Eof { needed: len, had: d.remaining() });
+                    return Err(CodecError::Eof {
+                        needed: len,
+                        had: d.remaining(),
+                    });
                 }
                 let inner = d.bytes(len)?;
                 let mut ad = Decoder::new(inner);
@@ -372,7 +380,10 @@ mod tests {
             FieldValue::UnsignedLongLong(1 << 50),
             FieldValue::Float(1.5),
             FieldValue::Double(-2.25),
-            FieldValue::Decimal { scale: 2, value: -1099 },
+            FieldValue::Decimal {
+                scale: 2,
+                value: -1099,
+            },
             FieldValue::ShortString("short".into()),
             FieldValue::LongString(vec![0xFF, 0x00]),
             FieldValue::ByteArray(vec![1, 2, 3]),
@@ -421,7 +432,10 @@ mod tests {
     #[test]
     fn decimal_is_scale_then_signed_long() {
         assert_eq!(
-            enc(&FieldValue::Decimal { scale: 4, value: -12345 }),
+            enc(&FieldValue::Decimal {
+                scale: 4,
+                value: -12345
+            }),
             vec![b'D', 4, 0xFF, 0xFF, 0xCF, 0xC7]
         );
     }
@@ -432,7 +446,10 @@ mod tests {
         inner.insert("x", FieldValue::UnsignedLongLong(9));
         let mut outer = FieldTable::new();
         outer.insert("nested", FieldValue::FieldTable(inner));
-        outer.insert("list", FieldValue::Array(vec![FieldValue::ShortString("a".into())]));
+        outer.insert(
+            "list",
+            FieldValue::Array(vec![FieldValue::ShortString("a".into())]),
+        );
 
         let mut e = Encoder::new();
         outer.encode(&mut e);
@@ -451,7 +468,10 @@ mod tests {
         // We define ours: syntax error.
         let bytes = [0, 0, 0, 8, 1, b'a', b't', 1, 1, b'a', b't', 0];
         let mut d = Decoder::new(&bytes);
-        assert!(matches!(FieldTable::decode(&mut d), Err(CodecError::FieldName(_))));
+        assert!(matches!(
+            FieldTable::decode(&mut d),
+            Err(CodecError::FieldName(_))
+        ));
     }
 
     #[test]
@@ -461,9 +481,15 @@ mod tests {
         }
         let too_long = "x".repeat(129);
         for bad in ["", "9lead", "_lead", "has space", "bad!", too_long.as_str()] {
-            assert!(validate_field_name(bad).is_err(), "{bad:?} should be invalid");
+            assert!(
+                validate_field_name(bad).is_err(),
+                "{bad:?} should be invalid"
+            );
         }
-        assert!(validate_field_name(&"x".repeat(128)).is_ok(), "128 chars is the limit");
+        assert!(
+            validate_field_name(&"x".repeat(128)).is_ok(),
+            "128 chars is the limit"
+        );
     }
 
     #[test]
@@ -488,7 +514,10 @@ mod tests {
     #[test]
     fn unknown_type_tag_is_rejected() {
         let mut d = Decoder::new(&[b'Z']);
-        assert!(matches!(FieldValue::decode(&mut d), Err(CodecError::FieldType(0x5A))));
+        assert!(matches!(
+            FieldValue::decode(&mut d),
+            Err(CodecError::FieldType(0x5A))
+        ));
     }
 
     #[test]
@@ -575,7 +604,10 @@ mod depth_tests {
         let bytes = nested_tables(100_000);
         let mut d = Decoder::new(&bytes);
         assert!(
-            matches!(FieldTable::decode(&mut d), Err(CodecError::NestingTooDeep(_))),
+            matches!(
+                FieldTable::decode(&mut d),
+                Err(CodecError::NestingTooDeep(_))
+            ),
             "deeply nested tables must decode-error, not recurse unboundedly"
         );
     }
@@ -585,7 +617,10 @@ mod depth_tests {
         let bytes = nested_arrays(100_000);
         let mut d = Decoder::new(&bytes);
         assert!(
-            matches!(FieldValue::decode(&mut d), Err(CodecError::NestingTooDeep(_))),
+            matches!(
+                FieldValue::decode(&mut d),
+                Err(CodecError::NestingTooDeep(_))
+            ),
             "deeply nested arrays must decode-error, not recurse unboundedly"
         );
     }

@@ -11,25 +11,32 @@ use std::time::Duration;
 
 use switchboard_bench::soak;
 use switchboard_cluster::ClusterNode;
-use switchboard_server::channel::ConnectionLimits;
 use switchboard_server::ProtocolConfig;
+use switchboard_server::channel::ConnectionLimits;
 
 /// Start a 3-node cluster fronted by the full protocol gateway (the
 /// production listener: AMQP 0-9-1, AMQP 1.0, MQTT, STOMP, WebSocket,
 /// HTTP health — one port, sniffed).
 async fn start_gateway_cluster() -> Vec<String> {
     support::init_tracing();
-    let internal: Vec<String> =
-        (0..3).map(|_| format!("127.0.0.1:{}", support::free_port())).collect();
-    let clients: Vec<String> =
-        (0..3).map(|_| format!("127.0.0.1:{}", support::free_port())).collect();
-    let peers: Vec<(u64, String)> =
-        (1..=3u64).map(|id| (id, internal[id as usize - 1].clone())).collect();
+    let internal: Vec<String> = (0..3)
+        .map(|_| format!("127.0.0.1:{}", support::free_port()))
+        .collect();
+    let clients: Vec<String> = (0..3)
+        .map(|_| format!("127.0.0.1:{}", support::free_port()))
+        .collect();
+    let peers: Vec<(u64, String)> = (1..=3u64)
+        .map(|id| (id, internal[id as usize - 1].clone()))
+        .collect();
 
     let mut nodes: Vec<Arc<ClusterNode>> = Vec::new();
     for id in 1..=3u64 {
         let i = id as usize - 1;
-        let seeds = if id == 1 { vec![] } else { vec![internal[0].clone()] };
+        let seeds = if id == 1 {
+            vec![]
+        } else {
+            vec![internal[0].clone()]
+        };
         let (node, _listener) = support::start_broker_node(
             &format!("soak-smoke-{id}"),
             id,
@@ -47,7 +54,10 @@ async fn start_gateway_cluster() -> Vec<String> {
         // ticks in real time — idle sessions would be killed spuriously.
         // Heartbeat keepalive under real time is exercised by the k8s
         // soak's idle probe instead.
-        let limits = ConnectionLimits { heartbeat: 0, ..ConnectionLimits::default() };
+        let limits = ConnectionLimits {
+            heartbeat: 0,
+            ..ConnectionLimits::default()
+        };
         let node_for_listener = node.clone();
         let addr2 = addr;
         tokio::spawn(async move {
@@ -69,7 +79,11 @@ async fn start_gateway_cluster() -> Vec<String> {
     // Formation: bootstrap entities visible everywhere, shard layout
     // installed, then a beat for shard-group elections.
     let ok = support::wait_until(
-        || nodes.iter().all(|n| !n.topology().vhosts.is_empty() && !n.topology().groups.is_empty()),
+        || {
+            nodes
+                .iter()
+                .all(|n| !n.topology().vhosts.is_empty() && !n.topology().groups.is_empty())
+        },
         120,
     )
     .await;
@@ -83,7 +97,13 @@ async fn soak_smoke_passes_with_zero_errors() {
     let hosts = start_gateway_cluster().await;
     // SOAK_ONLY=fanout etc. isolates one workload while debugging.
     let only = std::env::var("SOAK_ONLY").unwrap_or_default();
-    let r = |name: &str, base: f64| if only.is_empty() || only == name { base } else { 0.0 };
+    let r = |name: &str, base: f64| {
+        if only.is_empty() || only == name {
+            base
+        } else {
+            0.0
+        }
+    };
     let cfg = soak::SoakConfig {
         hosts,
         user: "guest".into(),
@@ -122,13 +142,13 @@ async fn soak_smoke_passes_with_zero_errors() {
     if !report.passed {
         eprintln!(
             "soak: {} error(s), {} transitions; elapsed {:?}; metrics: {:?}",
-            report.error_total,
-            report.transitions,
-            report.elapsed,
-            report.metrics
+            report.error_total, report.transitions, report.elapsed, report.metrics
         );
         for e in &report.errors {
-            eprintln!("soak error t={}s [{}/{}] {}: {}", e.elapsed_s, e.workload, e.kind, e.host, e.detail);
+            eprintln!(
+                "soak error t={}s [{}/{}] {}: {}",
+                e.elapsed_s, e.workload, e.kind, e.host, e.detail
+            );
         }
         for c in &report.reconcile {
             if !c.ok {
@@ -141,7 +161,10 @@ async fn soak_smoke_passes_with_zero_errors() {
     }
     assert!(report.passed, "soak smoke must pass with zero errors");
     assert!(
-        report.metrics.iter().any(|(k, v)| k == "pipeline.confirmed" && *v > 100),
+        report
+            .metrics
+            .iter()
+            .any(|(k, v)| k == "pipeline.confirmed" && *v > 100),
         "pipeline must have moved real traffic: {:?}",
         report.metrics
     );

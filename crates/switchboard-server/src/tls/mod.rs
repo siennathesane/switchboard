@@ -38,9 +38,15 @@ mod tests {
 
     #[test]
     fn bad_pem_is_reported_not_panicked() {
-        let id = TlsIdentity { cert_pem: CERT.as_bytes().to_vec(), key_pem: b"junk".to_vec() };
+        let id = TlsIdentity {
+            cert_pem: CERT.as_bytes().to_vec(),
+            key_pem: b"junk".to_vec(),
+        };
         assert!(acceptor(&id).is_err());
-        let id = TlsIdentity { cert_pem: b"junk".to_vec(), key_pem: b"junk".to_vec() };
+        let id = TlsIdentity {
+            cert_pem: b"junk".to_vec(),
+            key_pem: b"junk".to_vec(),
+        };
         assert!(acceptor(&id).is_err());
     }
 }

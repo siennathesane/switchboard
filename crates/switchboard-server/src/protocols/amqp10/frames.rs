@@ -5,10 +5,10 @@
 //! for `transfer` additionally the message payload bytes. SASL frames use
 //! type byte `0x01`.
 
+use super::types::Value;
+use super::types::decode;
 use super::types::described_list;
 use super::types::encode;
-use super::types::decode;
-use super::types::Value;
 
 pub const FRAME_TYPE_AMQP: u8 = 0x00;
 pub const FRAME_TYPE_SASL: u8 = 0x01;
@@ -145,12 +145,22 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Frame, usize), String> {
         let (performative, used) = decode(body)?;
         let payload = body[used..].to_vec();
         Ok((
-            Frame { channel, frame_type, performative, payload },
+            Frame {
+                channel,
+                frame_type,
+                performative,
+                payload,
+            },
             size,
         ))
     } else {
         Ok((
-            Frame { channel, frame_type, performative: Value::Null, payload: body.to_vec() },
+            Frame {
+                channel,
+                frame_type,
+                performative: Value::Null,
+                payload: body.to_vec(),
+            },
             size,
         ))
     }
@@ -243,9 +253,10 @@ pub fn attach_receiver(name: &str, handle: u32, address: &str) -> Vec<u8> {
 pub fn attach_sender(name: &str, handle: u32, address: Option<&str>) -> Vec<u8> {
     // role = sender: the TARGET (field 6) carries the delivery address.
     let target = match address {
-        Some(addr) => Value::Map(vec![
-            (Value::Symbol("address".into()), Value::String(addr.into()))
-        ]),
+        Some(addr) => Value::Map(vec![(
+            Value::Symbol("address".into()),
+            Value::String(addr.into()),
+        )]),
         None => Value::Null,
     };
     encode_frame(
@@ -278,7 +289,7 @@ pub fn attach_sender_mode(name: &str, handle: u32, settled: bool) -> Vec<u8> {
         vec![
             Value::String(name.into()),
             Value::UInt(handle),
-            Value::Bool(false),                            // role: sender
+            Value::Bool(false),                        // role: sender
             Value::UByte(if settled { 1 } else { 0 }), // snd-settle-mode
             Value::Null,                               // rcv-settle-mode
             Value::Null,                               // source
@@ -322,14 +333,14 @@ pub fn flow(channel: u16, next_outgoing_id: u32) -> Vec<u8> {
         channel,
         codes::FLOW,
         vec![
-            Value::Null,              // next-incoming-id
-            Value::UInt(100_000),     // incoming-credit
+            Value::Null,          // next-incoming-id
+            Value::UInt(100_000), // incoming-credit
             Value::UInt(next_outgoing_id),
-            Value::Null,              // credit (echo)
-            Value::Null,              // available
-            Value::Bool(false),       // drain
-            Value::Bool(false),       // echo
-            Value::Null,              // properties
+            Value::Null,        // credit (echo)
+            Value::Null,        // available
+            Value::Bool(false), // drain
+            Value::Bool(false), // echo
+            Value::Null,        // properties
         ],
     )
 }
@@ -387,7 +398,9 @@ pub fn close() -> Vec<u8> {
 pub fn sasl_mechanisms(mechs: &[&str]) -> Vec<u8> {
     encode_sasl_frame(
         codes::SASL_MECHANISMS,
-        vec![Value::List(mechs.iter().map(|m| Value::Symbol((*m).into())).collect())],
+        vec![Value::List(
+            mechs.iter().map(|m| Value::Symbol((*m).into())).collect(),
+        )],
     )
 }
 
@@ -463,7 +476,8 @@ mod builder_tests {
         assert_eq!(f.field(1).and_then(Value::as_uint), Some(4));
         assert_eq!(f.field(2).and_then(Value::as_bool), Some(false));
         assert_eq!(
-            f.field(6).and_then(|v| v.map_get("address").and_then(Value::as_str)),
+            f.field(6)
+                .and_then(|v| v.map_get("address").and_then(Value::as_str)),
             Some("/queue/jobs"),
             "sender attach carries the target address"
         );
@@ -502,9 +516,7 @@ mod builder_tests {
 
     #[test]
     fn detach_end_close_roundtrip() {
-        for (bytes, code, handle) in [
-            (detach(5), codes::DETACH, Some(5u32)),
-        ] {
+        for (bytes, code, handle) in [(detach(5), codes::DETACH, Some(5u32))] {
             let f = roundtrip(&bytes);
             assert_eq!(f.code(), Some(code));
             assert_eq!(f.field(0).and_then(Value::as_uint), handle);

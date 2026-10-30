@@ -7,9 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-
-use super::k8s;
 use super::Ctx;
+use super::k8s;
 
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -195,7 +194,9 @@ async fn http_get(host: &str, path: &str) -> Option<String> {
 /// deployments tail logs out of band).
 async fn scan_logs(ctx: &Arc<Ctx>, endpoints: &Arc<k8s::EndpointSet>) {
     let Some(k) = endpoints.k8s() else { return };
-    let Ok(pods) = k.pods(endpoints.label()).await else { return };
+    let Ok(pods) = k.pods(endpoints.label()).await else {
+        return;
+    };
     for pod in pods {
         if pod.client_endpoint().is_none() {
             continue;
@@ -324,11 +325,22 @@ pub fn trends_snapshot() -> Vec<NodeTrend> {
             disk_kb: last.disk_kb,
             uptime_s: last.uptime_s,
             restarts: h.restarts,
-            rss_mb_h: if pts.len() >= 8 { slope_h(&pts, |s| s.rss_kb as f64 / 1024.0) } else { 0.0 },
-            fds_h: if pts.len() >= 8 { slope_h(&pts, |s| s.fds as f64) } else { 0.0 },
-            disk_mb_h: if pts.len() >= 8 { slope_h(&pts, |s| s.disk_kb as f64 / 1024.0) } else { 0.0 },
+            rss_mb_h: if pts.len() >= 8 {
+                slope_h(&pts, |s| s.rss_kb as f64 / 1024.0)
+            } else {
+                0.0
+            },
+            fds_h: if pts.len() >= 8 {
+                slope_h(&pts, |s| s.fds as f64)
+            } else {
+                0.0
+            },
+            disk_mb_h: if pts.len() >= 8 {
+                slope_h(&pts, |s| s.disk_kb as f64 / 1024.0)
+            } else {
+                0.0
+            },
         });
     }
     out
 }
-

@@ -8,13 +8,18 @@
 //!   octet    short      long             'size' octets         octet
 //! ```
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Buf;
+use bytes::Bytes;
+use bytes::BytesMut;
 
-use crate::constants::{FrameType, FRAME_END, FRAME_HEADER_SIZE};
+use crate::constants::FRAME_END;
+use crate::constants::FRAME_HEADER_SIZE;
+use crate::constants::FrameType;
 use crate::error::CodecError;
 use crate::method::Method;
 use crate::properties::ContentHeader;
-use crate::wireio::{Decoder, Encoder};
+use crate::wireio::Decoder;
+use crate::wireio::Encoder;
 
 /// The 8-octet protocol header of §4.2.2: `"AMQP"` + id 0 + version 0.9.1.
 pub const PROTOCOL_HEADER: [u8; 8] = *b"AMQP\x00\x00\x09\x01";
@@ -29,7 +34,10 @@ pub const PROTOCOL_HEADER: [u8; 8] = *b"AMQP\x00\x00\x09\x01";
 pub fn parse_protocol_header(buf: &[u8]) -> Result<usize, CodecError> {
     if buf.len() < 8 {
         if PROTOCOL_HEADER.starts_with(buf) {
-            Err(CodecError::Eof { needed: 8, had: buf.len() })
+            Err(CodecError::Eof {
+                needed: 8,
+                had: buf.len(),
+            })
         } else {
             Err(CodecError::ProtocolHeader)
         }
@@ -52,13 +60,21 @@ impl Frame {
     pub fn method(channel: u16, m: &Method) -> Self {
         let mut e = Encoder::new();
         m.encode(&mut e);
-        Frame { frame_type: FrameType::Method, channel, payload: e.finish().freeze() }
+        Frame {
+            frame_type: FrameType::Method,
+            channel,
+            payload: e.finish().freeze(),
+        }
     }
 
     pub fn header(channel: u16, header: &ContentHeader) -> Self {
         let mut e = Encoder::new();
         header.encode(&mut e);
-        Frame { frame_type: FrameType::Header, channel, payload: e.finish().freeze() }
+        Frame {
+            frame_type: FrameType::Header,
+            channel,
+            payload: e.finish().freeze(),
+        }
     }
 
     pub fn body(channel: u16, data: &[u8]) -> Self {
@@ -71,7 +87,11 @@ impl Frame {
 
     /// Heartbeat frames MUST use channel zero and carry no payload (§4.2.7).
     pub fn heartbeat() -> Self {
-        Frame { frame_type: FrameType::Heartbeat, channel: 0, payload: Bytes::new() }
+        Frame {
+            frame_type: FrameType::Heartbeat,
+            channel: 0,
+            payload: Bytes::new(),
+        }
     }
 
     pub fn encode(&self, out: &mut BytesMut) {
@@ -153,8 +173,7 @@ impl FrameReader {
             return Ok(None);
         }
         let type_byte = self.buf[0];
-        let frame_type = FrameType::from_u8(type_byte)
-            .ok_or(CodecError::FrameType(type_byte))?;
+        let frame_type = FrameType::from_u8(type_byte).ok_or(CodecError::FrameType(type_byte))?;
         let channel = u16::from_be_bytes([self.buf[1], self.buf[2]]);
         let size = u32::from_be_bytes([self.buf[3], self.buf[4], self.buf[5], self.buf[6]]);
 
@@ -176,7 +195,11 @@ impl FrameReader {
         if end != FRAME_END {
             return Err(CodecError::FrameEnd { actual: end });
         }
-        Ok(Some(Frame { frame_type, channel, payload: payload.freeze() }))
+        Ok(Some(Frame {
+            frame_type,
+            channel,
+            payload: payload.freeze(),
+        }))
     }
 }
 
@@ -194,8 +217,14 @@ mod tests {
             parse_protocol_header(&PROTOCOL_HEADER[..4]),
             Err(CodecError::Eof { needed: 8, had: 4 })
         );
-        assert_eq!(parse_protocol_header(b"HTTP/1.1"), Err(CodecError::ProtocolHeader));
-        assert_eq!(parse_protocol_header(&[]), Err(CodecError::Eof { needed: 8, had: 0 }));
+        assert_eq!(
+            parse_protocol_header(b"HTTP/1.1"),
+            Err(CodecError::ProtocolHeader)
+        );
+        assert_eq!(
+            parse_protocol_header(&[]),
+            Err(CodecError::Eof { needed: 8, had: 0 })
+        );
         // Wrong version: magic ok, version bad -> reject outright.
         assert_eq!(
             parse_protocol_header(b"AMQP\x00\x00\x09\x00"),
@@ -212,7 +241,11 @@ mod tests {
     }
 
     fn sample_method() -> Method {
-        Method::BasicQos { prefetch_size: 0, prefetch_count: 10, global_: false }
+        Method::BasicQos {
+            prefetch_size: 0,
+            prefetch_count: 10,
+            global_: false,
+        }
     }
 
     #[test]

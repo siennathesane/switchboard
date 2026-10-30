@@ -8,9 +8,18 @@ use switchboard_wire::properties::ContentHeader;
 /// One frame (or control) waiting to go out on the socket.
 #[derive(Debug)]
 pub enum OutboundFrame {
-    Method { channel: u16, method: Method },
-    Header { channel: u16, header: ContentHeader },
-    Body { channel: u16, data: Vec<u8> },
+    Method {
+        channel: u16,
+        method: Method,
+    },
+    Header {
+        channel: u16,
+        header: ContentHeader,
+    },
+    Body {
+        channel: u16,
+        data: Vec<u8>,
+    },
     Heartbeat,
     /// Terminate the writer (connection teardown).
     Shutdown,
@@ -65,7 +74,10 @@ pub fn message_frames(
         return frames; // zero body size: no body frames (§4.2.6.1)
     }
     for piece in body.chunks(chunk.max(1)) {
-        frames.push(OutboundFrame::Body { channel, data: piece.to_vec() });
+        frames.push(OutboundFrame::Body {
+            channel,
+            data: piece.to_vec(),
+        });
     }
     frames
 }
@@ -78,8 +90,14 @@ mod tests {
 
     #[test]
     fn method_frame_encoding_roundtrip() {
-        let m = Method::BasicAck { delivery_tag: 9, multiple: true };
-        let f = OutboundFrame::Method { channel: 2, method: m.clone() };
+        let m = Method::BasicAck {
+            delivery_tag: 9,
+            multiple: true,
+        };
+        let f = OutboundFrame::Method {
+            channel: 2,
+            method: m.clone(),
+        };
         let mut buf = BytesMut::new();
         encode(&f, &mut buf);
         let mut r = switchboard_wire::FrameReader::new();
@@ -113,8 +131,10 @@ mod tests {
         );
         // method + header + ceil(500/120) bodies
         assert_eq!(frames.len(), 2 + 5);
-        let bodies: Vec<&OutboundFrame> =
-            frames.iter().filter(|f| matches!(f, OutboundFrame::Body { .. })).collect();
+        let bodies: Vec<&OutboundFrame> = frames
+            .iter()
+            .filter(|f| matches!(f, OutboundFrame::Body { .. }))
+            .collect();
         let total: usize = bodies
             .iter()
             .map(|f| match f {

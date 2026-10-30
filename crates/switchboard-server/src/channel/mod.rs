@@ -31,10 +31,10 @@ use switchboard_core::model::StoredMessage;
 use switchboard_core::model::SubscriptionId;
 use switchboard_core::shard::ShardReply;
 use switchboard_core::topology::GroupId;
+use switchboard_wire::BasicProperties;
 use switchboard_wire::constants::reply;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
-use switchboard_wire::BasicProperties;
 use tokio::sync::mpsc;
 
 use crate::outbound::OutboundFrame;
@@ -107,7 +107,11 @@ pub enum TxOp {
         message: StoredMessage,
         confirm_seq: Option<u64>,
     },
-    Ack { queue: String, shard: GroupId, seq: u64 },
+    Ack {
+        queue: String,
+        shard: GroupId,
+        seq: u64,
+    },
 }
 
 /// Coordinator id for transactions started by this connection.
@@ -225,7 +229,10 @@ impl ChannelInner {
     }
 
     pub fn next_sub_id(&self, counter: u64) -> SubscriptionId {
-        SubscriptionId { node: self.node_id, sub: counter }
+        SubscriptionId {
+            node: self.node_id,
+            sub: counter,
+        }
     }
 
     /// Content assembly accepted a whole message?
@@ -279,7 +286,10 @@ impl Channel {
 
     /// Queue a reply method without touching the inner lock.
     pub fn reply(&self, m: Method) {
-        let _ = self.outbound.send(OutboundFrame::Method { channel: self.id, method: m });
+        let _ = self.outbound.send(OutboundFrame::Method {
+            channel: self.id,
+            method: m,
+        });
     }
 
     /// Map a shard reply onto either success or a broker exception.
@@ -325,11 +335,7 @@ impl Channel {
     /// channel's, when global) prefetch count. Unlimited consumers pull in
     /// bounded batches to keep flow control meaningful.
     pub fn initial_credit(prefetch: u32) -> u32 {
-        if prefetch == 0 {
-            1000
-        } else {
-            prefetch
-        }
+        if prefetch == 0 { 1000 } else { prefetch }
     }
 
     /// Credit refill after `acked` messages were acknowledged.
@@ -503,7 +509,9 @@ mod tests {
 
     #[test]
     fn connection_class_on_channel_zero_only() {
-        let m = Method::ChannelOpen { out_of_band: String::new() };
+        let m = Method::ChannelOpen {
+            out_of_band: String::new(),
+        };
         assert!(!method_allowed_on_channel_zero(&m));
         let m = Method::ConnectionClose {
             reply_code: 200,
@@ -524,7 +532,10 @@ mod tests {
             immediate: false,
         };
         assert!(expects_content(&publish));
-        let ack = Method::BasicAck { delivery_tag: 1, multiple: false };
+        let ack = Method::BasicAck {
+            delivery_tag: 1,
+            multiple: false,
+        };
         assert!(!expects_content(&ack));
     }
 
@@ -562,7 +573,13 @@ mod tests {
         inner.pending_body = b"body".to_vec();
 
         let (m, props, body) = inner.take_content().unwrap();
-        assert!(matches!(m, Method::BasicPublish { mandatory: true, .. }));
+        assert!(matches!(
+            m,
+            Method::BasicPublish {
+                mandatory: true,
+                ..
+            }
+        ));
         assert_eq!(props.delivery_mode, Some(2));
         assert_eq!(body, b"body");
         assert!(inner.pending_method.is_none());
@@ -578,7 +595,8 @@ mod reply_arms {
     fn shard_reply_maps_error_and_unexpected() {
         let ok = Channel::shard_reply(BrokerReply::Shard(ShardReply::Ok)).unwrap();
         assert!(matches!(ok, ShardReply::Ok));
-        let err = Channel::shard_reply(BrokerReply::Error(BrokerError::not_found("x"))).unwrap_err();
+        let err =
+            Channel::shard_reply(BrokerReply::Error(BrokerError::not_found("x"))).unwrap_err();
         assert_eq!(err.code, 404);
         let bad = Channel::shard_reply(BrokerReply::Bootstrapped).unwrap_err();
         assert!(bad.code >= 500);
@@ -586,7 +604,8 @@ mod reply_arms {
 
     #[test]
     fn meta_reply_maps_ok_and_error() {
-        let ok = Channel::meta_reply(BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok)).unwrap();
+        let ok = Channel::meta_reply(BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok))
+            .unwrap();
         assert!(matches!(ok, switchboard_core::topology::MetaReply::Ok));
         let err = Channel::meta_reply(BrokerReply::Error(BrokerError::not_found("v"))).unwrap_err();
         assert_eq!(err.code, 404);
@@ -596,9 +615,6 @@ mod reply_arms {
 
     #[test]
     fn reply_code_of_extracts_code() {
-        assert_eq!(
-            Channel::reply_code_of(&BrokerError::not_found("x")),
-            404
-        );
+        assert_eq!(Channel::reply_code_of(&BrokerError::not_found("x")), 404);
     }
 }

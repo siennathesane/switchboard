@@ -71,8 +71,18 @@ pub fn render(node: &Arc<ClusterNode>) -> String {
             let name = q["queue"].as_str().unwrap_or("");
             let ready = q["ready"].as_u64().unwrap_or(0);
             let held = q["held"].as_u64().unwrap_or(0);
-            labeled(&mut out, "switchboard_queue_ready_messages", &[("queue", name)], ready);
-            labeled(&mut out, "switchboard_queue_held_messages", &[("queue", name)], held);
+            labeled(
+                &mut out,
+                "switchboard_queue_ready_messages",
+                &[("queue", name)],
+                ready,
+            );
+            labeled(
+                &mut out,
+                "switchboard_queue_held_messages",
+                &[("queue", name)],
+                held,
+            );
         }
     }
 
@@ -90,8 +100,18 @@ pub fn render(node: &Arc<ClusterNode>) -> String {
         "Client connections accepted since process start, per protocol.",
     );
     for (name, current, total) in super::connstats::snapshot() {
-        labeled(&mut out, "switchboard_connections", &[("protocol", name)], current);
-        labeled(&mut out, "switchboard_connections_total", &[("protocol", name)], total);
+        labeled(
+            &mut out,
+            "switchboard_connections",
+            &[("protocol", name)],
+            current,
+        );
+        labeled(
+            &mut out,
+            "switchboard_connections_total",
+            &[("protocol", name)],
+            total,
+        );
     }
 
     // ---- topology entity counts ----
@@ -104,7 +124,12 @@ pub fn render(node: &Arc<ClusterNode>) -> String {
         exchanges += v.exchanges.len() as u64;
         bindings += v.bindings.len() as u64;
     }
-    help_type(&mut out, "switchboard_vhosts", "gauge", "Configured vhosts.");
+    help_type(
+        &mut out,
+        "switchboard_vhosts",
+        "gauge",
+        "Configured vhosts.",
+    );
     emit_gauge(&mut out, "switchboard_vhosts", topo.vhosts.len() as u64);
     emit_gauge(&mut out, "switchboard_users", topo.users.len() as u64);
     emit_gauge(&mut out, "switchboard_queues", queues);
@@ -227,6 +252,9 @@ mod tests {
     fn help_newlines_are_folded() {
         let mut s = String::new();
         help_type(&mut s, "m", "gauge", "two\nlines");
-        assert!(s.starts_with("# HELP m two lines\n# TYPE m gauge\n"), "got: {s}");
+        assert!(
+            s.starts_with("# HELP m two lines\n# TYPE m gauge\n"),
+            "got: {s}"
+        );
     }
 }

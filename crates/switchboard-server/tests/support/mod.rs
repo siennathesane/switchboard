@@ -7,14 +7,15 @@
 //! Also home of the cluster test helpers (formation, teardown, polling).
 #![allow(dead_code)] // each test binary uses a different subset
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use switchboard_wire::BasicProperties;
+use switchboard_wire::FrameReader;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
-use switchboard_wire::BasicProperties;
-use switchboard_wire::FrameReader;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
@@ -30,21 +31,27 @@ pub fn test_tag() -> u64 {
 pub fn init_tracing() {
     static LOG: std::sync::Once = std::sync::Once::new();
     LOG.call_once(|| {
-    // Test tempo: shrink fixed delays (raft elections, ticks, join
-    // deadlines) 50x. Uniform time-warp — ordering unchanged. A preset
-    // SB_TIME_SCALE wins: CI exports a softer warp (10x) on macOS/Windows
-    // runners, whose 4 cores cannot reliably meet a 0.8 ms raft
-    // heartbeat once a second cluster test runs alongside.
-    if std::env::var("SB_TIME_SCALE").is_err() {
-        unsafe { std::env::set_var("SB_TIME_SCALE", "50"); }
-    }
-    // Test-grade password hashing: parallel test processes bootstrap and
-    // authenticate dozens of clusters; the production-default 19 MiB
-    // memory-hard verify per handshake starved whole formation rounds.
-    if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
-        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048"); }
-        unsafe { std::env::set_var("SWITCHBOARD_ARGON2_T", "1"); }
-    }
+        // Test tempo: shrink fixed delays (raft elections, ticks, join
+        // deadlines) 50x. Uniform time-warp — ordering unchanged. A preset
+        // SB_TIME_SCALE wins: CI exports a softer warp (10x) on macOS/Windows
+        // runners, whose 4 cores cannot reliably meet a 0.8 ms raft
+        // heartbeat once a second cluster test runs alongside.
+        if std::env::var("SB_TIME_SCALE").is_err() {
+            unsafe {
+                std::env::set_var("SB_TIME_SCALE", "50");
+            }
+        }
+        // Test-grade password hashing: parallel test processes bootstrap and
+        // authenticate dozens of clusters; the production-default 19 MiB
+        // memory-hard verify per handshake starved whole formation rounds.
+        if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+            unsafe {
+                std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+            }
+            unsafe {
+                std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+            }
+        }
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -83,10 +90,7 @@ impl TestClient {
     }
 
     /// Connect, optionally emitting `first` as the very first octets.
-    pub async fn connect_raw(
-        addr: &str,
-        first: Option<&[u8]>,
-    ) -> std::io::Result<Self> {
+    pub async fn connect_raw(addr: &str, first: Option<&[u8]>) -> std::io::Result<Self> {
         let socket = TcpStream::connect(addr).await?;
         socket.set_nodelay(true).ok();
         let (r, mut w) = socket.into_split();
@@ -95,7 +99,13 @@ impl TestClient {
             w.write_all(first).await?;
             w.flush().await?;
         }
-        Ok(TestClient { reader: FrameReader::new(), read_half: r, writer: w, last_method: None, backlog: Vec::new() })
+        Ok(TestClient {
+            reader: FrameReader::new(),
+            read_half: r,
+            writer: w,
+            last_method: None,
+            backlog: Vec::new(),
+        })
     }
 
     pub async fn send_method(&mut self, channel: u16, m: &Method) -> std::io::Result<()> {
@@ -143,7 +153,9 @@ impl TestClient {
             match self.reader.next_frame(0) {
                 Ok(Some(frame)) => match frame.frame_type {
                     switchboard_wire::FrameType::Method => {
-                        let m = frame.decode_method().map_err(|e| format!("bad method: {e}"))?;
+                        let m = frame
+                            .decode_method()
+                            .map_err(|e| format!("bad method: {e}"))?;
                         self.last_method = Some(format!("{m:?}"));
                         if let Some(m) = content_for.take() {
                             let content =
@@ -161,8 +173,9 @@ impl TestClient {
                         return Ok((m, None));
                     }
                     switchboard_wire::FrameType::Header => {
-                        let h =
-                            frame.content_header(60).map_err(|e| format!("bad header: {e}"))?;
+                        let h = frame
+                            .content_header(60)
+                            .map_err(|e| format!("bad header: {e}"))?;
                         // Zero-size content completes on the header itself.
                         if h.body_size == 0 {
                             let m = content_for.take().expect("header without method");
@@ -289,9 +302,14 @@ async fn connect_and_open_once(addr: &str, vhost: &str) -> Result<TestClient, St
     };
 
     // Channel 1.
-    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() })
-        .await
-        .map_err(|e| e.to_string())?;
+    c.send_method(
+        1,
+        &Method::ChannelOpen {
+            out_of_band: String::new(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let Method::ChannelOpenOk { .. } = c.expect(1).await? else {
         return Err("expected Channel.OpenOk".into());
     };
@@ -320,7 +338,9 @@ pub async fn publish(
     )
     .await
     .map_err(|e| e.to_string())?;
-    c.send_content(channel, props, body).await.map_err(|e| e.to_string())
+    c.send_content(channel, props, body)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Basic.Get one message; Ok(None) = empty.
@@ -360,7 +380,6 @@ pub async fn basic_get(
 
 /// Spin up a single-node broker and return the client-listener address.
 pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>, String) {
-    
     static LOG: std::sync::Once = std::sync::Once::new();
     LOG.call_once(|| {
         tracing_subscriber::fmt()
@@ -392,7 +411,7 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
 
@@ -527,7 +546,11 @@ pub async fn start_cluster(
             id,
             clients[i].clone(),
             internal[i].clone(),
-            if id == 1 { vec![] } else { vec![internal[0].clone()] },
+            if id == 1 {
+                vec![]
+            } else {
+                vec![internal[0].clone()]
+            },
             id == 1,
             n,
             peers.clone(),
@@ -550,7 +573,10 @@ pub async fn start_cluster(
         120,
     )
     .await;
-    assert!(ok_layout, "cluster {tag}: shard layout never became visible");
+    assert!(
+        ok_layout,
+        "cluster {tag}: shard layout never became visible"
+    );
     // A beat for shard-group elections.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 

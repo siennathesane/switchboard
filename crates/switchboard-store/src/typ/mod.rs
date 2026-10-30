@@ -8,12 +8,19 @@
 
 use std::io::Cursor;
 
+use openraft::Entry;
+use openraft::RaftTypeConfig;
+use openraft::TokioRuntime;
 use openraft::impls::BasicNode;
-use openraft::{Entry, RaftTypeConfig, TokioRuntime};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use switchboard_core::shard::{ShardCmd, ShardEffect, ShardReply};
-use switchboard_core::topology::{MetaCmd, MetaEffect, MetaReply};
+use switchboard_core::shard::ShardCmd;
+use switchboard_core::shard::ShardEffect;
+use switchboard_core::shard::ShardReply;
+use switchboard_core::topology::MetaCmd;
+use switchboard_core::topology::MetaEffect;
+use switchboard_core::topology::MetaReply;
 
 /// Node identity across the cluster: small dense integers assigned at join
 /// time. `Default` must be deterministic, so it is `u64::MAX` sentinel use
@@ -45,7 +52,11 @@ pub enum BrokerCommand {
     /// Lay down the bootstrap entities (default vhost, exchanges, user).
     /// Emitted once when the meta group is created; safe to re-apply
     /// because the underlying commands are idempotent.
-    Bootstrap { vhost: String, user: String, password: String },
+    Bootstrap {
+        vhost: String,
+        user: String,
+        password: String,
+    },
     /// A control-plane (topology) mutation.
     Meta(MetaCmd),
     /// A data-plane (queue) mutation.
@@ -59,7 +70,10 @@ pub enum BrokerCommand {
     /// publish). The dedup log makes the *second* application of a
     /// request a no-op that replays the first reply. The variant is last
     /// so existing log indices are unchanged.
-    Idempotent { id: RequestId, command: Box<BrokerCommand> },
+    Idempotent {
+        id: RequestId,
+        command: Box<BrokerCommand>,
+    },
     /// Several [`BrokerCommand`]s committed as one raft entry (group
     /// commit on the shard groups' hot path). Commands are applied in
     /// order; each element is individually `Idempotent`-wrapped, so a
@@ -154,8 +168,14 @@ impl BrokerState {
                 self.dedup.remember(*id, reply.clone());
                 Ok((reply, effects))
             }
-            BrokerCommand::Bootstrap { vhost, user, password } => {
-                let (r1, _r1_effects) = self.meta.apply(&MetaCmd::DeclareVhost { name: vhost.clone() })?;
+            BrokerCommand::Bootstrap {
+                vhost,
+                user,
+                password,
+            } => {
+                let (r1, _r1_effects) = self.meta.apply(&MetaCmd::DeclareVhost {
+                    name: vhost.clone(),
+                })?;
                 let (r2, _r2_effects) = self.meta.apply(&MetaCmd::CreateUser {
                     name: user.clone(),
                     password: password.clone(),
@@ -166,11 +186,17 @@ impl BrokerState {
             }
             BrokerCommand::Meta(m) => {
                 let (r, effs) = self.meta.apply(m)?;
-                Ok((BrokerReply::Meta(r), effs.into_iter().map(Effect::Meta).collect()))
+                Ok((
+                    BrokerReply::Meta(r),
+                    effs.into_iter().map(Effect::Meta).collect(),
+                ))
             }
             BrokerCommand::Shard(s) => {
                 let (r, effs) = self.shard.apply(s)?;
-                Ok((BrokerReply::Shard(r), effs.into_iter().map(Effect::Shard).collect()))
+                Ok((
+                    BrokerReply::Shard(r),
+                    effs.into_iter().map(Effect::Shard).collect(),
+                ))
             }
             BrokerCommand::Batch { commands } => {
                 let mut replies = Vec::with_capacity(commands.len());
@@ -251,7 +277,10 @@ mod tests {
         assert!(!existed);
 
         st.shard
-            .apply(&ShardCmd::CreateQueueData { queue: "q".into(), policy: Default::default() })
+            .apply(&ShardCmd::CreateQueueData {
+                queue: "q".into(),
+                policy: Default::default(),
+            })
             .unwrap();
         let (BrokerReply::Shard(ShardReply::Enqueued { seq }), effs) = st
             .apply(&BrokerCommand::Shard(ShardCmd::Enqueue {

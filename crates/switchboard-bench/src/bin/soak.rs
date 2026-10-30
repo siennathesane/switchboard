@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::bail;
 use clap::Parser;
 use switchboard_bench::soak;
 

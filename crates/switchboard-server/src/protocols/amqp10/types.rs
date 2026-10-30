@@ -51,7 +51,8 @@ impl Value {
     pub fn map_get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Map(entries) => entries.iter().find_map(|(k, v)| {
-                k.as_str().and_then(|s| if s == key { Some(v) } else { None })
+                k.as_str()
+                    .and_then(|s| if s == key { Some(v) } else { None })
             }),
             _ => None,
         }
@@ -214,8 +215,8 @@ fn decode_inner(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             let (len, w) = read_vlen(buf, *pos, constructor == 0xB1)?;
             *pos += w;
             need(buf, *pos, len)?;
-            let s = std::str::from_utf8(&buf[*pos..*pos + len])
-                .map_err(|_| "bad utf8 in string")?;
+            let s =
+                std::str::from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in string")?;
             *pos += len;
             Value::String(s.to_string())
         }
@@ -223,8 +224,8 @@ fn decode_inner(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             let (len, w) = read_vlen(buf, *pos, constructor == 0xB3)?;
             *pos += w;
             need(buf, *pos, len)?;
-            let s = std::str::from_utf8(&buf[*pos..*pos + len])
-                .map_err(|_| "bad utf8 in symbol")?;
+            let s =
+                std::str::from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in symbol")?;
             *pos += len;
             Value::Symbol(s.to_string())
         }
@@ -290,7 +291,8 @@ fn read_vlen(buf: &[u8], pos: usize, long: bool) -> Result<(usize, usize), Strin
 fn read_compound(buf: &[u8], pos: usize, long: bool) -> Result<(usize, u32, usize), String> {
     if long {
         need(buf, pos, 8)?;
-        let size = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        let size =
+            u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
         let count = u32::from_be_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]);
         Ok((size, count, 8))
     } else {
@@ -301,10 +303,7 @@ fn read_compound(buf: &[u8], pos: usize, long: bool) -> Result<(usize, u32, usiz
 
 /// A described list with a ulong descriptor (performatives, sections).
 pub fn described_list(code: u64, fields: Vec<Value>) -> Value {
-    Value::Described(
-        Box::new(Value::ULong(code)),
-        Box::new(Value::List(fields)),
-    )
+    Value::Described(Box::new(Value::ULong(code)), Box::new(Value::List(fields)))
 }
 
 #[cfg(test)]
@@ -336,7 +335,10 @@ mod tests {
 
     #[test]
     fn described_list_roundtrip() {
-        let v = described_list(0x10, vec![Value::String("c".into()), Value::Null, Value::UInt(5)]);
+        let v = described_list(
+            0x10,
+            vec![Value::String("c".into()), Value::Null, Value::UInt(5)],
+        );
         let mut out = Vec::new();
         encode(&v, &mut out);
         let (back, used) = decode(&out).unwrap();
@@ -347,14 +349,20 @@ mod tests {
     #[test]
     fn map_roundtrip_and_lookup() {
         let v = Value::Map(vec![
-            (Value::Symbol("address".into()), Value::String("/topic/news".into())),
+            (
+                Value::Symbol("address".into()),
+                Value::String("/topic/news".into()),
+            ),
             (Value::Symbol("durable".into()), Value::Bool(true)),
         ]);
         let mut out = Vec::new();
         encode(&v, &mut out);
         let (back, used) = decode(&out).unwrap();
         assert_eq!(used, out.len());
-        assert_eq!(back.map_get("address").and_then(Value::as_str), Some("/topic/news"));
+        assert_eq!(
+            back.map_get("address").and_then(Value::as_str),
+            Some("/topic/news")
+        );
         assert_eq!(back.map_get("durable").and_then(Value::as_bool), Some(true));
     }
 }
@@ -440,7 +448,9 @@ mod wide_tests {
         // A list8 claiming 3 items but encoding 1.
         let mut raw = vec![0xC0, 3, 0x52, 1];
         assert!(decode(&raw).is_err());
-        raw = vec![0xC8, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x52, 1];
+        raw = vec![
+            0xC8, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x52, 1,
+        ];
         assert!(decode(&raw).is_err());
     }
 }

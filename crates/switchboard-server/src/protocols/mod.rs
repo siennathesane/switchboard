@@ -16,8 +16,8 @@
 //! socket; TLS wraps the socket *before* sniffing, so every protocol is
 //! available with and without TLS.
 
-pub mod amqp10;
 pub mod admin;
+pub mod amqp10;
 pub mod connstats;
 pub mod detect;
 mod gateway;
@@ -28,7 +28,8 @@ pub mod shared;
 pub mod stomp;
 pub mod ws;
 
-pub use detect::{classify, Detected};
+pub use detect::Detected;
+pub use detect::classify;
 pub use gateway::serve_client;
 pub use shared::BridgeContext;
 pub use shared::ProtocolConfig;

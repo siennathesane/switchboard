@@ -4,9 +4,12 @@
 
 mod support;
 
-use support::{basic_get, connect_and_open, publish, start_broker};
-use switchboard_wire::method::Method;
+use support::basic_get;
+use support::connect_and_open;
+use support::publish;
+use support::start_broker;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::method::Method;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_declare_publish_get_roundtrip() {
@@ -41,9 +44,17 @@ async fn handshake_declare_publish_get_roundtrip() {
     assert_eq!((message_count, consumer_count), (0, 0));
 
     // Publish to the default exchange, routed by queue name.
-    publish(&mut c, 1, "", "jobs", &BasicProperties::new(), b"hello switchboard", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "jobs",
+        &BasicProperties::new(),
+        b"hello switchboard",
+        false,
+    )
+    .await
+    .unwrap();
 
     // Get it back.
     let got = basic_get(&mut c, 1, "jobs", true).await.unwrap();
@@ -118,9 +129,17 @@ async fn direct_exchange_routing_and_fanout() {
     };
 
     // Direct: only q1 gets key "a".
-    publish(&mut c, 1, "amq.direct", "a", &BasicProperties::new(), b"to-a", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "amq.direct",
+        "a",
+        &BasicProperties::new(),
+        b"to-a",
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         basic_get(&mut c, 1, "q1", true).await.unwrap().unwrap().1,
         b"to-a"
@@ -128,9 +147,17 @@ async fn direct_exchange_routing_and_fanout() {
     assert!(basic_get(&mut c, 1, "q2", true).await.unwrap().is_none());
 
     // Fanout: q3 receives.
-    publish(&mut c, 1, "amq.fanout", "ignored", &BasicProperties::new(), b"to-q3", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "amq.fanout",
+        "ignored",
+        &BasicProperties::new(),
+        b"to-q3",
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         basic_get(&mut c, 1, "q3", true).await.unwrap().unwrap().1,
         b"to-q3"
@@ -142,9 +169,17 @@ async fn mandatory_unroutable_gets_returned() {
     let (_node, addr) = start_broker("mandatory").await;
     let mut c = connect_and_open(&addr, "/").await.expect("open");
 
-    publish(&mut c, 1, "amq.direct", "no-such-key", &BasicProperties::new(), b"lost", true)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "amq.direct",
+        "no-such-key",
+        &BasicProperties::new(),
+        b"lost",
+        true,
+    )
+    .await
+    .unwrap();
     let (m, content) = c.expect_method(1).await.unwrap();
     let Method::BasicReturn {
         reply_code,
@@ -252,11 +287,15 @@ async fn protocol_header_garbage_gets_protocol_header_reply() {
     c.writer.flush().await.unwrap();
     // Server writes a valid protocol header then closes (§4.2.2).
     let mut buf = [0u8; 8];
-    let n = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf)
+        .await
+        .unwrap();
     assert_eq!(n, 8);
     assert_eq!(&buf, &switchboard_wire::PROTOCOL_HEADER);
     // Then EOF.
-    let n2 = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf)
+        .await
+        .unwrap();
     assert_eq!(n2, 0);
 }
 
@@ -283,16 +322,30 @@ async fn publish_confirms_arrive_in_order() {
     let Method::QueueDeclareOk { .. } = c.expect(1).await.unwrap() else {
         panic!()
     };
-    c.send_method(1, &Method::ConfirmSelect { nowait: false }).await.unwrap();
+    c.send_method(1, &Method::ConfirmSelect { nowait: false })
+        .await
+        .unwrap();
     let Method::ConfirmSelectOk {} = c.expect(1).await.unwrap() else {
         panic!()
     };
 
     for i in 0..5u64 {
-        publish(&mut c, 1, "", "acked", &BasicProperties::new(), format!("m{i}").as_bytes(), false)
-            .await
-            .unwrap();
-        let Method::BasicAck { delivery_tag, multiple } = c.expect(1).await.unwrap() else {
+        publish(
+            &mut c,
+            1,
+            "",
+            "acked",
+            &BasicProperties::new(),
+            format!("m{i}").as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
+        let Method::BasicAck {
+            delivery_tag,
+            multiple,
+        } = c.expect(1).await.unwrap()
+        else {
             panic!("expected confirm ack");
         };
         assert_eq!((delivery_tag, multiple), (i + 1, false));
@@ -336,15 +389,43 @@ async fn topic_exchange_pattern_matching_e2e() {
     let _ = c.expect(1).await.unwrap();
 
     // Matches per §3.1.3.3.
-    publish(&mut c, 1, "amq.topic", "usd.stock.nyse", &BasicProperties::new(), b"x", false)
-        .await
-        .unwrap();
-    assert_eq!(basic_get(&mut c, 1, "prices", true).await.unwrap().unwrap().1, b"x");
+    publish(
+        &mut c,
+        1,
+        "amq.topic",
+        "usd.stock.nyse",
+        &BasicProperties::new(),
+        b"x",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        basic_get(&mut c, 1, "prices", true)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        b"x"
+    );
     // Does not match.
-    publish(&mut c, 1, "amq.topic", "stock.nasdaq", &BasicProperties::new(), b"y", false)
-        .await
-        .unwrap();
-    assert!(basic_get(&mut c, 1, "prices", true).await.unwrap().is_none());
+    publish(
+        &mut c,
+        1,
+        "amq.topic",
+        "stock.nasdaq",
+        &BasicProperties::new(),
+        b"y",
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        basic_get(&mut c, 1, "prices", true)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -371,9 +452,17 @@ async fn consumer_receives_deliveries_and_acks() {
 
     // Publish three first.
     for i in 0..3 {
-        publish(&mut c, 1, "", "stream", &BasicProperties::new(), format!("m{i}").as_bytes(), false)
-            .await
-            .unwrap();
+        publish(
+            &mut c,
+            1,
+            "",
+            "stream",
+            &BasicProperties::new(),
+            format!("m{i}").as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
     }
 
     // Consume.
@@ -414,16 +503,33 @@ async fn consumer_receives_deliveries_and_acks() {
     }
 
     // Ack all, then the queue is empty.
-    c.send_method(1, &Method::BasicAck { delivery_tag: 3, multiple: true })
-        .await
-        .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicAck {
+            delivery_tag: 3,
+            multiple: true,
+        },
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(basic_get(&mut c, 1, "stream", true).await.unwrap().is_none());
+    assert!(
+        basic_get(&mut c, 1, "stream", true)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Cancel cleanly.
-    c.send_method(1, &Method::BasicCancel { consumer_tag: "worker".into(), nowait: false })
-        .await
-        .unwrap();
+    c.send_method(
+        1,
+        &Method::BasicCancel {
+            consumer_tag: "worker".into(),
+            nowait: false,
+        },
+    )
+    .await
+    .unwrap();
     let Method::BasicCancelOk { consumer_tag } = c.expect(1).await.unwrap() else {
         panic!()
     };
@@ -451,19 +557,30 @@ async fn unacked_messages_are_requeued_on_channel_close() {
         .await
         .unwrap();
         let _ = c.expect(1).await.unwrap();
-        publish(&mut c, 1, "", "rq", &BasicProperties::new(), b"survivor", false)
-            .await
-            .unwrap();
+        publish(
+            &mut c,
+            1,
+            "",
+            "rq",
+            &BasicProperties::new(),
+            b"survivor",
+            false,
+        )
+        .await
+        .unwrap();
         // Get it unacked, then drop the connection without acking.
         let got = basic_get(&mut c, 1, "rq", false).await.unwrap();
         assert!(got.is_some());
         // (connection dropped at scope end)
-        c.send_method(1, &Method::ChannelClose {
-            reply_code: 200,
-            reply_text: "done".into(),
-            class_id: 0,
-            method_id: 0,
-        })
+        c.send_method(
+            1,
+            &Method::ChannelClose {
+                reply_code: 200,
+                reply_text: "done".into(),
+                class_id: 0,
+                method_id: 0,
+            },
+        )
         .await
         .unwrap();
         let Method::ChannelCloseOk {} = c.expect(1).await.unwrap() else {
@@ -473,7 +590,10 @@ async fn unacked_messages_are_requeued_on_channel_close() {
     // New connection: the message is back.
     let mut c2 = connect_and_open(&addr, "/").await.expect("reopen");
     let got = basic_get(&mut c2, 1, "rq", true).await.unwrap();
-    assert!(got.is_some(), "unacked message must be requeued on channel close");
+    assert!(
+        got.is_some(),
+        "unacked message must be requeued on channel close"
+    );
     assert_eq!(got.unwrap().1, b"survivor");
 }
 
@@ -505,9 +625,17 @@ async fn transactions_commit_and_rollback() {
     };
 
     // Rollback: nothing lands.
-    publish(&mut c, 1, "", "txq", &BasicProperties::new(), b"rolled", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "txq",
+        &BasicProperties::new(),
+        b"rolled",
+        false,
+    )
+    .await
+    .unwrap();
     c.send_method(1, &Method::TxRollback {}).await.unwrap();
     let Method::TxRollbackOk {} = c.expect(1).await.unwrap() else {
         panic!()
@@ -515,9 +643,17 @@ async fn transactions_commit_and_rollback() {
     assert!(basic_get(&mut c, 1, "txq", true).await.unwrap().is_none());
 
     // Commit: message lands.
-    publish(&mut c, 1, "", "txq", &BasicProperties::new(), b"committed", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "txq",
+        &BasicProperties::new(),
+        b"committed",
+        false,
+    )
+    .await
+    .unwrap();
     c.send_method(1, &Method::TxCommit {}).await.unwrap();
     let Method::TxCommitOk {} = c.expect(1).await.unwrap() else {
         panic!()

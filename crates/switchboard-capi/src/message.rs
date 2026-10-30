@@ -1,10 +1,13 @@
 //! Message marshalling: the `sb_message_t` layout, owned-buffer
 //! allocation for returned strings/bodies, and the explicit free fn.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::c_char;
 use std::slice;
 
-use switchboard_embedded::{Delivery, ReturnedMessage};
+use switchboard_embedded::Delivery;
+use switchboard_embedded::ReturnedMessage;
 
 /// A delivered message, marshalled into C-owned memory. Returned by
 /// `sb_channel_get` and `sb_consumer_next`.

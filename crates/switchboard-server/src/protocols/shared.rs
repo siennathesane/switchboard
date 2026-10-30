@@ -4,9 +4,9 @@
 //! expressed once, at the [`ClusterNode`] level, so each protocol module
 //! stays pure protocol.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -115,10 +115,7 @@ pub async fn authorize(
     peer_ip: Option<std::net::IpAddr>,
     allow_remote_guest: bool,
 ) -> BridgeResult<()> {
-    if user == "guest"
-        && !allow_remote_guest
-        && peer_ip.map_or(false, |ip| !ip.is_loopback())
-    {
+    if user == "guest" && !allow_remote_guest && peer_ip.map_or(false, |ip| !ip.is_loopback()) {
         return Err(BrokerError::access_refused(
             "guest is loopback-only; create a real user or set allow-remote-guest",
         )
@@ -134,10 +131,10 @@ pub async fn authorize(
     if authed {
         Ok(())
     } else {
-        Err(BrokerError::access_refused(format!(
-            "authentication refused for user {user:?}"
-        ))
-        .channel_level())
+        Err(
+            BrokerError::access_refused(format!("authentication refused for user {user:?}"))
+                .channel_level(),
+        )
     }
 }
 
@@ -155,7 +152,12 @@ impl BridgeContext {
     /// consumer-exclusivity semantics work for bridge clients too).
     pub async fn create(node: Arc<ClusterNode>, vhost: String) -> Self {
         let conn = node.new_connection_id().await;
-        BridgeContext { node, vhost, conn, sub_counter: AtomicU64::new(1) }
+        BridgeContext {
+            node,
+            vhost,
+            conn,
+            sub_counter: AtomicU64::new(1),
+        }
     }
 
     pub fn next_sub(&self) -> SubscriptionId2 {
@@ -196,11 +198,22 @@ pub async fn declare_queue(
         .await
         .map_err(berr)?;
     let shard = match reply {
-        switchboard_cluster::BrokerReply::Meta(MetaReply::QueueDeclared { shard, created, .. }) => {
+        switchboard_cluster::BrokerReply::Meta(MetaReply::QueueDeclared {
+            shard, created, ..
+        }) => {
             if created {
-                let policy =
-                    switchboard_core::shard::QueuePolicy::from_arguments(&switchboard_wire::field::FieldTable::new());
-                shard_call(&ctx.node, shard, ShardCmd::CreateQueueData { queue: name.to_string(), policy }).await?;
+                let policy = switchboard_core::shard::QueuePolicy::from_arguments(
+                    &switchboard_wire::field::FieldTable::new(),
+                );
+                shard_call(
+                    &ctx.node,
+                    shard,
+                    ShardCmd::CreateQueueData {
+                        queue: name.to_string(),
+                        policy,
+                    },
+                )
+                .await?;
             }
             // Refresh so the very next publish/subscribe observes the
             // queue (§4.4 visibility).
@@ -208,10 +221,10 @@ pub async fn declare_queue(
             shard
         }
         other => {
-            return Err(BrokerError::resource_error(format!(
-                "unexpected declare reply {other:?}"
-            ))
-            .channel_level())
+            return Err(
+                BrokerError::resource_error(format!("unexpected declare reply {other:?}"))
+                    .channel_level(),
+            );
         }
     };
     Ok(shard)
@@ -220,12 +233,7 @@ pub async fn declare_queue(
 /// Bind `queue` to `exchange` with routing key `rk`. The local topology
 /// view is refreshed before returning so the very next publish observes
 /// the new binding (§4.4 visibility).
-pub async fn bind(
-    ctx: &BridgeContext,
-    exchange: &str,
-    queue: &str,
-    rk: &str,
-) -> BridgeResult<()> {
+pub async fn bind(ctx: &BridgeContext, exchange: &str, queue: &str, rk: &str) -> BridgeResult<()> {
     ctx.node
         .write(
             switchboard_cluster::META_GROUP,
@@ -256,7 +264,14 @@ pub async fn delete_queue(ctx: &BridgeContext, name: &str) {
     else {
         return;
     };
-    let _ = shard_call(&ctx.node, shard, ShardCmd::DeleteQueueData { queue: name.to_string() }).await;
+    let _ = shard_call(
+        &ctx.node,
+        shard,
+        ShardCmd::DeleteQueueData {
+            queue: name.to_string(),
+        },
+    )
+    .await;
     let _ = ctx
         .node
         .write(
@@ -363,7 +378,10 @@ impl BridgeConsumer {
         let sub = node.next_subscription_id();
         let (dtx, drx) = mpsc::unbounded_channel::<Delivery>();
         let (ctx_tx, crx) = mpsc::unbounded_channel::<String>();
-        let sink = ConsumerSink { deliveries: dtx, cancelled: ctx_tx };
+        let sink = ConsumerSink {
+            deliveries: dtx,
+            cancelled: ctx_tx,
+        };
         node.attach_consumer(sub, sink.clone()).await;
         shard_call(
             node,
@@ -380,17 +398,36 @@ impl BridgeConsumer {
             },
         )
         .await?;
-        let credit = if prefetch == 0 { u32::MAX.saturating_sub(1).min(1000) } else { prefetch };
+        let credit = if prefetch == 0 {
+            u32::MAX.saturating_sub(1).min(1000)
+        } else {
+            prefetch
+        };
         shard_call(node, shard, ShardCmd::Credit { sub, count: credit }).await?;
         let _ = crx; // cancellation notifications are not surfaced to bridges
-        Ok((Arc::new(BridgeConsumer { queue: queue.to_string(), shard, sub }), drx))
+        Ok((
+            Arc::new(BridgeConsumer {
+                queue: queue.to_string(),
+                shard,
+                sub,
+            }),
+            drx,
+        ))
     }
 
     /// Acknowledge a delivered message (removes it from the queue).
     pub async fn ack(&self, node: &Arc<ClusterNode>, seq: u64) -> BridgeResult<()> {
         let mut seqs = std::collections::BTreeSet::new();
         seqs.insert(seq);
-        shard_call(node, self.shard, ShardCmd::Ack { queue: self.queue.clone(), seqs }).await?;
+        shard_call(
+            node,
+            self.shard,
+            ShardCmd::Ack {
+                queue: self.queue.clone(),
+                seqs,
+            },
+        )
+        .await?;
         Ok(())
     }
 

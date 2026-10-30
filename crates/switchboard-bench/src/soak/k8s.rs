@@ -19,22 +19,22 @@
 //! (pod count, readiness, canary round-trip), and reopens the gate.
 //! Protocol sessions stay connected the whole time.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
 
+use super::Ctx;
 use super::check::encode_body;
 use super::client;
-use super::Ctx;
 
 // ---------------------------------------------------------------------
 // In-cluster REST client
@@ -51,12 +51,13 @@ impl K8s {
     /// Build from the in-cluster service-account files.
     pub fn in_cluster() -> Result<Self, String> {
         let host = std::env::var("KUBERNETES_SERVICE_HOST")
-            .map_err(|_| "KUBERNETES_SERVICE_HOST not set (not running in-cluster?)" )?;
+            .map_err(|_| "KUBERNETES_SERVICE_HOST not set (not running in-cluster?)")?;
         let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".into());
         let token = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
             .map_err(|e| format!("sa token: {e}"))?;
-        let namespace = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-            .map_err(|e| format!("sa namespace: {e}"))?;
+        let namespace =
+            std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                .map_err(|e| format!("sa namespace: {e}"))?;
         let mut roots = RootCertStore::empty();
         let ca_file = std::fs::File::open("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
             .map_err(|e| format!("sa ca: {e}"))?;
@@ -69,7 +70,12 @@ impl K8s {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config));
-        Ok(K8s { host: format!("{host}:{port}"), token: token.trim().to_string(), namespace: namespace.trim().to_string(), tls })
+        Ok(K8s {
+            host: format!("{host}:{port}"),
+            token: token.trim().to_string(),
+            namespace: namespace.trim().to_string(),
+            tls,
+        })
     }
 
     pub fn namespace(&self) -> &str {
@@ -107,9 +113,13 @@ impl K8s {
         }
         let body = body.unwrap_or(&[]);
         req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-        tls.write_all(req.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        tls.write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         if !body.is_empty() {
-            tls.write_all(body).await.map_err(|e| format!("write body: {e}"))?;
+            tls.write_all(body)
+                .await
+                .map_err(|e| format!("write body: {e}"))?;
         }
         tls.flush().await.ok();
 
@@ -132,7 +142,10 @@ impl K8s {
     async fn get_json(&self, path: &str) -> Result<Value, String> {
         let (status, body) = self.req("GET", path, None, None).await?;
         if status != 200 {
-            return Err(format!("GET {path}: {status}: {}", String::from_utf8_lossy(&body[..body.len().min(300)])));
+            return Err(format!(
+                "GET {path}: {status}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(300)])
+            ));
         }
         serde_json::from_slice(&body).map_err(|e| format!("GET {path}: bad json: {e}"))
     }
@@ -160,7 +173,14 @@ impl K8s {
                     restarts += c["restartCount"].as_u64().unwrap_or(0);
                 }
             }
-            out.push(Pod { name, ip, phase: phase.to_string(), ready, restarts, terminating });
+            out.push(Pod {
+                name,
+                ip,
+                phase: phase.to_string(),
+                ready,
+                restarts,
+                terminating,
+            });
         }
         Ok(out)
     }
@@ -194,7 +214,10 @@ impl K8s {
             )
             .await?;
         if status != 200 {
-            return Err(format!("scale {deployment} -> {replicas}: {status}: {}", String::from_utf8_lossy(&resp[..resp.len().min(300)])));
+            return Err(format!(
+                "scale {deployment} -> {replicas}: {status}: {}",
+                String::from_utf8_lossy(&resp[..resp.len().min(300)])
+            ));
         }
         Ok(())
     }
@@ -210,10 +233,18 @@ impl K8s {
         })
         .to_string();
         let (status, resp) = self
-            .req("PATCH", &path, Some("application/strategic-merge-patch+json"), Some(body.as_bytes()))
+            .req(
+                "PATCH",
+                &path,
+                Some("application/strategic-merge-patch+json"),
+                Some(body.as_bytes()),
+            )
             .await?;
         if status != 200 {
-            return Err(format!("deletion-cost {pod}: {status}: {}", String::from_utf8_lossy(&resp[..resp.len().min(200)])));
+            return Err(format!(
+                "deletion-cost {pod}: {status}: {}",
+                String::from_utf8_lossy(&resp[..resp.len().min(200)])
+            ));
         }
         Ok(())
     }
@@ -222,10 +253,22 @@ impl K8s {
     /// the dead-node reaper); otherwise a normal SIGTERM leave.
     pub async fn delete_pod(&self, pod: &str, grace_secs: u64) -> Result<(), String> {
         let path = format!("/api/v1/namespaces/{}/pods/{pod}", self.namespace);
-        let body = json!({"apiVersion": "v1", "kind": "DeleteOptions", "gracePeriodSeconds": grace_secs}).to_string();
-        let (status, resp) = self.req("DELETE", &path, Some("application/json"), Some(body.as_bytes())).await?;
+        let body =
+            json!({"apiVersion": "v1", "kind": "DeleteOptions", "gracePeriodSeconds": grace_secs})
+                .to_string();
+        let (status, resp) = self
+            .req(
+                "DELETE",
+                &path,
+                Some("application/json"),
+                Some(body.as_bytes()),
+            )
+            .await?;
         if !(200..300).contains(&status) {
-            return Err(format!("delete {pod}: {status}: {}", String::from_utf8_lossy(&resp[..resp.len().min(300)])));
+            return Err(format!(
+                "delete {pod}: {status}: {}",
+                String::from_utf8_lossy(&resp[..resp.len().min(300)])
+            ));
         }
         Ok(())
     }
@@ -275,7 +318,9 @@ pub(crate) fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
 fn dechunk(mut body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
-        let Some(line_end) = body.windows(2).position(|w| w == b"\r\n") else { break };
+        let Some(line_end) = body.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
         let size_str = String::from_utf8_lossy(&body[..line_end]);
         let Ok(size) = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("0"), 16)
         else {
@@ -334,12 +379,19 @@ impl EndpointSet {
         let (k8s, label) = match &cfg.scale {
             super::ScaleMode::K8s { .. } => {
                 let k = K8s::in_cluster().ok();
-                let label = std::env::var("SOAK_BROKER_LABEL").unwrap_or_else(|_| "app=switchboard".into());
+                let label =
+                    std::env::var("SOAK_BROKER_LABEL").unwrap_or_else(|_| "app=switchboard".into());
                 (k, label)
             }
             _ => (None, String::new()),
         };
-        EndpointSet { cfg, k8s: k8s.map(Arc::new), label, cache: tokio::sync::Mutex::new(None), rr: AtomicUsize::new(0) }
+        EndpointSet {
+            cfg,
+            k8s: k8s.map(Arc::new),
+            label,
+            cache: tokio::sync::Mutex::new(None),
+            rr: AtomicUsize::new(0),
+        }
     }
 
     pub fn k8s(&self) -> Option<Arc<K8s>> {
@@ -398,14 +450,30 @@ pub struct Scaler {
 
 impl Scaler {
     pub fn new(ctx: Arc<Ctx>) -> Self {
-        let k8s = ctx.endpoints.k8s().expect("k8s scaler needs in-cluster config");
+        let k8s = ctx
+            .endpoints
+            .k8s()
+            .expect("k8s scaler needs in-cluster config");
         let (deployment, min, max, every, kill_every) = match &ctx.cfg.scale {
-            super::ScaleMode::K8s { deployment, min, max, every, kill_every, .. } => {
-                (deployment.clone(), *min, *max, *every, *kill_every)
-            }
+            super::ScaleMode::K8s {
+                deployment,
+                min,
+                max,
+                every,
+                kill_every,
+                ..
+            } => (deployment.clone(), *min, *max, *every, *kill_every),
             _ => unreachable!("scaler only constructed for k8s mode"),
         };
-        Scaler { ctx, k8s, deployment, min, max, every, kill_every }
+        Scaler {
+            ctx,
+            k8s,
+            deployment,
+            min,
+            max,
+            every,
+            kill_every,
+        }
     }
 
     pub async fn run(self) {
@@ -424,12 +492,13 @@ impl Scaler {
         let ctx = &self.ctx;
         let mut current: u32 = {
             let pods = self.k8s.pods(&ctx.endpoints.label()).await?;
-            let live = pods.iter().filter(|p| p.client_endpoint().is_some()).count();
+            let live = pods
+                .iter()
+                .filter(|p| p.client_endpoint().is_some())
+                .count();
             (live as u32).clamp(self.min, self.max)
         };
-        ctx.ledger
-            .metrics
-            .add("scale.moves", 0);
+        ctx.ledger.metrics.add("scale.moves", 0);
         let mut next_scale = tokio::time::Instant::now() + self.every;
         let mut next_kill = if self.kill_every.is_zero() {
             tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2)
@@ -500,7 +569,12 @@ impl Scaler {
         ctx.gate.set(false);
         let drained = drain_all(ctx).await;
         if !drained {
-            ctx.error("scaler", "quiesce.drain", "-", "queues did not drain before sub-quorum scale".into());
+            ctx.error(
+                "scaler",
+                "quiesce.drain",
+                "-",
+                "queues did not drain before sub-quorum scale".into(),
+            );
         }
         let r = async {
             self.k8s.scale(&self.deployment, target).await?;
@@ -519,8 +593,15 @@ impl Scaler {
             if ctx.token.is_cancelled() {
                 return Ok(());
             }
-            let pods = self.k8s.pods(&ctx.endpoints.label()).await.unwrap_or_default();
-            let ready = pods.iter().filter(|p| p.client_endpoint().is_some()).count();
+            let pods = self
+                .k8s
+                .pods(&ctx.endpoints.label())
+                .await
+                .unwrap_or_default();
+            let ready = pods
+                .iter()
+                .filter(|p| p.client_endpoint().is_some())
+                .count();
             if ready as u32 >= target.max(1) {
                 // Canary: confirm + get on the control queue.
                 if canary(ctx).await.is_ok() {
@@ -642,8 +723,15 @@ fn now_nanos() -> u64 {
 /// Drain: every soak queue empty on every live endpoint.
 pub async fn drain_all(ctx: &Arc<Ctx>) -> bool {
     let queues = [
-        "soak.p.0", "soak.p.1", "soak.p.2", "soak.f.0", "soak.f.1", "soak.f.2", "soak.tx",
-        "soak.get", "soak.mand",
+        "soak.p.0",
+        "soak.p.1",
+        "soak.p.2",
+        "soak.f.0",
+        "soak.f.1",
+        "soak.f.2",
+        "soak.tx",
+        "soak.get",
+        "soak.mand",
     ];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
@@ -686,10 +774,13 @@ async fn canary(ctx: &Arc<Ctx>) -> Result<(), String> {
         .filter(|ok| *ok)
         .ok_or_else(|| "canary confirm failed".to_string())?;
     use lapin::options::BasicGetOptions;
-    let got = tokio::time::timeout(Duration::from_secs(10), ch.basic_get("soak.control", BasicGetOptions { no_ack: true }))
-        .await
-        .map_err(|_| "canary get timeout".to_string())?
-        .map_err(|e| format!("canary get: {e}"))?;
+    let got = tokio::time::timeout(
+        Duration::from_secs(10),
+        ch.basic_get("soak.control", BasicGetOptions { no_ack: true }),
+    )
+    .await
+    .map_err(|_| "canary get timeout".to_string())?
+    .map_err(|e| format!("canary get: {e}"))?;
     match got {
         Some(g) if g.delivery.data == body => Ok(()),
         Some(_) => Err("canary body mismatch".into()),

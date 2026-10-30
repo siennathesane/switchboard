@@ -2,19 +2,33 @@
 //! admin (embedded design §5, §6).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use switchboard_cluster::{BrokerCommand, BrokerReply, ClusterNode, META_GROUP, NodeConfig};
+use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::BrokerReply;
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::META_GROUP;
+use switchboard_cluster::NodeConfig;
 use switchboard_core::topology::MetaCmd;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::{BrokerConfig, EmbeddedLimits, JoinSpec};
+use crate::config::BrokerConfig;
+use crate::config::EmbeddedLimits;
+use crate::config::JoinSpec;
 use crate::conn::EmbeddedConnection;
 use crate::driver;
-use crate::error::{AdminError, ConnectError, StartError, StopError};
+use crate::error::AdminError;
+use crate::error::ConnectError;
+use crate::error::StartError;
+use crate::error::StopError;
 use crate::types::ReturnedMessage;
 
 /// One tracked connection in the broker registry (embedded design §4.2

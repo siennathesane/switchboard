@@ -6,7 +6,8 @@
 
 mod scenarios;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use anyhow::bail;
 use clap::Parser;
 use serde_json::json;
 use switchboard_bench::stats;
@@ -116,7 +117,10 @@ async fn main() -> Result<()> {
                 let t = v["throughput_msg_s"].as_u64().unwrap_or(0);
                 let mib = v["throughput_mib_s"].as_f64().unwrap_or(0.0);
                 let peak = v["peak_msg_s"].as_u64().unwrap_or(0);
-                println!("{:<12} {:>14} {:>12} {:>10} {:>22}", name, t, mib, peak, "-");
+                println!(
+                    "{:<12} {:>14} {:>12} {:>10} {:>22}",
+                    name, t, mib, peak, "-"
+                );
             }
         }
     }

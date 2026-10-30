@@ -9,15 +9,15 @@ use crate::channel::Channel;
 use crate::channel::ChannelResult;
 use crate::methods::shard_call;
 
-use switchboard_core::model::QueueOptions;
-use switchboard_core::topology::MetaCmd;
-use switchboard_core::topology::MetaReply;
 use crate::methods::inner_vhost;
 use crate::methods::meta_call;
+use switchboard_core::model::QueueOptions;
 use switchboard_core::topology::GroupId;
+use switchboard_core::topology::MetaCmd;
+use switchboard_core::topology::MetaReply;
 
 impl Channel {
-        pub(crate) async fn queue_declare(
+    pub(crate) async fn queue_declare(
         &self,
         node: &Arc<ClusterNode>,
         name: &str,
@@ -109,11 +109,25 @@ impl Channel {
         }
     }
 
-    pub(crate) async fn queue_purge(&self, node: &Arc<ClusterNode>, queue: &str) -> ChannelResult<u32> {
+    pub(crate) async fn queue_purge(
+        &self,
+        node: &Arc<ClusterNode>,
+        queue: &str,
+    ) -> ChannelResult<u32> {
         let shard = self.queue_shard(node, queue).await?;
-        match shard_call(node, shard, ShardCmd::Purge { queue: queue.to_string() }).await? {
+        match shard_call(
+            node,
+            shard,
+            ShardCmd::Purge {
+                queue: queue.to_string(),
+            },
+        )
+        .await?
+        {
             ShardReply::Purged { message_count } => Ok(message_count),
-            other => Err(BrokerError::resource_error(format!("unexpected purge reply {other:?}"))),
+            other => Err(BrokerError::resource_error(format!(
+                "unexpected purge reply {other:?}"
+            ))),
         }
     }
 
@@ -208,7 +222,15 @@ impl Channel {
     ) -> ChannelResult<ShardReply> {
         const TRIES: usize = 8;
         for attempt in 0..TRIES {
-            match shard_call(node, shard, ShardCmd::Stats { queue: queue.to_string() }).await {
+            match shard_call(
+                node,
+                shard,
+                ShardCmd::Stats {
+                    queue: queue.to_string(),
+                },
+            )
+            .await
+            {
                 Err(e) if e.code == 404 && attempt + 1 < TRIES => {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }

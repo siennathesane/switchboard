@@ -14,29 +14,31 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_lite::StreamExt;
+use lapin::Channel;
+use lapin::Connection;
 use lapin::options::QueueBindOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::options::QueueDeleteOptions;
 use lapin::types::FieldTable;
-use lapin::Channel;
-use lapin::Connection;
 use tokio_util::sync::CancellationToken;
 
+use crate::soak::Ctx;
 use crate::soak::check;
-use crate::soak::check::{decode_body, encode_body, FifoStream};
+use crate::soak::check::FifoStream;
+use crate::soak::check::decode_body;
+use crate::soak::check::encode_body;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
 use crate::soak::report::Check;
-use crate::soak::Ctx;
 
-use lapin::options::ExchangeDeclareOptions;
 use lapin::ExchangeKind;
+use lapin::options::ExchangeDeclareOptions;
 
 pub const FANOUT_QUEUES: usize = 3;
 pub const PIPELINE_QUEUES: usize = 3;
@@ -60,12 +62,22 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
     ch.exchange_declare(
         "soak.fx",
         ExchangeKind::Fanout,
-        ExchangeDeclareOptions { durable: true, ..Default::default() },
+        ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
         FieldTable::default(),
     )
     .await
     .map_err(|e| format!("soak.fx: {e}"))?;
-    let mut queues = vec!["soak.control".to_string(), "soak.tx".into(), "soak.get".into(), "soak.mand".into(), "soak.stomp".into(), "soak.a10".into()];
+    let mut queues = vec![
+        "soak.control".to_string(),
+        "soak.tx".into(),
+        "soak.get".into(),
+        "soak.mand".into(),
+        "soak.stomp".into(),
+        "soak.a10".into(),
+    ];
     for i in 0..PIPELINE_QUEUES {
         queues.push(format!("soak.p.{i}"));
     }
@@ -75,7 +87,10 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
     for q in queues {
         ch.queue_declare(
             &q,
-            QueueDeclareOptions { durable: true, ..Default::default() },
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
@@ -83,9 +98,15 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
     }
     for i in 0..FANOUT_QUEUES {
         let q = format!("soak.f.{i}");
-        ch.queue_bind(&q, "soak.fx", "", QueueBindOptions::default(), FieldTable::default())
-            .await
-            .map_err(|e| format!("bind {q}: {e}"))?;
+        ch.queue_bind(
+            &q,
+            "soak.fx",
+            "",
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| format!("bind {q}: {e}"))?;
     }
     drop(ch);
     drop(conn);
@@ -104,7 +125,9 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
             "soak.stomp".into(),
             "soak.a10".into(),
         ],
-        (0..PIPELINE_QUEUES).map(|i| format!("soak.p.{i}")).collect(),
+        (0..PIPELINE_QUEUES)
+            .map(|i| format!("soak.p.{i}"))
+            .collect(),
         (0..FANOUT_QUEUES).map(|i| format!("soak.f.{i}")).collect(),
     ]
     .concat();
@@ -123,7 +146,10 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
                 let ok = ch
                     .queue_declare(
                         q,
-                        QueueDeclareOptions { passive: true, ..Default::default() },
+                        QueueDeclareOptions {
+                            passive: true,
+                            ..Default::default()
+                        },
                         FieldTable::default(),
                     )
                     .await
@@ -147,7 +173,10 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
                 if let Ok(d) = ch
                     .queue_declare(
                         q,
-                        QueueDeclareOptions { durable: true, ..Default::default() },
+                        QueueDeclareOptions {
+                            durable: true,
+                            ..Default::default()
+                        },
                         FieldTable::default(),
                     )
                     .await
@@ -161,7 +190,10 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("topology never propagated to: {}", missing.join(", ")));
+            return Err(format!(
+                "topology never propagated to: {}",
+                missing.join(", ")
+            ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -179,7 +211,12 @@ pub struct TagCounts {
 
 impl TagCounts {
     pub fn bump(&self, tag: &str) {
-        *self.inner.lock().unwrap().entry(tag.to_string()).or_default() += 1;
+        *self
+            .inner
+            .lock()
+            .unwrap()
+            .entry(tag.to_string())
+            .or_default() += 1;
     }
     pub fn snapshot(&self) -> BTreeMap<String, u64> {
         self.inner.lock().unwrap().clone()
@@ -196,23 +233,15 @@ pub struct TagStreams {
 }
 
 impl TagStreams {
-    pub fn observe(
-        &self,
-        tag: &str,
-        seq: u64,
-        redelivered: bool,
-        window: bool,
-    ) -> check::Delivery {
+    pub fn observe(&self, tag: &str, seq: u64, redelivered: bool, window: bool) -> check::Delivery {
         let mut g = self.inner.lock().unwrap();
-        let s = g
-            .entry(tag.to_string())
-            .or_insert_with(|| {
-                if window {
-                    FifoStream::with_window(4096)
-                } else {
-                    FifoStream::new()
-                }
-            });
+        let s = g.entry(tag.to_string()).or_insert_with(|| {
+            if window {
+                FifoStream::with_window(4096)
+            } else {
+                FifoStream::new()
+            }
+        });
         s.observe(seq, redelivered)
     }
 
@@ -241,7 +270,12 @@ impl TagStreams {
     }
 
     pub fn total_distinct(&self) -> u64 {
-        self.inner.lock().unwrap().values().map(|s| s.distinct()).sum()
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.distinct())
+            .sum()
     }
 }
 
@@ -259,7 +293,11 @@ pub type Reconciler = Arc<dyn Fn() -> Vec<Check> + Send + Sync>;
 /// whose confirm was lost (retired) but which the broker applied and
 /// delivered anyway is delayed, not lost. A cursor BELOW confirmed is a
 /// real hole and fails.
-pub fn tag_reconciler(name: &str, confirmed: Arc<TagCounts>, streams: Arc<TagStreams>) -> Reconciler {
+pub fn tag_reconciler(
+    name: &str,
+    confirmed: Arc<TagCounts>,
+    streams: Arc<TagStreams>,
+) -> Reconciler {
     let name = name.to_string();
     Arc::new(move || {
         let conf = confirmed.snapshot();
@@ -289,10 +327,7 @@ pub fn tag_reconciler(name: &str, confirmed: Arc<TagCounts>, streams: Arc<TagStr
                     expected: *want,
                     delivered: got,
                     ok: true,
-                    note: format!(
-                        "{} unconfirmed-but-landed (ambiguity window)",
-                        got - want
-                    ),
+                    note: format!("{} unconfirmed-but-landed (ambiguity window)", got - want),
                 });
             }
         }
@@ -327,8 +362,12 @@ pub fn tag_reconciler(name: &str, confirmed: Arc<TagCounts>, streams: Arc<TagStr
 pub async fn run_pipeline(ctx: Arc<Ctx>) {
     let confirmed = Arc::new(TagCounts::default());
     let streams = Arc::new(TagStreams::default());
-    ctx.add_reconciler(tag_reconciler("pipeline", confirmed.clone(), streams.clone()))
-        .await;
+    ctx.add_reconciler(tag_reconciler(
+        "pipeline",
+        confirmed.clone(),
+        streams.clone(),
+    ))
+    .await;
     let mut handles = Vec::new();
     for i in 0..PIPELINE_QUEUES {
         let queue = format!("soak.p.{i}");
@@ -392,7 +431,9 @@ async fn pipeline_publisher(
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                if !client::alive(&ctx) { return }
+                if !client::alive(&ctx) {
+                    return;
+                }
                 continue;
             }
             pacer.wait().await;
@@ -436,8 +477,7 @@ async fn acked_consumer(ctx: Arc<Ctx>, queue: String, streams: Arc<TagStreams>, 
         let Some(ch) = client::channel(&ctx, &conn, name, &host).await else {
             continue;
         };
-        let Some(mut consumer) =
-            client::consume_acked(&ctx, &ch, &host, name, &queue, 256).await
+        let Some(mut consumer) = client::consume_acked(&ctx, &ch, &host, name, &queue, 256).await
         else {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -471,7 +511,9 @@ async fn acked_consumer(ctx: Arc<Ctx>, queue: String, streams: Arc<TagStreams>, 
                                 name,
                                 "dup.unflagged",
                                 &host,
-                                format!("{queue}: seq {seq} redelivered without the redelivered flag"),
+                                format!(
+                                    "{queue}: seq {seq} redelivered without the redelivered flag"
+                                ),
                             );
                         }
                         check::Delivery::Gap(n) => {
@@ -479,7 +521,9 @@ async fn acked_consumer(ctx: Arc<Ctx>, queue: String, streams: Arc<TagStreams>, 
                                 name,
                                 "fifo.gap",
                                 &host,
-                                format!("{queue}: tag {tag} missing {n} message(s) before seq {seq}"),
+                                format!(
+                                    "{queue}: tag {tag} missing {n} message(s) before seq {seq}"
+                                ),
                             );
                         }
                     }
@@ -525,8 +569,12 @@ pub async fn run_fanout(ctx: Arc<Ctx>) {
     for i in 0..FANOUT_QUEUES {
         let queue = format!("soak.f.{i}");
         let streams = Arc::new(TagStreams::default());
-        ctx.add_reconciler(tag_reconciler(&format!("fanout.{i}"), confirmed.clone(), streams.clone()))
-            .await;
+        ctx.add_reconciler(tag_reconciler(
+            &format!("fanout.{i}"),
+            confirmed.clone(),
+            streams.clone(),
+        ))
+        .await;
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
             acked_consumer(ctx, queue, streams, "fanout").await;
@@ -561,12 +609,15 @@ async fn fanout_publisher(ctx: Arc<Ctx>, rate: f64, confirmed: Arc<TagCounts>) {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                if !client::alive(&ctx) { return }
+                if !client::alive(&ctx) {
+                    return;
+                }
                 continue;
             }
             pacer.wait().await;
             let body = encode_body(&tag, seq, ctx.cfg.msg_size);
-            match client::publish_confirmed(&ctx, &ch, &host, "fanout", "soak.fx", "", &body).await {
+            match client::publish_confirmed(&ctx, &ch, &host, "fanout", "soak.fx", "", &body).await
+            {
                 Some(true) => {
                     confirmed.bump(&tag);
                     seq += 1;
@@ -618,7 +669,8 @@ impl TxWindow {
             let evicted = g.0.pop_front().unwrap();
             g.1.remove(&evicted);
         }
-        self.committed.fetch_add(seqs.len() as u64, Ordering::Relaxed);
+        self.committed
+            .fetch_add(seqs.len() as u64, Ordering::Relaxed);
     }
 
     /// Undo a commit(): the consumer task observes deliveries
@@ -715,7 +767,9 @@ async fn tx_publisher(ctx: Arc<Ctx>, rate: f64, msgs_per_tx: usize, window: Arc<
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                if !client::alive(&ctx) { return }
+                if !client::alive(&ctx) {
+                    return;
+                }
                 continue;
             }
             pacer.wait().await;
@@ -759,7 +813,11 @@ async fn tx_publisher(ctx: Arc<Ctx>, rate: f64, msgs_per_tx: usize, window: Arc<
                 // beat this task's post-commit bookkeeping.
                 window.commit(&batch);
             }
-            let result = if commit { ch.tx_commit().await } else { ch.tx_rollback().await };
+            let result = if commit {
+                ch.tx_commit().await
+            } else {
+                ch.tx_rollback().await
+            };
             match result {
                 Ok(_) => {
                     if commit {
@@ -795,7 +853,8 @@ async fn tx_consumer(ctx: Arc<Ctx>, window: Arc<TxWindow>) {
         let Some(ch) = client::channel(&ctx, &conn, "tx", &host).await else {
             continue;
         };
-        let Some(mut consumer) = client::consume_acked(&ctx, &ch, &host, "tx", "soak.tx", 128).await
+        let Some(mut consumer) =
+            client::consume_acked(&ctx, &ch, &host, "tx", "soak.tx", 128).await
         else {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -815,20 +874,22 @@ async fn tx_consumer(ctx: Arc<Ctx>, window: Arc<TxWindow>) {
                 }
             };
             match decode_body(delivery.data.as_slice()) {
-                Ok((_, seq)) => match window.saw(seq) {
-                    Saw::Committed => {}
-                    Saw::TooOld => {
-                        window.too_old.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Saw::RolledBack => {
-                        ctx.error(
+                Ok((_, seq)) => {
+                    match window.saw(seq) {
+                        Saw::Committed => {}
+                        Saw::TooOld => {
+                            window.too_old.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Saw::RolledBack => {
+                            ctx.error(
                             "tx",
                             "abort.leak",
                             &host,
                             format!("message from a rolled-back transaction was delivered (seq {seq})"),
                         );
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     ctx.error("tx", "body", &host, format!("integrity violation: {e:?}"));
                 }
@@ -860,7 +921,9 @@ pub async fn run_get(ctx: Arc<Ctx>) {
     {
         let ctx = ctx.clone();
         let streams = streams.clone();
-        handles.push(tokio::spawn(async move { get_consumer(ctx, streams).await }));
+        handles.push(tokio::spawn(
+            async move { get_consumer(ctx, streams).await },
+        ));
     }
     for h in handles {
         let _ = h.await;
@@ -899,24 +962,41 @@ async fn get_consumer(ctx: Arc<Ctx>, streams: Arc<TagStreams>) {
             };
             let Some(got) = got else { continue }; // empty queue
             match decode_body(got.delivery.data.as_slice()) {
-                Ok((tag, seq)) => match streams.observe(&tag, seq, got.delivery.redelivered, ctx.cfg.chaos) {
-                    check::Delivery::InOrder => {}
-                    check::Delivery::Repeat => {
-                        ctx.ledger.legal_dup();
-                        ctx.ledger.metrics.add("dup.legal", 1);
+                Ok((tag, seq)) => {
+                    match streams.observe(&tag, seq, got.delivery.redelivered, ctx.cfg.chaos) {
+                        check::Delivery::InOrder => {}
+                        check::Delivery::Repeat => {
+                            ctx.ledger.legal_dup();
+                            ctx.ledger.metrics.add("dup.legal", 1);
+                        }
+                        check::Delivery::RepeatUnflagged => {
+                            ctx.error(
+                                "get",
+                                "dup.unflagged",
+                                &host,
+                                format!("seq {seq} without redelivered flag"),
+                            );
+                        }
+                        check::Delivery::Gap(n) => {
+                            ctx.error(
+                                "get",
+                                "fifo.gap",
+                                &host,
+                                format!("missing {n} before seq {seq}"),
+                            );
+                        }
                     }
-                    check::Delivery::RepeatUnflagged => {
-                        ctx.error("get", "dup.unflagged", &host, format!("seq {seq} without redelivered flag"));
-                    }
-                    check::Delivery::Gap(n) => {
-                        ctx.error("get", "fifo.gap", &host, format!("missing {n} before seq {seq}"));
-                    }
-                },
+                }
                 Err(e) => {
                     ctx.error("get", "body", &host, format!("integrity violation: {e:?}"));
                 }
             }
-            if let Err(e) = got.delivery.acker.ack(lapin::options::BasicAckOptions::default()).await {
+            if let Err(e) = got
+                .delivery
+                .acker
+                .ack(lapin::options::BasicAckOptions::default())
+                .await
+            {
                 ctx.error("get", "ack", &host, format!("ack failed: {e}"));
             }
             ctx.ledger.metrics.add("get.delivered", 1);
@@ -981,9 +1061,31 @@ async fn topo_cycle(ctx: &Arc<Ctx>, ch: &Channel, host: &str, q: &str) -> Result
         };
     }
     // Full lifecycle on a durable queue.
-    step!(ch.queue_declare(q, QueueDeclareOptions { durable: true, ..Default::default() }, FieldTable::default()), format!("declare {q}"));
-    step!(ch.queue_bind(q, "amq.topic", q, QueueBindOptions::default(), FieldTable::default()), format!("bind {q}"));
-    step!(ch.queue_purge(q, QueuePurgeOptions::default()), format!("purge {q}"));
+    step!(
+        ch.queue_declare(
+            q,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default()
+        ),
+        format!("declare {q}")
+    );
+    step!(
+        ch.queue_bind(
+            q,
+            "amq.topic",
+            q,
+            QueueBindOptions::default(),
+            FieldTable::default()
+        ),
+        format!("bind {q}")
+    );
+    step!(
+        ch.queue_purge(q, QueuePurgeOptions::default()),
+        format!("purge {q}")
+    );
     let body = encode_body("topo", 0, 64);
     match client::publish_confirmed(ctx, ch, host, "topo", "amq.topic", q, &body).await {
         Some(true) => {}
@@ -995,21 +1097,60 @@ async fn topo_cycle(ctx: &Arc<Ctx>, ch: &Channel, host: &str, q: &str) -> Result
         }
     }
     use lapin::options::BasicGetOptions;
-    let got = step!(ch.basic_get(q, BasicGetOptions { no_ack: false }), format!("get {q}"));
+    let got = step!(
+        ch.basic_get(q, BasicGetOptions { no_ack: false }),
+        format!("get {q}")
+    );
     if let Some(got) = got {
-        step!(got.delivery.acker.ack(lapin::options::BasicAckOptions::default()), format!("ack {q}"));
+        step!(
+            got.delivery
+                .acker
+                .ack(lapin::options::BasicAckOptions::default()),
+            format!("ack {q}")
+        );
     }
-    step!(ch.queue_unbind(q, "amq.topic", q, FieldTable::default()), format!("unbind {q}"));
-    step!(ch.queue_delete(q, QueueDeleteOptions::default()), format!("delete {q}"));
+    step!(
+        ch.queue_unbind(q, "amq.topic", q, FieldTable::default()),
+        format!("unbind {q}")
+    );
+    step!(
+        ch.queue_delete(q, QueueDeleteOptions::default()),
+        format!("delete {q}")
+    );
 
     // Exchange lifecycle.
     let x = format!("soak.topox.{q}");
-    step!(ch.exchange_declare(&x, ExchangeKind::Fanout, ExchangeDeclareOptions { durable: false, ..Default::default() }, FieldTable::default()), format!("declare exchange {x}"));
-    step!(ch.exchange_delete(&x, ExchangeDeleteOptions::default()), format!("delete exchange {x}"));
+    step!(
+        ch.exchange_declare(
+            &x,
+            ExchangeKind::Fanout,
+            ExchangeDeclareOptions {
+                durable: false,
+                ..Default::default()
+            },
+            FieldTable::default()
+        ),
+        format!("declare exchange {x}")
+    );
+    step!(
+        ch.exchange_delete(&x, ExchangeDeleteOptions::default()),
+        format!("delete exchange {x}")
+    );
 
     // Exclusive + auto-delete queue lifecycle (cleanup-path exercise).
     let eq = format!("soak.excl.{q}");
-    step!(ch.queue_declare(&eq, QueueDeclareOptions { exclusive: true, auto_delete: true, ..Default::default() }, FieldTable::default()), format!("declare exclusive {eq}"));
+    step!(
+        ch.queue_declare(
+            &eq,
+            QueueDeclareOptions {
+                exclusive: true,
+                auto_delete: true,
+                ..Default::default()
+            },
+            FieldTable::default()
+        ),
+        format!("declare exclusive {eq}")
+    );
     // It disappears when the channel closes; verify a delete on a fresh
     // channel observes the cleanup (404 = cleaned up = good, but we do
     // not assert either way: both outcomes are legal per spec timing).
@@ -1049,11 +1190,7 @@ pub async fn run_connchurn(ctx: Arc<Ctx>) {
             n += 1;
             let q = format!("soak.churn.{run}.{n}");
             match ch
-                .queue_declare(
-                    &q,
-                    QueueDeclareOptions::default(),
-                    FieldTable::default(),
-                )
+                .queue_declare(&q, QueueDeclareOptions::default(), FieldTable::default())
                 .await
             {
                 Ok(_) => {
@@ -1114,8 +1251,15 @@ pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
 /// pass; a stuck depth is a reconciliation failure.
 pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
     let queues = [
-        "soak.p.0", "soak.p.1", "soak.p.2", "soak.f.0", "soak.f.1", "soak.f.2", "soak.tx",
-        "soak.get", "soak.mand",
+        "soak.p.0",
+        "soak.p.1",
+        "soak.p.2",
+        "soak.f.0",
+        "soak.f.1",
+        "soak.f.2",
+        "soak.tx",
+        "soak.get",
+        "soak.mand",
     ];
     let deadline = tokio::time::Instant::now() + ctx.cfg.drain_timeout;
     let mut drained: Vec<(String, u32)> = Vec::new();
@@ -1145,7 +1289,12 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
         }
         if tokio::time::Instant::now() >= deadline {
             if !saw_endpoints {
-                ctx.error("drain", "drain.no_endpoints", "-", "no endpoints to drain".into());
+                ctx.error(
+                    "drain",
+                    "drain.no_endpoints",
+                    "-",
+                    "no endpoints to drain".into(),
+                );
             } else {
                 ctx.error(
                     "drain",
@@ -1175,7 +1324,10 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
                         "reconcile",
                         "conservation",
                         "-",
-                        format!("{}: confirmed {} != delivered {}", c.name, c.expected, c.delivered),
+                        format!(
+                            "{}: confirmed {} != delivered {}",
+                            c.name, c.expected, c.delivered
+                        ),
                     );
                 }
             }
@@ -1221,7 +1373,10 @@ mod tests {
         observe_seqs(&streams, "p", &[0, 1, 2]);
         let checks = tag_reconciler("w", confirmed, streams)();
         assert!(checks.iter().all(|c| c.ok), "{checks:?}");
-        assert!(checks.iter().any(|c| c.note.contains("ambiguity")), "{checks:?}");
+        assert!(
+            checks.iter().any(|c| c.note.contains("ambiguity")),
+            "{checks:?}"
+        );
     }
 
     #[test]

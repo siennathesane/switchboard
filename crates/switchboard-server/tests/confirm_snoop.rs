@@ -16,83 +16,219 @@ async fn snoop_confirm_frames() {
         let Method::ConnectionStart { mechanisms: _, .. } = &start else {
             panic!("expected Start");
         };
-        c.send_method(0, &Method::ConnectionStartOk {
-            client_properties: FieldTable::new(),
-            mechanism: "PLAIN".into(),
-            response: {
-                let mut r = vec![0u8];
-                r.extend_from_slice(b"guest");
-                r.push(0);
-                r.extend_from_slice(b"guest");
-                r
+        c.send_method(
+            0,
+            &Method::ConnectionStartOk {
+                client_properties: FieldTable::new(),
+                mechanism: "PLAIN".into(),
+                response: {
+                    let mut r = vec![0u8];
+                    r.extend_from_slice(b"guest");
+                    r.push(0);
+                    r.extend_from_slice(b"guest");
+                    r
+                },
+                locale: "en_US".into(),
             },
-            locale: "en_US".into(),
-        }).await.unwrap();
-        let Method::ConnectionTune { channel_max, frame_max, heartbeat: _ } = c.expect(0).await.unwrap() else {
+        )
+        .await
+        .unwrap();
+        let Method::ConnectionTune {
+            channel_max,
+            frame_max,
+            heartbeat: _,
+        } = c.expect(0).await.unwrap()
+        else {
             panic!("expected Tune");
         };
-        c.send_method(0, &Method::ConnectionTuneOk { channel_max, frame_max, heartbeat: 10 }).await.unwrap();
-        c.send_method(0, &Method::ConnectionOpen { virtual_host: "/".into(), capabilities: String::new(), insist: false }).await.unwrap();
+        c.send_method(
+            0,
+            &Method::ConnectionTuneOk {
+                channel_max,
+                frame_max,
+                heartbeat: 10,
+            },
+        )
+        .await
+        .unwrap();
+        c.send_method(
+            0,
+            &Method::ConnectionOpen {
+                virtual_host: "/".into(),
+                capabilities: String::new(),
+                insist: false,
+            },
+        )
+        .await
+        .unwrap();
         let _ = c.expect(0).await.unwrap();
-        c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() }).await.unwrap();
+        c.send_method(
+            1,
+            &Method::ChannelOpen {
+                out_of_band: String::new(),
+            },
+        )
+        .await
+        .unwrap();
         let _ = c.expect(1).await.unwrap();
     }
 
-    c.send_method(1, &Method::ConfirmSelect { nowait: false }).await.unwrap();
-    println!("[snoop] after ConfirmSelect: {:?}", c.expect(1).await.unwrap().name());
+    c.send_method(1, &Method::ConfirmSelect { nowait: false })
+        .await
+        .unwrap();
+    println!(
+        "[snoop] after ConfirmSelect: {:?}",
+        c.expect(1).await.unwrap().name()
+    );
 
     // Mirror the Go suite: confirmed publish -> get -> ack -> declares
     // -> binds -> confirmed publish.
-    c.send_method(1, &Method::QueueDeclare {
-        ticket: 0, queue: "sn-first".into(), passive: false, durable: true,
-        exclusive: false, auto_delete: false, nowait: false, arguments: Default::default(),
-    }).await.unwrap();
+    c.send_method(
+        1,
+        &Method::QueueDeclare {
+            ticket: 0,
+            queue: "sn-first".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     let _ = c.expect(1).await.unwrap();
-    c.send_method(1, &Method::BasicPublish {
-        ticket: 0, exchange: "".into(), routing_key: "sn-first".into(),
-        mandatory: false, immediate: false,
-    }).await.unwrap();
-    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one").await.unwrap();
+    c.send_method(
+        1,
+        &Method::BasicPublish {
+            ticket: 0,
+            exchange: "".into(),
+            routing_key: "sn-first".into(),
+            mandatory: false,
+            immediate: false,
+        },
+    )
+    .await
+    .unwrap();
+    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one")
+        .await
+        .unwrap();
     println!("[snoop] after pub1: {:?}", c.expect(1).await.unwrap());
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "sn-first".into(), no_ack: false }).await.unwrap();
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "sn-first".into(),
+            no_ack: false,
+        },
+    )
+    .await
+    .unwrap();
     let got = c.expect(1).await.unwrap();
     println!("[snoop] get: {}", got.name());
     if let Method::BasicGetOk { delivery_tag, .. } = got {
-        c.send_method(1, &Method::BasicAck { delivery_tag, multiple: false }).await.unwrap();
+        c.send_method(
+            1,
+            &Method::BasicAck {
+                delivery_tag,
+                multiple: false,
+            },
+        )
+        .await
+        .unwrap();
         println!("[snoop] acked {delivery_tag}");
     }
 
     for q in ["sn-a", "sn-b"] {
-        c.send_method(1, &Method::QueueDeclare {
-            ticket: 0, queue: q.into(), passive: false, durable: true,
-            exclusive: false, auto_delete: false, nowait: false, arguments: Default::default(),
-        }).await.unwrap();
+        c.send_method(
+            1,
+            &Method::QueueDeclare {
+                ticket: 0,
+                queue: q.into(),
+                passive: false,
+                durable: true,
+                exclusive: false,
+                auto_delete: false,
+                nowait: false,
+                arguments: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
         let _ = c.expect(1).await.unwrap();
-        c.send_method(1, &Method::QueueBind {
-            ticket: 0, queue: q.into(), exchange: "amq.topic".into(),
-            routing_key: "a.*".into(), nowait: false, arguments: FieldTable::new(),
-        }).await.unwrap();
+        c.send_method(
+            1,
+            &Method::QueueBind {
+                ticket: 0,
+                queue: q.into(),
+                exchange: "amq.topic".into(),
+                routing_key: "a.*".into(),
+                nowait: false,
+                arguments: FieldTable::new(),
+            },
+        )
+        .await
+        .unwrap();
         let _ = c.expect(1).await.unwrap();
     }
 
     // Mirror the Go nack probe: confirm-publish, get, ack, then raw-dump
     // everything the broker sends.
-    c.send_method(1, &Method::QueueDeclare {
-        ticket: 0, queue: "sn-first".into(), passive: false, durable: true,
-        exclusive: false, auto_delete: false, nowait: false, arguments: Default::default(),
-    }).await.unwrap();
+    c.send_method(
+        1,
+        &Method::QueueDeclare {
+            ticket: 0,
+            queue: "sn-first".into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     let _ = c.expect(1).await.unwrap();
-    c.send_method(1, &Method::BasicPublish {
-        ticket: 0, exchange: "".into(), routing_key: "sn-first".into(),
-        mandatory: false, immediate: false,
-    }).await.unwrap();
-    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one").await.unwrap();
+    c.send_method(
+        1,
+        &Method::BasicPublish {
+            ticket: 0,
+            exchange: "".into(),
+            routing_key: "sn-first".into(),
+            mandatory: false,
+            immediate: false,
+        },
+    )
+    .await
+    .unwrap();
+    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one")
+        .await
+        .unwrap();
     println!("[snoop] after pub1: {:?}", c.expect(1).await.unwrap());
-    c.send_method(1, &Method::BasicGet { ticket: 0, queue: "sn-first".into(), no_ack: false }).await.unwrap();
+    c.send_method(
+        1,
+        &Method::BasicGet {
+            ticket: 0,
+            queue: "sn-first".into(),
+            no_ack: false,
+        },
+    )
+    .await
+    .unwrap();
     let got = c.expect(1).await.unwrap();
     println!("[snoop] get: {}", got.name());
     if let Method::BasicGetOk { delivery_tag, .. } = got {
-        c.send_method(1, &Method::BasicAck { delivery_tag, multiple: false }).await.unwrap();
+        c.send_method(
+            1,
+            &Method::BasicAck {
+                delivery_tag,
+                multiple: false,
+            },
+        )
+        .await
+        .unwrap();
         println!("[snoop] acked {delivery_tag}");
     }
 
@@ -103,7 +239,11 @@ async fn snoop_confirm_frames() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut frames = 0usize;
     while tokio::time::Instant::now() < deadline && frames < 12 {
-        let n = tokio::time::timeout(std::time::Duration::from_millis(500), c.read_half.read(&mut buf)).await;
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            c.read_half.read(&mut buf),
+        )
+        .await;
         match n {
             Ok(Ok(0)) => break,
             Err(_) => continue, // silence until the deadline
@@ -129,7 +269,9 @@ async fn snoop_confirm_frames() {
                 } else {
                     0
                 };
-                println!("[snoop] frame ch={channel} class={class} method={method} tag={tag} payload={payload:02x?}");
+                println!(
+                    "[snoop] frame ch={channel} class={class} method={method} tag={tag} payload={payload:02x?}"
+                );
             } else {
                 println!("[snoop] frame type={ftype} ch={channel} size={size}");
             }

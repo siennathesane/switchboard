@@ -84,50 +84,103 @@ mod message;
 mod status;
 mod table;
 
-pub use channel_api::{
-    SB_EXCHANGE_DIRECT, SB_EXCHANGE_FANOUT, SB_EXCHANGE_HEADERS, SB_EXCHANGE_TOPIC,
-};
+pub use channel_api::SB_EXCHANGE_DIRECT;
+pub use channel_api::SB_EXCHANGE_FANOUT;
+pub use channel_api::SB_EXCHANGE_HEADERS;
+pub use channel_api::SB_EXCHANGE_TOPIC;
 // The extern fns themselves, re-exported so Rust callers (and this
 // crate's own tests) can `use switchboard_capi::*` and reach the exact
 // surface the cdylib exports.
-pub use broker_api::{
-    sb_broker_connect, sb_broker_connect_vhost, sb_broker_create_user, sb_broker_data_dir,
-    sb_broker_declare_vhost, sb_broker_delete_user, sb_broker_free, sb_broker_is_ready,
-    sb_broker_set_permissions, sb_broker_start, sb_broker_stop, sb_broker_wait_ready,
-    sb_config_create, sb_config_free, sb_config_set_bootstrap_credentials,
-    sb_config_set_expected_nodes, sb_config_set_janitor_interval_ms, sb_config_set_node_id,
-    sb_string_free,
-};
-pub use channel_api::{
-    sb_channel_ack, sb_channel_ack_many, sb_channel_cancel, sb_channel_confirm_select,
-    sb_channel_consume, sb_channel_exchange_bind, sb_channel_exchange_declare,
-    sb_channel_exchange_delete, sb_channel_exchange_unbind, sb_channel_free, sb_channel_get,
-    sb_channel_id, sb_channel_nack, sb_channel_nack_many, sb_channel_publish,
-    sb_channel_publish_confirmed, sb_channel_publish_mandatory, sb_channel_qos,
-    sb_channel_queue_bind, sb_channel_queue_declare, sb_channel_queue_delete,
-    sb_channel_queue_purge, sb_channel_queue_unbind, sb_channel_tx_commit, sb_channel_tx_rollback,
-    sb_channel_tx_select,
-};
-pub use client_api::{sb_client_close, sb_client_free, sb_client_open_channel};
-pub use consumer_api::{sb_consumer_cancel, sb_consumer_free, sb_consumer_next, sb_consumer_tag};
+pub use broker_api::sb_broker_connect;
+pub use broker_api::sb_broker_connect_vhost;
+pub use broker_api::sb_broker_create_user;
+pub use broker_api::sb_broker_data_dir;
+pub use broker_api::sb_broker_declare_vhost;
+pub use broker_api::sb_broker_delete_user;
+pub use broker_api::sb_broker_free;
+pub use broker_api::sb_broker_is_ready;
+pub use broker_api::sb_broker_set_permissions;
+pub use broker_api::sb_broker_start;
+pub use broker_api::sb_broker_stop;
+pub use broker_api::sb_broker_wait_ready;
+pub use broker_api::sb_config_create;
+pub use broker_api::sb_config_free;
+pub use broker_api::sb_config_set_bootstrap_credentials;
+pub use broker_api::sb_config_set_expected_nodes;
+pub use broker_api::sb_config_set_janitor_interval_ms;
+pub use broker_api::sb_config_set_node_id;
+pub use broker_api::sb_string_free;
+pub use channel_api::sb_channel_ack;
+pub use channel_api::sb_channel_ack_many;
+pub use channel_api::sb_channel_cancel;
+pub use channel_api::sb_channel_confirm_select;
+pub use channel_api::sb_channel_consume;
+pub use channel_api::sb_channel_exchange_bind;
+pub use channel_api::sb_channel_exchange_declare;
+pub use channel_api::sb_channel_exchange_delete;
+pub use channel_api::sb_channel_exchange_unbind;
+pub use channel_api::sb_channel_free;
+pub use channel_api::sb_channel_get;
+pub use channel_api::sb_channel_id;
+pub use channel_api::sb_channel_nack;
+pub use channel_api::sb_channel_nack_many;
+pub use channel_api::sb_channel_publish;
+pub use channel_api::sb_channel_publish_confirmed;
+pub use channel_api::sb_channel_publish_mandatory;
+pub use channel_api::sb_channel_qos;
+pub use channel_api::sb_channel_queue_bind;
+pub use channel_api::sb_channel_queue_declare;
+pub use channel_api::sb_channel_queue_delete;
+pub use channel_api::sb_channel_queue_purge;
+pub use channel_api::sb_channel_queue_unbind;
+pub use channel_api::sb_channel_tx_commit;
+pub use channel_api::sb_channel_tx_rollback;
+pub use channel_api::sb_channel_tx_select;
+pub use client_api::sb_client_close;
+pub use client_api::sb_client_free;
+pub use client_api::sb_client_open_channel;
+pub use consumer_api::sb_consumer_cancel;
+pub use consumer_api::sb_consumer_free;
+pub use consumer_api::sb_consumer_next;
+pub use consumer_api::sb_consumer_tag;
 // The opaque handle types (C: sb_config_t / sb_broker_t / sb_client_t /
 // sb_channel_t / sb_consumer_t) and the message struct, so Rust-side
 // tests can declare pointers to them.
 pub use consumer_api::SbConsumer;
-pub use handles::{SbBroker, SbChannel, SbClient, SbConfig};
+pub use handles::SbBroker;
+pub use handles::SbChannel;
+pub use handles::SbClient;
+pub use handles::SbConfig;
 pub use message::SbMessage;
-pub use status::{SB_OK, SbStatus};
+pub use status::SB_OK;
+pub use status::SbStatus;
 // The full status vocabulary is exported under its C names.
-pub use status::{
-    SB_ERR_ACCESS_REFUSED, SB_ERR_ADMIN_REFUSED, SB_ERR_BROKER_STOPPED, SB_ERR_CHANNEL_CLOSED,
-    SB_ERR_CONNECT_ACCESS_REFUSED, SB_ERR_CONNECTION_CLOSED, SB_ERR_CONSUMER_CANCELLED,
-    SB_ERR_FORMATION, SB_ERR_HANDLE_DEAD, SB_ERR_INVALID_CONFIG, SB_ERR_INVALID_HANDLE,
-    SB_ERR_INVALID_UTF8, SB_ERR_IO, SB_ERR_NO_SUCH_VHOST, SB_ERR_NOT_FOUND, SB_ERR_NULL_ARG,
-    SB_ERR_PANIC, SB_ERR_PRECONDITION_FAILED, SB_ERR_RAFT, SB_ERR_STOP_LEAVE_FAILED,
-    SB_ERR_STOP_TIMED_OUT, SB_ERR_STORAGE, SB_ERR_TIMEOUT,
-};
+pub use status::SB_ERR_ACCESS_REFUSED;
+pub use status::SB_ERR_ADMIN_REFUSED;
+pub use status::SB_ERR_BROKER_STOPPED;
+pub use status::SB_ERR_CHANNEL_CLOSED;
+pub use status::SB_ERR_CONNECT_ACCESS_REFUSED;
+pub use status::SB_ERR_CONNECTION_CLOSED;
+pub use status::SB_ERR_CONSUMER_CANCELLED;
+pub use status::SB_ERR_FORMATION;
+pub use status::SB_ERR_HANDLE_DEAD;
+pub use status::SB_ERR_INVALID_CONFIG;
+pub use status::SB_ERR_INVALID_HANDLE;
+pub use status::SB_ERR_INVALID_UTF8;
+pub use status::SB_ERR_IO;
+pub use status::SB_ERR_NO_SUCH_VHOST;
+pub use status::SB_ERR_NOT_FOUND;
+pub use status::SB_ERR_NULL_ARG;
+pub use status::SB_ERR_PANIC;
+pub use status::SB_ERR_PRECONDITION_FAILED;
+pub use status::SB_ERR_RAFT;
+pub use status::SB_ERR_STOP_LEAVE_FAILED;
+pub use status::SB_ERR_STOP_TIMED_OUT;
+pub use status::SB_ERR_STORAGE;
+pub use status::SB_ERR_TIMEOUT;
 
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
+use std::ffi::c_char;
 
 /// The library version (the workspace version, e.g. `"1.0.0-rc.1"`), as a
 /// static NUL-terminated string that never needs freeing.

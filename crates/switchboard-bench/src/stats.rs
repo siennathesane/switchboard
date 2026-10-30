@@ -1,8 +1,10 @@
 //! Benchmark statistics: rate sampling over atomic counters and latency
 //! percentiles.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// A monotonic message counter shared between load tasks and the sampler.
@@ -72,7 +74,13 @@ impl RateSampler {
                 }
             })
         };
-        RateSampler { counter, samples, byte_samples, stop, handle }
+        RateSampler {
+            counter,
+            samples,
+            byte_samples,
+            stop,
+            handle,
+        }
     }
 
     /// Stops sampling; returns (total msgs over the window, per-second
@@ -114,7 +122,11 @@ pub struct Hist {
 
 impl Default for Hist {
     fn default() -> Self {
-        Hist { counts: Mutex::new(vec![0; 256]), total: AtomicU64::new(0), max: AtomicU64::new(0) }
+        Hist {
+            counts: Mutex::new(vec![0; 256]),
+            total: AtomicU64::new(0),
+            max: AtomicU64::new(0),
+        }
     }
 }
 
@@ -173,6 +185,11 @@ impl Hist {
     }
 
     pub fn snapshot(&self) -> (u64, u64, u64, u64) {
-        (self.percentile(50.0), self.percentile(99.0), self.percentile(99.9), self.max())
+        (
+            self.percentile(50.0),
+            self.percentile(99.0),
+            self.percentile(99.9),
+            self.max(),
+        )
     }
 }

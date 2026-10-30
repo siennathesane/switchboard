@@ -11,21 +11,26 @@ use switchboard_wire::method::Method;
 
 use crate::channel::Channel;
 use crate::channel::ChannelResult;
+use crate::methods::authorize_ch;
 use crate::methods::reply_method;
 use crate::methods::send_frame;
-use crate::methods::authorize_ch;
 use crate::methods::shard_call;
-use switchboard_core::topology::Perm;
 use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
+use switchboard_core::topology::Perm;
 
-use crate::channel::Unacked;
 use crate::channel::TxOp as ChannelTxOp;
+use crate::channel::Unacked;
 use crate::outbound::message_frames;
 use std::collections::BTreeSet;
 
 impl Channel {
-        pub(crate) async fn get(&self, node: &Arc<ClusterNode>, queue: &str, no_ack: bool) -> ChannelResult<()> {
+    pub(crate) async fn get(
+        &self,
+        node: &Arc<ClusterNode>,
+        queue: &str,
+        no_ack: bool,
+    ) -> ChannelResult<()> {
         let shard = self.queue_shard(node, queue).await?;
         let get_id = self
             .sub_counter
@@ -81,16 +86,18 @@ impl Channel {
                 }
                 Ok(())
             }
-            ShardReply::GetEmpty { .. } => {
-                send_frame(
-                    self,
-                    OutboundFrame::Method {
-                        channel,
-                        method: Method::BasicGetEmpty { cluster_id: String::new() },
+            ShardReply::GetEmpty { .. } => send_frame(
+                self,
+                OutboundFrame::Method {
+                    channel,
+                    method: Method::BasicGetEmpty {
+                        cluster_id: String::new(),
                     },
-                )
-            }
-            other => Err(BrokerError::resource_error(format!("unexpected get reply {other:?}"))),
+                },
+            ),
+            other => Err(BrokerError::resource_error(format!(
+                "unexpected get reply {other:?}"
+            ))),
         }
     }
 
@@ -183,10 +190,7 @@ impl Channel {
                 .or_default()
                 .insert(u.seq);
             if let Some(sub) = u.sub {
-                credits
-                    .entry(sub)
-                    .or_insert((u.shard, 0))
-                    .1 += 1;
+                credits.entry(sub).or_insert((u.shard, 0)).1 += 1;
             }
         }
         for ((shard, queue), seqs) in per_queue {
@@ -289,7 +293,11 @@ impl Channel {
     }
 
     /// Basic.Recover (§3.2.2): redeliver all unacknowledged messages.
-    pub(crate) async fn recover(&self, node: &Arc<ClusterNode>, _requeue: bool) -> ChannelResult<()> {
+    pub(crate) async fn recover(
+        &self,
+        node: &Arc<ClusterNode>,
+        _requeue: bool,
+    ) -> ChannelResult<()> {
         let holds: Vec<(u64, Unacked)> = {
             let inner = self.inner.lock().unwrap();
             inner

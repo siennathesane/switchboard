@@ -7,25 +7,43 @@
 //! writer task owns the write half. The only new protocol machinery in the
 //! whole crate lives here — the server side runs unmodified.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use bytes::BytesMut;
 use switchboard_server::outbound::max_body_size;
+use switchboard_wire::BasicProperties;
+use switchboard_wire::Frame;
+use switchboard_wire::FrameReader;
+use switchboard_wire::FrameType;
 use switchboard_wire::constants::reply;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::frame::PROTOCOL_HEADER;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
-use switchboard_wire::{BasicProperties, Frame, FrameReader, FrameType};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::debug;
 
-use crate::error::{ConnectError, OpError, decode_channel_close};
-use crate::types::{ConfirmOutcome, Delivery, ReturnedMessage};
+use crate::error::ConnectError;
+use crate::error::OpError;
+use crate::error::decode_channel_close;
+use crate::types::ConfirmOutcome;
+use crate::types::Delivery;
+use crate::types::ReturnedMessage;
 
 /// Budget for one handshake and one close handshake. Generous in
 /// production; shrinks with the test tempo like every other wait.

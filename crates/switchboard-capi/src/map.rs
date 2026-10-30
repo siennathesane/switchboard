@@ -2,15 +2,31 @@
 //! values (+ the thread-local message). The variant sets are frozen for
 //! 1.0 by the embedded design (§3), so this table is stable.
 
-use switchboard_embedded::{AdminError, ConnectError, OpError, StartError, StopError};
+use switchboard_embedded::AdminError;
+use switchboard_embedded::ConnectError;
+use switchboard_embedded::OpError;
+use switchboard_embedded::StartError;
+use switchboard_embedded::StopError;
 
-use crate::status::{
-    SB_ERR_ACCESS_REFUSED, SB_ERR_ADMIN_REFUSED, SB_ERR_BROKER_STOPPED, SB_ERR_CHANNEL_CLOSED,
-    SB_ERR_CONNECT_ACCESS_REFUSED, SB_ERR_CONNECTION_CLOSED, SB_ERR_FORMATION,
-    SB_ERR_INVALID_CONFIG, SB_ERR_INVALID_HANDLE, SB_ERR_IO, SB_ERR_NO_SUCH_VHOST,
-    SB_ERR_NOT_FOUND, SB_ERR_PRECONDITION_FAILED, SB_ERR_RAFT, SB_ERR_STOP_LEAVE_FAILED,
-    SB_ERR_STOP_TIMED_OUT, SB_ERR_STORAGE, SbStatus, fail,
-};
+use crate::status::SB_ERR_ACCESS_REFUSED;
+use crate::status::SB_ERR_ADMIN_REFUSED;
+use crate::status::SB_ERR_BROKER_STOPPED;
+use crate::status::SB_ERR_CHANNEL_CLOSED;
+use crate::status::SB_ERR_CONNECT_ACCESS_REFUSED;
+use crate::status::SB_ERR_CONNECTION_CLOSED;
+use crate::status::SB_ERR_FORMATION;
+use crate::status::SB_ERR_INVALID_CONFIG;
+use crate::status::SB_ERR_INVALID_HANDLE;
+use crate::status::SB_ERR_IO;
+use crate::status::SB_ERR_NO_SUCH_VHOST;
+use crate::status::SB_ERR_NOT_FOUND;
+use crate::status::SB_ERR_PRECONDITION_FAILED;
+use crate::status::SB_ERR_RAFT;
+use crate::status::SB_ERR_STOP_LEAVE_FAILED;
+use crate::status::SB_ERR_STOP_TIMED_OUT;
+use crate::status::SB_ERR_STORAGE;
+use crate::status::SbStatus;
+use crate::status::fail;
 
 pub(crate) fn start_status(e: StartError) -> SbStatus {
     match &e {

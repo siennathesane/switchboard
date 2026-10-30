@@ -19,11 +19,13 @@
 //! `tests/registry_conformance.rs` checks this table, byte for byte, against
 //! the normative method registry.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::error::CodecError;
 use crate::field::FieldTable;
-use crate::wireio::{Decoder, Encoder};
+use crate::wireio::Decoder;
+use crate::wireio::Encoder;
 
 /// Class 10: connection.
 pub const CONNECTION_CLASS_ID: u16 = 10;
@@ -48,36 +50,68 @@ pub trait AmqpArg: Sized {
 }
 
 impl AmqpArg for u8 {
-    fn encode_arg(&self, e: &mut Encoder) { e.u8(*self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.u8() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.u8(*self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.u8()
+    }
 }
 impl AmqpArg for u16 {
-    fn encode_arg(&self, e: &mut Encoder) { e.u16(*self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.u16() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.u16(*self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.u16()
+    }
 }
 impl AmqpArg for u32 {
-    fn encode_arg(&self, e: &mut Encoder) { e.u32(*self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.u32() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.u32(*self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.u32()
+    }
 }
 impl AmqpArg for u64 {
-    fn encode_arg(&self, e: &mut Encoder) { e.u64(*self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.u64() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.u64(*self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.u64()
+    }
 }
 impl AmqpArg for bool {
-    fn encode_arg(&self, e: &mut Encoder) { e.bit(*self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.bit() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.bit(*self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.bit()
+    }
 }
 impl AmqpArg for String {
-    fn encode_arg(&self, e: &mut Encoder) { e.short_str(self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.short_str() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.short_str(self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.short_str()
+    }
 }
 impl AmqpArg for Vec<u8> {
-    fn encode_arg(&self, e: &mut Encoder) { e.long_str(self); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { d.long_str() }
+    fn encode_arg(&self, e: &mut Encoder) {
+        e.long_str(self);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        d.long_str()
+    }
 }
 impl AmqpArg for FieldTable {
-    fn encode_arg(&self, e: &mut Encoder) { self.encode(e); }
-    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> { FieldTable::decode(d) }
+    fn encode_arg(&self, e: &mut Encoder) {
+        self.encode(e);
+    }
+    fn decode_arg(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        FieldTable::decode(d)
+    }
 }
 
 macro_rules! define_methods {
@@ -333,7 +367,11 @@ mod tests {
     /// method-id lead every method payload (§4.2.4).
     #[test]
     fn ids_lead_the_payload() {
-        let m = Method::QueuePurge { ticket: 0, queue: "q".into(), nowait: false };
+        let m = Method::QueuePurge {
+            ticket: 0,
+            queue: "q".into(),
+            nowait: false,
+        };
         let mut e = Encoder::new();
         m.encode(&mut e);
         let buf = e.finish();
@@ -344,7 +382,10 @@ mod tests {
     #[test]
     fn unknown_class_and_method_are_distinct_errors() {
         let mut d = Decoder::new(&[0, 99, 0, 1]);
-        assert!(matches!(Method::decode(&mut d), Err(CodecError::UnknownClass(99))));
+        assert!(matches!(
+            Method::decode(&mut d),
+            Err(CodecError::UnknownClass(99))
+        ));
 
         let mut d = Decoder::new(&[0, 50, 0, 99]);
         assert!(matches!(
@@ -376,7 +417,11 @@ mod tests {
                 locales: b"en_US".to_vec(),
             },
             Method::ExchangeUnbindOk {},
-            Method::BasicNack { delivery_tag: 1, multiple: false, requeue: true },
+            Method::BasicNack {
+                delivery_tag: 1,
+                multiple: false,
+                requeue: true,
+            },
             Method::ConfirmSelect { nowait: true },
         ];
         for m in samples {
@@ -393,25 +438,29 @@ mod tests {
     #[test]
     fn sync_and_content_flags() {
         // Synchronous requests wait for a specific reply (§3.2.1).
-        assert!(Method::QueueDeclare {
-            ticket: 0,
-            queue: String::new(),
-            passive: false,
-            durable: false,
-            exclusive: false,
-            auto_delete: false,
-            nowait: false,
-            arguments: FieldTable::new(),
-        }
-        .is_sync_request());
-        assert!(!Method::BasicPublish {
-            ticket: 0,
-            exchange: String::new(),
-            routing_key: String::new(),
-            mandatory: false,
-            immediate: false,
-        }
-        .is_sync_request());
+        assert!(
+            Method::QueueDeclare {
+                ticket: 0,
+                queue: String::new(),
+                passive: false,
+                durable: false,
+                exclusive: false,
+                auto_delete: false,
+                nowait: false,
+                arguments: FieldTable::new(),
+            }
+            .is_sync_request()
+        );
+        assert!(
+            !Method::BasicPublish {
+                ticket: 0,
+                exchange: String::new(),
+                routing_key: String::new(),
+                mandatory: false,
+                immediate: false,
+            }
+            .is_sync_request()
+        );
 
         // Content is unconditional for these four methods (§4.2.6).
         for (m, wants) in [
@@ -454,7 +503,13 @@ mod tests {
                 },
                 true,
             ),
-            (Method::BasicAck { delivery_tag: 0, multiple: false }, false),
+            (
+                Method::BasicAck {
+                    delivery_tag: 0,
+                    multiple: false,
+                },
+                false,
+            ),
         ] {
             assert_eq!(m.carries_content(), wants, "{}", m.name());
         }
@@ -467,7 +522,9 @@ mod name_tests {
 
     #[test]
     fn method_name_is_the_variant() {
-        let m = Method::ChannelOpen { out_of_band: String::new() };
+        let m = Method::ChannelOpen {
+            out_of_band: String::new(),
+        };
         assert_eq!(m.name(), "ChannelOpen");
     }
 }
@@ -482,7 +539,10 @@ mod ack_encoding_tests {
     /// interop (the Go client tears the channel down on a parse error).
     #[test]
     fn basic_ack_wire_bytes_match_the_spec() {
-        let m = Method::BasicAck { delivery_tag: 3, multiple: false };
+        let m = Method::BasicAck {
+            delivery_tag: 3,
+            multiple: false,
+        };
         let mut e = crate::wireio::Encoder::new();
         m.encode(&mut e);
         let bytes = e.finish();
@@ -495,13 +555,22 @@ mod ack_encoding_tests {
 
     #[test]
     fn basic_ack_roundtrips_with_multiple() {
-        let m = Method::BasicAck { delivery_tag: 9, multiple: true };
+        let m = Method::BasicAck {
+            delivery_tag: 9,
+            multiple: true,
+        };
         let mut e = crate::wireio::Encoder::new();
         m.encode(&mut e);
         let bytes = e.finish();
         assert_eq!(bytes[12], 0x01);
         let mut d = crate::wireio::Decoder::new(&bytes);
         let back = Method::decode(&mut d).unwrap();
-        assert_eq!(back, Method::BasicAck { delivery_tag: 9, multiple: true });
+        assert_eq!(
+            back,
+            Method::BasicAck {
+                delivery_tag: 9,
+                multiple: true
+            }
+        );
     }
 }

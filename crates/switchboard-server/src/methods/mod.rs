@@ -15,19 +15,19 @@ use std::sync::Arc;
 
 use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::ClusterNode;
-use switchboard_core::topology::Perm;
 use switchboard_core::error::BrokerError;
 use switchboard_core::model::ExchangeKind;
-use switchboard_core::topology::MetaCmd;
 use switchboard_core::shard::ShardCmd;
 use switchboard_core::shard::ShardReply;
 use switchboard_core::topology::GroupId;
+use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::Perm;
 use switchboard_wire::method::Method;
 
 use crate::channel::Channel;
-use crate::outbound::OutboundFrame;
 use crate::channel::ChannelResult;
+use crate::outbound::OutboundFrame;
 
 /// Convert a cluster error into the closest broker exception: broker-level
 mod basic;
@@ -49,7 +49,10 @@ async fn shard_call(
     shard: GroupId,
     cmd: ShardCmd,
 ) -> ChannelResult<ShardReply> {
-    let reply = node.write(shard, BrokerCommand::Shard(cmd)).await.map_err(ce)?;
+    let reply = node
+        .write(shard, BrokerCommand::Shard(cmd))
+        .await
+        .map_err(ce)?;
     tracing::debug!(node = node.id, shard, reply = ?reply, "shard_call");
     Channel::shard_reply(reply)
 }
@@ -95,11 +98,7 @@ async fn shard_call_lenient(
     const TRIES: usize = 8;
     for attempt in 0..TRIES {
         match shard_call(node, shard, cmd.clone()).await {
-            Err(e)
-                if e.code == 404
-                    && e.text.contains("on this shard")
-                    && attempt + 1 < TRIES =>
-            {
+            Err(e) if e.code == 404 && e.text.contains("on this shard") && attempt + 1 < TRIES => {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             other => return other,
@@ -112,11 +111,11 @@ async fn shard_call_lenient(
 /// reply so the acting connection immediately observes its own change
 /// (§4.4 visibility guarantee); other nodes converge on their next
 /// reconciliation tick.
-async fn meta_call(
-    node: &Arc<ClusterNode>,
-    cmd: MetaCmd,
-) -> ChannelResult<MetaReply> {
-    let reply = node.write(switchboard_cluster::META_GROUP, BrokerCommand::Meta(cmd)).await.map_err(ce)?;
+async fn meta_call(node: &Arc<ClusterNode>, cmd: MetaCmd) -> ChannelResult<MetaReply> {
+    let reply = node
+        .write(switchboard_cluster::META_GROUP, BrokerCommand::Meta(cmd))
+        .await
+        .map_err(ce)?;
     let out = Channel::meta_reply(reply)?;
     node.refresh_topology().await;
     Ok(out)
@@ -158,7 +157,11 @@ impl Channel {
     pub async fn handle(&self, node: &Arc<ClusterNode>, m: Method) -> ChannelResult<()> {
         match m {
             // ---- basic ----
-            Method::BasicQos { prefetch_size, prefetch_count, global_ } => {
+            Method::BasicQos {
+                prefetch_size,
+                prefetch_count,
+                global_,
+            } => {
                 // §3.1.7: prefetch_size windows unacknowledged BYTES,
                 // prefetch_count windows unacknowledged messages. The
                 // window applies per-consumer (global semantics affect
@@ -178,13 +181,18 @@ impl Channel {
                 nowait,
                 ..
             } => {
-                let tag = self.consume(node, &queue, &consumer_tag, no_ack, exclusive).await?;
+                let tag = self
+                    .consume(node, &queue, &consumer_tag, no_ack, exclusive)
+                    .await?;
                 if !nowait {
                     reply_method(self, Method::BasicConsumeOk { consumer_tag: tag });
                 }
                 Ok(())
             }
-            Method::BasicCancel { consumer_tag, nowait } => {
+            Method::BasicCancel {
+                consumer_tag,
+                nowait,
+            } => {
                 self.cancel(node, &consumer_tag).await?;
                 if !nowait {
                     reply_method(self, Method::BasicCancelOk { consumer_tag });
@@ -192,15 +200,19 @@ impl Channel {
                 Ok(())
             }
             Method::BasicGet { queue, no_ack, .. } => self.get(node, &queue, no_ack).await,
-            Method::BasicAck { delivery_tag, multiple } => {
-                self.ack(node, delivery_tag, multiple).await
-            }
-            Method::BasicReject { delivery_tag, requeue } => {
-                self.nack(node, delivery_tag, false, requeue).await
-            }
-            Method::BasicNack { delivery_tag, multiple, requeue } => {
-                self.nack(node, delivery_tag, multiple, requeue).await
-            }
+            Method::BasicAck {
+                delivery_tag,
+                multiple,
+            } => self.ack(node, delivery_tag, multiple).await,
+            Method::BasicReject {
+                delivery_tag,
+                requeue,
+            } => self.nack(node, delivery_tag, false, requeue).await,
+            Method::BasicNack {
+                delivery_tag,
+                multiple,
+                requeue,
+            } => self.nack(node, delivery_tag, multiple, requeue).await,
             Method::BasicRecoverAsync { requeue } => self.recover(node, requeue).await,
             Method::BasicRecover { requeue } => self.recover(node, requeue).await,
             Method::BasicPublish { .. } => {
@@ -255,7 +267,12 @@ impl Channel {
                 }
                 Ok(())
             }
-            Method::ExchangeDelete { exchange, if_unused, nowait, .. } => {
+            Method::ExchangeDelete {
+                exchange,
+                if_unused,
+                nowait,
+                ..
+            } => {
                 authorize_ch(self, node, Perm::Configure, &exchange)?;
                 meta_call(
                     node,
@@ -338,12 +355,24 @@ impl Channel {
                 };
                 authorize_ch(self, node, Perm::Configure, &name)?;
                 let (name, depth, consumers) = self
-                    .queue_declare(node, &name, passive, durable, exclusive, auto_delete, arguments)
+                    .queue_declare(
+                        node,
+                        &name,
+                        passive,
+                        durable,
+                        exclusive,
+                        auto_delete,
+                        arguments,
+                    )
                     .await?;
                 if !nowait {
                     reply_method(
                         self,
-                        Method::QueueDeclareOk { queue: name, message_count: depth, consumer_count: consumers },
+                        Method::QueueDeclareOk {
+                            queue: name,
+                            message_count: depth,
+                            consumer_count: consumers,
+                        },
                     );
                 }
                 Ok(())
@@ -400,7 +429,12 @@ impl Channel {
                 authorize_ch(self, node, Perm::Read, &queue)?;
                 let count = self.queue_purge(node, &queue).await?;
                 if !nowait {
-                    reply_method(self, Method::QueuePurgeOk { message_count: count });
+                    reply_method(
+                        self,
+                        Method::QueuePurgeOk {
+                            message_count: count,
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -414,7 +448,12 @@ impl Channel {
                 authorize_ch(self, node, Perm::Configure, &queue)?;
                 let count = self.queue_delete(node, &queue, if_unused, if_empty).await?;
                 if !nowait {
-                    reply_method(self, Method::QueueDeleteOk { message_count: count });
+                    reply_method(
+                        self,
+                        Method::QueueDeleteOk {
+                            message_count: count,
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -454,7 +493,7 @@ impl Channel {
                 let Some(tx) = inner.tx.as_mut() else {
                     return Err(
                         BrokerError::precondition_failed("channel is not transacted")
-                            .for_method(90, 30)
+                            .for_method(90, 30),
                     );
                 };
                 // Rollback drops the buffer: publishes were never sent and
@@ -488,5 +527,4 @@ impl Channel {
             .for_method(other.class_id(), other.method_id())),
         }
     }
-
 }

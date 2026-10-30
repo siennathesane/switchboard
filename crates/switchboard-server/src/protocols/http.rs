@@ -62,13 +62,21 @@ where
     } else if path == "/metrics" && method == "GET" {
         // Prometheus text exposition (v0.0.4), hand-rolled in
         // [`super::metrics`]; unauthenticated like /stats.
-        ("200 OK", "text/plain; version=0.0.4", super::metrics::render(&node))
+        (
+            "200 OK",
+            "text/plain; version=0.0.4",
+            super::metrics::render(&node),
+        )
     } else if path == "/api" || path.starts_with("/api/") {
         // Admin API (JSON, basic auth): dispatches with its own reader and
         // writer; the head has already been consumed here.
         return super::admin::serve(io, &head, node, limits).await;
     } else {
-        let body = if ok { "{\"status\":\"ok\"}".to_string() } else { "{\"status\":\"not found\"}".to_string() };
+        let body = if ok {
+            "{\"status\":\"ok\"}".to_string()
+        } else {
+            "{\"status\":\"not found\"}".to_string()
+        };
         let status = if ok { "200 OK" } else { "404 Not Found" };
         (status, "application/json", body)
     };
@@ -97,11 +105,14 @@ fn stats_json(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> String
     // Membership, not visibility: a pending node can fetch (and serve)
     // a peer's topology without having joined. Only this node's own id
     // in the directory means load may land here.
-    let joined = topo.nodes.contains_key(&node.id)
-        && !topo.vhosts.is_empty()
-        && !topo.groups.is_empty();
+    let joined =
+        topo.nodes.contains_key(&node.id) && !topo.vhosts.is_empty() && !topo.groups.is_empty();
     let accounting = node.message_accounting();
-    let voters: Vec<String> = node.meta_voter_ids().iter().map(|v| v.to_string()).collect();
+    let voters: Vec<String> = node
+        .meta_voter_ids()
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
     format!(
         concat!(
             "{{\"status\":\"ok\",\"node\":{},\"pid\":{},\"rss_kb\":{},\"fds\":{},",
@@ -128,7 +139,9 @@ pub(crate) fn proc_self_stats() -> (u64, u64) {
         .ok()
         .and_then(|s| {
             s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
-                l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
             })
         })
         .unwrap_or(0);
@@ -148,7 +161,9 @@ fn dir_size_kb(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for entry in rd.filter_map(|e| e.ok()) {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {

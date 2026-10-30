@@ -34,7 +34,12 @@ pub async fn run(
         None => None,
     };
     let listener = TcpListener::bind(addr).await?;
-    info!(addr, tls = acceptor.is_some(), ?protocols, "gateway listener up");
+    info!(
+        addr,
+        tls = acceptor.is_some(),
+        ?protocols,
+        "gateway listener up"
+    );
     loop {
         let Ok((socket, _peer)) = listener.accept().await else {
             continue;
@@ -53,8 +58,7 @@ pub async fn run(
                 tokio::spawn(async move {
                     match a.accept(socket).await {
                         Ok(tls) => {
-                            let _ =
-                                protocols::serve_client(tls, node, limits, protocols).await;
+                            let _ = protocols::serve_client(tls, node, limits, protocols).await;
                         }
                         Err(e) => warn!(err = ?e, "tls handshake failed"),
                     }

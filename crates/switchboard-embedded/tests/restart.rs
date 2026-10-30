@@ -14,10 +14,15 @@ mod support;
 
 use std::time::Duration;
 
-use switchboard_embedded::{Broker, BrokerConfig, ConsumeOptions, MessageProperties, QueueOptions};
+use switchboard_embedded::Broker;
+use switchboard_embedded::BrokerConfig;
+use switchboard_embedded::ConsumeOptions;
+use switchboard_embedded::MessageProperties;
+use switchboard_embedded::QueueOptions;
 use switchboard_wire::field::FieldTable;
 
-use support::{RESTART_PHASE_ENV, init};
+use support::RESTART_PHASE_ENV;
+use support::init;
 
 fn persistent(body: &[u8]) -> (MessageProperties, Vec<u8>) {
     let mut p = MessageProperties::default();

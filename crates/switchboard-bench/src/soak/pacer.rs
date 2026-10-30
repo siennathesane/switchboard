@@ -58,15 +58,15 @@ impl Pacer {
 mod tests {
     use super::*;
 
-#[tokio::test]
-async fn paces_at_rate() {
-    let mut p = Pacer::new(100.0); // 10ms period
-    let t0 = std::time::Instant::now();
-    p.wait().await; // immediate
-    p.wait().await; // +10ms
-    p.wait().await; // +20ms
-    let el = t0.elapsed();
-    assert!(el >= Duration::from_millis(18), "paced too fast: {el:?}");
-    assert!(el < Duration::from_secs(2), "paced too slow: {el:?}");
-}
+    #[tokio::test]
+    async fn paces_at_rate() {
+        let mut p = Pacer::new(100.0); // 10ms period
+        let t0 = std::time::Instant::now();
+        p.wait().await; // immediate
+        p.wait().await; // +10ms
+        p.wait().await; // +20ms
+        let el = t0.elapsed();
+        assert!(el >= Duration::from_millis(18), "paced too fast: {el:?}");
+        assert!(el < Duration::from_secs(2), "paced too slow: {el:?}");
+    }
 }

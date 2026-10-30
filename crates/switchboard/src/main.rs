@@ -27,7 +27,11 @@ mod backup_cmd;
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
-#[command(name = "switchboard", version, about = "Multi-master AMQP 0-9-1 broker")]
+#[command(
+    name = "switchboard",
+    version,
+    about = "Multi-master AMQP 0-9-1 broker"
+)]
 pub struct Cli {
     /// Unique node id within the cluster (1..).
     #[arg(long, env = "SWITCHBOARD_NODE_ID", default_value_t = 1)]
@@ -100,7 +104,11 @@ pub struct Cli {
 
     /// Client protocols on the gateway port, comma-separated:
     /// amqp,amqp1,mqtt,stomp,ws,http (default: all; `amqp` cannot be off).
-    #[arg(long, env = "SWITCHBOARD_PROTOCOLS", default_value = "amqp,amqp1,mqtt,stomp,ws,http")]
+    #[arg(
+        long,
+        env = "SWITCHBOARD_PROTOCOLS",
+        default_value = "amqp,amqp1,mqtt,stomp,ws,http"
+    )]
     pub protocols: String,
 
     /// DNS seed hostname whose A/AAAA records list cluster members
@@ -140,7 +148,11 @@ pub struct Cli {
     pub rpc_reply_budget_ms: u64,
 
     /// Retry budget for a membership reconfiguration: ms.
-    #[arg(long, env = "SWITCHBOARD_RECONFIGURE_BUDGET_MS", default_value_t = 5000)]
+    #[arg(
+        long,
+        env = "SWITCHBOARD_RECONFIGURE_BUDGET_MS",
+        default_value_t = 5000
+    )]
     pub reconfigure_budget_ms: u64,
 
     /// Retry budget for joining an existing cluster at startup: ms.
@@ -177,11 +189,19 @@ pub struct Cli {
     pub reap_dead_after: u32,
 
     /// Retries for a failed off-node delivery's Release write.
-    #[arg(long, env = "SWITCHBOARD_DELIVER_RELEASE_RETRIES", default_value_t = 10)]
+    #[arg(
+        long,
+        env = "SWITCHBOARD_DELIVER_RELEASE_RETRIES",
+        default_value_t = 10
+    )]
     pub deliver_release_retries: u32,
 
     /// Pause between failed off-node delivery Release retries: ms.
-    #[arg(long, env = "SWITCHBOARD_DELIVER_RELEASE_INTERVAL_MS", default_value_t = 200)]
+    #[arg(
+        long,
+        env = "SWITCHBOARD_DELIVER_RELEASE_INTERVAL_MS",
+        default_value_t = 200
+    )]
     pub deliver_release_interval_ms: u64,
 
     /// AMQP heartbeat offered to clients, in seconds (0 disables).
@@ -214,13 +234,19 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    let advertise = cli.advertise.clone().unwrap_or_else(|| cli.internal.clone());
+    let advertise = cli
+        .advertise
+        .clone()
+        .unwrap_or_else(|| cli.internal.clone());
     // Formation peers: `--peer id=addr` (repeatable) seeds the directory so
     // the initial voters can reach each other before anything is registered.
     let mut peers = Vec::new();
     for spec in &cli.peer {
         if let Some((id, addr)) = spec.split_once('=') {
-            peers.push((id.trim().parse::<u64>().expect("peer id must be u64"), addr.trim().to_string()));
+            peers.push((
+                id.trim().parse::<u64>().expect("peer id must be u64"),
+                addr.trim().to_string(),
+            ));
         }
     }
     let timeouts = switchboard_cluster::node::Timeouts {
@@ -267,8 +293,8 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::signal;
                 use tokio::signal::unix::SignalKind;
+                use tokio::signal::unix::signal;
                 let mut term = match signal(SignalKind::terminate()) {
                     Ok(s) => s,
                     Err(_) => return,
@@ -299,7 +325,6 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         });
     }
-
 
     // Self-discovery: DNS seeds / SRV records / mDNS all feed the join
     // protocol, so clusters assemble without listing every peer by hand.

@@ -117,16 +117,28 @@ mod error;
 mod types;
 
 pub use broker::Broker;
-pub use channel::{
-    ConsumeOptions, EmbeddedChannel, ExchangeDeleteOptions, ExchangeKind, ExchangeOptions,
-    QueueDeleteOptions, QueueOptions,
-};
-pub use config::{BrokerConfig, EmbeddedLimits, JoinSpec};
+pub use channel::ConsumeOptions;
+pub use channel::EmbeddedChannel;
+pub use channel::ExchangeDeleteOptions;
+pub use channel::ExchangeKind;
+pub use channel::ExchangeOptions;
+pub use channel::QueueDeleteOptions;
+pub use channel::QueueOptions;
+pub use config::BrokerConfig;
+pub use config::EmbeddedLimits;
+pub use config::JoinSpec;
 pub use conn::EmbeddedConnection;
 pub use consumer::Consumer;
-pub use error::{AdminError, ConnectError, OpError, StartError, StopError};
+pub use error::AdminError;
+pub use error::ConnectError;
+pub use error::OpError;
+pub use error::StartError;
+pub use error::StopError;
 pub use switchboard_core::topology::Permissions;
-pub use types::{
-    Arguments, ConfirmOutcome, Delivery, MessageProperties, PublishOutcome, QueueState,
-    ReturnedMessage,
-};
+pub use types::Arguments;
+pub use types::ConfirmOutcome;
+pub use types::Delivery;
+pub use types::MessageProperties;
+pub use types::PublishOutcome;
+pub use types::QueueState;
+pub use types::ReturnedMessage;

@@ -1,20 +1,36 @@
 //! `sb_config_*` and `sb_broker_*`: configuration, lifecycle, readiness,
 //! connections, typed admin, and the string free fn.
 
-use std::ffi::{CString, c_char, c_int};
+use std::ffi::CString;
+use std::ffi::c_char;
+use std::ffi::c_int;
 use std::time::Duration;
 
 use switchboard_cluster::node::Timeouts;
-use switchboard_embedded::{Broker, BrokerConfig};
+use switchboard_embedded::Broker;
+use switchboard_embedded::BrokerConfig;
 use tokio::runtime::Runtime;
 
-use crate::handles::{SbBroker, SbClient, SbConfig, as_broker, as_config};
-use crate::map::{admin_status, already_gone, connect_status, start_status, stop_status};
-use crate::message::{alloc_string, cstr};
-use crate::status::{
-    SB_ERR_INVALID_HANDLE, SB_ERR_IO, SB_ERR_NULL_ARG, SbStatus, entry_status, fail,
-};
-use crate::table::{self, Kind};
+use crate::handles::SbBroker;
+use crate::handles::SbClient;
+use crate::handles::SbConfig;
+use crate::handles::as_broker;
+use crate::handles::as_config;
+use crate::map::admin_status;
+use crate::map::already_gone;
+use crate::map::connect_status;
+use crate::map::start_status;
+use crate::map::stop_status;
+use crate::message::alloc_string;
+use crate::message::cstr;
+use crate::status::SB_ERR_INVALID_HANDLE;
+use crate::status::SB_ERR_IO;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::entry_status;
+use crate::status::fail;
+use crate::table::Kind;
+use crate::table::{self};
 
 /// The grace budget `sb_broker_free` uses when it must shut down a live
 /// broker itself (the caller skipped `sb_broker_stop`).

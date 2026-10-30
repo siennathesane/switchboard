@@ -151,6 +151,9 @@ mod tests {
             Some("2026-10-30 00:00:00 UTC".to_string())
         );
         assert_eq!(chrono_compat(u64::MAX), None, "out-of-i64-range falls back");
-        assert_eq!(humantime_or_unix_ms(u64::MAX), format!("{}ms-unix", u64::MAX));
+        assert_eq!(
+            humantime_or_unix_ms(u64::MAX),
+            format!("{}ms-unix", u64::MAX)
+        );
     }
 }

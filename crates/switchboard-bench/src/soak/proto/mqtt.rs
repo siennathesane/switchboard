@@ -22,10 +22,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
-use crate::soak::Ctx;
 
 // ---------------------------------------------------------------------
 // Packet codec (client subset)
@@ -105,17 +105,38 @@ fn pingreq() -> Vec<u8> {
 #[derive(Debug)]
 #[allow(dead_code)] // Closed is matched defensively, never constructed
 enum Ev {
-    ConnAck { session_present: bool, code: u8 },
-    SubAck { pid: u16, codes: Vec<u8> },
-    Publish { qos: u8, retain: bool, dup: bool, topic: String, pid: Option<u16>, payload: Vec<u8> },
-    PubAck { pid: u16 },
+    ConnAck {
+        session_present: bool,
+        code: u8,
+    },
+    SubAck {
+        pid: u16,
+        codes: Vec<u8>,
+    },
+    Publish {
+        qos: u8,
+        retain: bool,
+        dup: bool,
+        topic: String,
+        pid: Option<u16>,
+        payload: Vec<u8>,
+    },
+    PubAck {
+        pid: u16,
+    },
     PingResp,
     Closed,
 }
 
 /// Read one MQTT packet with a deadline.
-async fn read_ev(r: &mut (impl AsyncReadExt + Unpin), deadline: tokio::time::Instant) -> Result<Ev, String> {
-    async fn one_byte(r: &mut (impl AsyncReadExt + Unpin), deadline: tokio::time::Instant) -> Result<u8, String> {
+async fn read_ev(
+    r: &mut (impl AsyncReadExt + Unpin),
+    deadline: tokio::time::Instant,
+) -> Result<Ev, String> {
+    async fn one_byte(
+        r: &mut (impl AsyncReadExt + Unpin),
+        deadline: tokio::time::Instant,
+    ) -> Result<u8, String> {
         let mut b = [0u8; 1];
         tokio::select! {
             x = r.read(&mut b) => {
@@ -157,17 +178,27 @@ async fn read_ev(r: &mut (impl AsyncReadExt + Unpin), deadline: tokio::time::Ins
         v
     };
     match kind {
-        2 => Ok(Ev::ConnAck { session_present: buf[0] & 1 != 0, code: buf[1] }),
+        2 => Ok(Ev::ConnAck {
+            session_present: buf[0] & 1 != 0,
+            code: buf[1],
+        }),
         9 => {
             let pid = next_u16(&mut pos);
-            Ok(Ev::SubAck { pid, codes: buf[2..].to_vec() })
+            Ok(Ev::SubAck {
+                pid,
+                codes: buf[2..].to_vec(),
+            })
         }
         3 => {
             let tlen = next_u16(&mut pos) as usize;
             let topic = String::from_utf8_lossy(&buf[pos..pos + tlen]).to_string();
             pos += tlen;
             let qos = (flags >> 1) & 3;
-            let pid = if qos > 0 { Some(next_u16(&mut pos)) } else { None };
+            let pid = if qos > 0 {
+                Some(next_u16(&mut pos))
+            } else {
+                None
+            };
             Ok(Ev::Publish {
                 qos,
                 retain: flags & 1 != 0,
@@ -177,7 +208,9 @@ async fn read_ev(r: &mut (impl AsyncReadExt + Unpin), deadline: tokio::time::Ins
                 payload: buf[pos..].to_vec(),
             })
         }
-        4 => Ok(Ev::PubAck { pid: next_u16(&mut pos) }),
+        4 => Ok(Ev::PubAck {
+            pid: next_u16(&mut pos),
+        }),
         13 => Ok(Ev::PingResp),
         other => Err(format!("mqtt: unexpected packet type {other}")),
     }
@@ -218,11 +251,21 @@ async fn raw_dial(host: &str, client_id: &str, clean: bool) -> Result<MqttConn, 
     let s = TcpStream::connect(host).await.map_err(|e| e.to_string())?;
     s.set_nodelay(true).ok();
     let (mut r, mut w) = s.into_split();
-    w.write_all(&connect(client_id, clean, 60)).await.map_err(|e| e.to_string())?;
+    w.write_all(&connect(client_id, clean, 60))
+        .await
+        .map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
-    let ev = read_ev(&mut r, tokio::time::Instant::now() + Duration::from_secs(10)).await?;
+    let ev = read_ev(
+        &mut r,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await?;
     match ev {
-        Ev::ConnAck { code: 0, .. } => Ok(MqttConn { r, w, host: host.to_string() }),
+        Ev::ConnAck { code: 0, .. } => Ok(MqttConn {
+            r,
+            w,
+            host: host.to_string(),
+        }),
         Ev::ConnAck { code, .. } => Err(format!("mqtt CONNACK refused ({code})")),
         Ev::Closed => Err("mqtt closed before CONNACK".into()),
         other => Err(format!("mqtt expected CONNACK, got {other:?}")),
@@ -264,7 +307,12 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
         match read_ev(&mut c.r, soon(10)).await {
             Ok(Ev::SubAck { codes, .. }) if codes.iter().all(|&x| x != 0x80) => {}
             Ok(other) => {
-                ctx.error("mqtt", "subscribe", &c.host, format!("bad SUBACK: {other:?}"));
+                ctx.error(
+                    "mqtt",
+                    "subscribe",
+                    &c.host,
+                    format!("bad SUBACK: {other:?}"),
+                );
                 continue 'conn;
             }
             Err(e) => {
@@ -278,7 +326,10 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
         // on our own fresh subscription cycle.
         if seq == 0 {
             let body = format!("retained-{generation}").into_bytes();
-            if c.send(&publish("soak/retained", None, &body, true, false)).await.is_err() {
+            if c.send(&publish("soak/retained", None, &body, true, false))
+                .await
+                .is_err()
+            {
                 ctx.infra_bounce("mqtt", &c.host, "retained publish failed".into());
                 continue 'conn;
             }
@@ -286,7 +337,8 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
             let _ = c.send(&disconnect()).await;
             drop(c);
             generation += 1;
-            let Some(mut c2) = dial(&ctx, &format!("soak-rt-{generation}"), true, "mqtt").await else {
+            let Some(mut c2) = dial(&ctx, &format!("soak-rt-{generation}"), true, "mqtt").await
+            else {
                 return;
             };
             if c2.send(&subscribe(1, "soak/retained", 0)).await.is_err() {
@@ -296,7 +348,12 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
             match read_ev(&mut c2.r, soon(10)).await {
                 Ok(Ev::SubAck { .. }) => {}
                 Ok(other) => {
-                    ctx.error("mqtt", "subscribe", &c2.host, format!("bad SUBACK: {other:?}"));
+                    ctx.error(
+                        "mqtt",
+                        "subscribe",
+                        &c2.host,
+                        format!("bad SUBACK: {other:?}"),
+                    );
                     continue 'conn;
                 }
                 Err(e) => {
@@ -305,18 +362,42 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                 }
             }
             match read_ev(&mut c2.r, soon(10)).await {
-                Ok(Ev::Publish { retain: true, payload, .. }) if payload.starts_with(b"retained-") => {}
+                Ok(Ev::Publish {
+                    retain: true,
+                    payload,
+                    ..
+                }) if payload.starts_with(b"retained-") => {}
                 Ok(Ev::Publish { retain: true, .. }) => {
-                    ctx.error("mqtt", "retained", &c2.host, "retained payload mismatch".into());
+                    ctx.error(
+                        "mqtt",
+                        "retained",
+                        &c2.host,
+                        "retained payload mismatch".into(),
+                    );
                 }
                 Ok(Ev::Publish { retain: false, .. }) => {
-                    ctx.error("mqtt", "retained", &c2.host, "retained flag missing on retained delivery".into());
+                    ctx.error(
+                        "mqtt",
+                        "retained",
+                        &c2.host,
+                        "retained flag missing on retained delivery".into(),
+                    );
                 }
                 Ok(other) => {
-                    ctx.error("mqtt", "retained", &c2.host, format!("expected retained publish, got {other:?}"));
+                    ctx.error(
+                        "mqtt",
+                        "retained",
+                        &c2.host,
+                        format!("expected retained publish, got {other:?}"),
+                    );
                 }
                 Err(e) => {
-                    ctx.error("mqtt", "retained", &c2.host, format!("retained delivery: {e}"));
+                    ctx.error(
+                        "mqtt",
+                        "retained",
+                        &c2.host,
+                        format!("retained delivery: {e}"),
+                    );
                 }
             }
             // This connection still needs the roundtrip subscription —
@@ -328,7 +409,12 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
             match read_ev(&mut c2.r, soon(10)).await {
                 Ok(Ev::SubAck { codes, .. }) if codes.iter().all(|&x| x != 0x80) => {}
                 Ok(other) => {
-                    ctx.error("mqtt", "subscribe", &c2.host, format!("bad SUBACK: {other:?}"));
+                    ctx.error(
+                        "mqtt",
+                        "subscribe",
+                        &c2.host,
+                        format!("bad SUBACK: {other:?}"),
+                    );
                     continue 'conn;
                 }
                 Err(e) => {
@@ -349,25 +435,35 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                     }
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                        if !client::alive(&ctx) { return }
-                        // While gated, keep the session alive with pings.
-                        if c.send(&pingreq()).await.is_err() {
-                            continue 'conn;
-                        }
-                        match read_ev(&mut c.r, soon(30)).await {
-                            Ok(Ev::PingResp) | Ok(Ev::Publish { .. }) | Ok(Ev::PubAck { .. }) => {}
-                            Ok(Ev::Closed) | Err(_) => continue 'conn,
-                            Ok(other) => {
-                                ctx.error("mqtt", "ping", &c.host, format!("unexpected {other:?} while gated"));
-                            }
-                        }
-                        continue;
+                if !client::alive(&ctx) {
+                    return;
+                }
+                // While gated, keep the session alive with pings.
+                if c.send(&pingreq()).await.is_err() {
+                    continue 'conn;
+                }
+                match read_ev(&mut c.r, soon(30)).await {
+                    Ok(Ev::PingResp) | Ok(Ev::Publish { .. }) | Ok(Ev::PubAck { .. }) => {}
+                    Ok(Ev::Closed) | Err(_) => continue 'conn,
+                    Ok(other) => {
+                        ctx.error(
+                            "mqtt",
+                            "ping",
+                            &c.host,
+                            format!("unexpected {other:?} while gated"),
+                        );
+                    }
+                }
+                continue;
             }
             pacer.wait().await;
             let tag = format!("mqttrtg{generation}");
             let body = check::encode_body(&tag, seq, ctx.cfg.msg_size.min(256).max(32));
             let pid = 1u16;
-            if c.send(&publish("soak/rt/data", Some(pid), &body, false, false)).await.is_err() {
+            if c.send(&publish("soak/rt/data", Some(pid), &body, false, false))
+                .await
+                .is_err()
+            {
                 if client::consuming(&ctx) {
                     ctx.infra_bounce("mqtt", &c.host, "publish write failed".into());
                 }
@@ -381,9 +477,19 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                 match read_ev(&mut c.r, deadline).await {
                     Ok(Ev::PubAck { pid: p }) if p == pid => got_ack = true,
                     Ok(Ev::PubAck { pid: p }) => {
-                        ctx.error("mqtt", "puback", &c.host, format!("PUBACK for unsent pid {p}"));
+                        ctx.error(
+                            "mqtt",
+                            "puback",
+                            &c.host,
+                            format!("PUBACK for unsent pid {p}"),
+                        );
                     }
-                    Ok(Ev::Publish { pid: dp, payload, dup, .. }) => {
+                    Ok(Ev::Publish {
+                        pid: dp,
+                        payload,
+                        dup,
+                        ..
+                    }) => {
                         if let Some(dp) = dp {
                             let _ = c.send(&puback(dp)).await;
                         }
@@ -414,7 +520,9 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                                     "mqtt",
                                     "body",
                                     &c.host,
-                                    format!("delivered payload mismatch (want seq {seq}, got {got_seq})"),
+                                    format!(
+                                        "delivered payload mismatch (want seq {seq}, got {got_seq})"
+                                    ),
                                 );
                             }
                         } else {
@@ -429,16 +537,30 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                     Ok(Ev::PingResp) => {}
                     Ok(Ev::Closed) => {
                         if client::consuming(&ctx) {
-                            ctx.infra_bounce("mqtt", &c.host, "connection closed mid-roundtrip".into());
+                            ctx.infra_bounce(
+                                "mqtt",
+                                &c.host,
+                                "connection closed mid-roundtrip".into(),
+                            );
                         }
                         continue 'conn;
                     }
                     Err(e) => {
-                        ctx.error("mqtt", "roundtrip", &c.host, format!("{e} (waiting for PUBACK/delivery)"));
+                        ctx.error(
+                            "mqtt",
+                            "roundtrip",
+                            &c.host,
+                            format!("{e} (waiting for PUBACK/delivery)"),
+                        );
                         continue 'conn;
                     }
                     Ok(other) => {
-                        ctx.error("mqtt", "roundtrip", &c.host, format!("unexpected {other:?}"));
+                        ctx.error(
+                            "mqtt",
+                            "roundtrip",
+                            &c.host,
+                            format!("unexpected {other:?}"),
+                        );
                     }
                 }
                 if got_ack && got_msg.is_some() {
@@ -494,7 +616,12 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
         match read_ev(&mut c.r, soon(10)).await {
             Ok(Ev::SubAck { codes, .. }) if codes.iter().all(|&x| x != 0x80) => {}
             Ok(other) => {
-                ctx.error("mqtt.persist", "subscribe", &c.host, format!("bad SUBACK {other:?}"));
+                ctx.error(
+                    "mqtt.persist",
+                    "subscribe",
+                    &c.host,
+                    format!("bad SUBACK {other:?}"),
+                );
                 continue;
             }
             Err(e) => {
@@ -506,14 +633,24 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
         drop(c);
         // Publish k messages while the subscriber is offline.
         let k = 3u16;
-        let Some(mut p) = dial(&ctx, &format!("soak-pub-{cycle}"), true, "mqtt.persist").await else {
+        let Some(mut p) = dial(&ctx, &format!("soak-pub-{cycle}"), true, "mqtt.persist").await
+        else {
             return;
         };
         let mut bodies = Vec::new();
         for i in 0..k {
             let body = format!("ps-{cycle}-{i}").into_bytes();
             bodies.push(body.clone());
-            if p.send(&publish("soak/ps/offline", Some(i + 1), &body, false, false)).await.is_err() {
+            if p.send(&publish(
+                "soak/ps/offline",
+                Some(i + 1),
+                &body,
+                false,
+                false,
+            ))
+            .await
+            .is_err()
+            {
                 ctx.infra_bounce("mqtt.persist", &p.host, "offline publish failed".into());
                 break;
             }
@@ -529,7 +666,12 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
             }
         }
         if acked < k {
-            ctx.error("mqtt.persist", "publish", &p.host, format!("only {acked}/{k} offline publishes confirmed"));
+            ctx.error(
+                "mqtt.persist",
+                "publish",
+                &p.host,
+                format!("only {acked}/{k} offline publishes confirmed"),
+            );
             continue;
         }
         let _ = p.send(&disconnect()).await;
@@ -557,11 +699,20 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
                     if bodies.contains(&payload) {
                         got.push(payload);
                     } else {
-                        ctx.error("mqtt.persist", "body", &c.host, "unexpected offline payload".into());
+                        ctx.error(
+                            "mqtt.persist",
+                            "body",
+                            &c.host,
+                            "unexpected offline payload".into(),
+                        );
                     }
                 }
                 Ok(Ev::Closed) => {
-                    ctx.infra_bounce("mqtt.persist", &c.host, "closed while awaiting offline messages".into());
+                    ctx.infra_bounce(
+                        "mqtt.persist",
+                        &c.host,
+                        "closed while awaiting offline messages".into(),
+                    );
                     break;
                 }
                 Err(_) => break,
@@ -573,7 +724,11 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
                 "mqtt.persist",
                 "session",
                 &c.host,
-                format!("received {}/{} offline messages after reconnect", got.len(), k),
+                format!(
+                    "received {}/{} offline messages after reconnect",
+                    got.len(),
+                    k
+                ),
             );
         } else {
             ctx.ledger.metrics.add("mqtt.persist.cycles", 1);

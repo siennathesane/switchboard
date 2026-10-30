@@ -9,21 +9,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use switchboard_wire::field::FieldTable;
-use switchboard_wire::method::Method;
-use switchboard_wire::properties::ContentHeader;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::Frame;
 use switchboard_wire::FrameReader;
 use switchboard_wire::PROTOCOL_HEADER;
+use switchboard_wire::field::FieldTable;
+use switchboard_wire::method::Method;
+use switchboard_wire::properties::ContentHeader;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
-use crate::soak::Ctx;
 
 struct RawConn {
     r: tokio::net::tcp::OwnedReadHalf,
@@ -56,8 +56,15 @@ async fn raw_dial(host: &str) -> Result<RawConn, String> {
     let s = TcpStream::connect(host).await.map_err(|e| e.to_string())?;
     s.set_nodelay(true).ok();
     let (r, mut w) = s.into_split();
-    w.write_all(&PROTOCOL_HEADER).await.map_err(|e| e.to_string())?;
-    let mut c = RawConn { r, w, host: host.to_string(), reader: FrameReader::new() };
+    w.write_all(&PROTOCOL_HEADER)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut c = RawConn {
+        r,
+        w,
+        host: host.to_string(),
+        reader: FrameReader::new(),
+    };
     // Start.
     let (start, _) = c.expect().await?;
     match start {
@@ -79,10 +86,23 @@ async fn raw_dial(host: &str) -> Result<RawConn, String> {
     )
     .await?;
     let (tune, _) = c.expect().await?;
-    let Method::ConnectionTune { channel_max, frame_max, heartbeat } = tune else {
+    let Method::ConnectionTune {
+        channel_max,
+        frame_max,
+        heartbeat,
+    } = tune
+    else {
         return Err("expected Connection.Tune".into());
     };
-    c.send(0, &Method::ConnectionTuneOk { channel_max, frame_max, heartbeat }).await?;
+    c.send(
+        0,
+        &Method::ConnectionTuneOk {
+            channel_max,
+            frame_max,
+            heartbeat,
+        },
+    )
+    .await?;
     c.send(
         0,
         &Method::ConnectionOpen {
@@ -96,7 +116,13 @@ async fn raw_dial(host: &str) -> Result<RawConn, String> {
     let Method::ConnectionOpenOk { .. } = ok else {
         return Err("expected Connection.OpenOk".into());
     };
-    c.send(1, &Method::ChannelOpen { out_of_band: String::new() }).await?;
+    c.send(
+        1,
+        &Method::ChannelOpen {
+            out_of_band: String::new(),
+        },
+    )
+    .await?;
     let (ok, _) = c.expect().await?;
     let Method::ChannelOpenOk { .. } = ok else {
         return Err("expected Channel.OpenOk".into());
@@ -126,7 +152,9 @@ impl RawConn {
             match self.reader.next_frame(0) {
                 Ok(Some(frame)) => match frame.frame_type {
                     switchboard_wire::FrameType::Method => {
-                        let m = frame.decode_method().map_err(|e| format!("bad method: {e}"))?;
+                        let m = frame
+                            .decode_method()
+                            .map_err(|e| format!("bad method: {e}"))?;
                         if let Some(m) = content_for.take() {
                             let content =
                                 pending.map(|h| (h.properties, std::mem::take(&mut body)));
@@ -139,7 +167,9 @@ impl RawConn {
                         return Ok((m, None));
                     }
                     switchboard_wire::FrameType::Header => {
-                        let h = frame.content_header(60).map_err(|e| format!("bad header: {e}"))?;
+                        let h = frame
+                            .content_header(60)
+                            .map_err(|e| format!("bad header: {e}"))?;
                         if h.body_size == 0 {
                             let m = content_for.take().ok_or("header without method")?;
                             return Ok((m, Some((h.properties, Vec::new()))));
@@ -196,7 +226,10 @@ impl RawConn {
             1,
             &ContentHeader::new(
                 body.len() as u64,
-                BasicProperties { delivery_mode: Some(2), ..Default::default() },
+                BasicProperties {
+                    delivery_mode: Some(2),
+                    ..Default::default()
+                },
             ),
         )
         .to_bytes();
@@ -227,7 +260,9 @@ pub async fn run(ctx: Arc<Ctx>) {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
-                if !client::alive(&ctx) { return }
+                if !client::alive(&ctx) {
+                    return;
+                }
                 continue;
             }
             tokio::select! {
@@ -251,16 +286,30 @@ pub async fn run(ctx: Arc<Ctx>) {
                         acked = true;
                         break;
                     }
-                    Ok((Method::BasicReturn { reply_code, reply_text, .. }, _)) => {
+                    Ok((
+                        Method::BasicReturn {
+                            reply_code,
+                            reply_text,
+                            ..
+                        },
+                        _,
+                    )) => {
                         ctx.error(
                             "mandatory",
                             "return",
                             &c.host,
-                            format!("routable mandatory publish was returned: {reply_code} {reply_text}"),
+                            format!(
+                                "routable mandatory publish was returned: {reply_code} {reply_text}"
+                            ),
                         );
                     }
                     Ok((m, _)) => {
-                        ctx.error("mandatory", "frame", &c.host, format!("unexpected {}", m.name()));
+                        ctx.error(
+                            "mandatory",
+                            "frame",
+                            &c.host,
+                            format!("unexpected {}", m.name()),
+                        );
                     }
                     Err(e) => {
                         if client::consuming(&ctx) {
@@ -281,7 +330,10 @@ pub async fn run(ctx: Arc<Ctx>) {
             // 2. Unroutable mandatory publish: basic.return with the
             // exact body, then the confirm.
             let body2 = check::encode_body("mand", n + 1_000_000_000, 64);
-            if let Err(e) = c.publish("", &format!("soak.mand.missing{n}"), &body2, true).await {
+            if let Err(e) = c
+                .publish("", &format!("soak.mand.missing{n}"), &body2, true)
+                .await
+            {
                 if client::consuming(&ctx) {
                     ctx.infra_bounce("mandatory", &c.host, format!("publish: {e}"));
                 }
@@ -315,7 +367,12 @@ pub async fn run(ctx: Arc<Ctx>) {
                         }
                     }
                     Ok((m, _)) => {
-                        ctx.error("mandatory", "frame", &c.host, format!("unexpected {}", m.name()));
+                        ctx.error(
+                            "mandatory",
+                            "frame",
+                            &c.host,
+                            format!("unexpected {}", m.name()),
+                        );
                     }
                     Err(e) => {
                         if client::consuming(&ctx) {
@@ -333,7 +390,9 @@ pub async fn run(ctx: Arc<Ctx>) {
                     "mandatory",
                     "return.missing",
                     &c.host,
-                    format!("unroutable mandatory publish: returned={returned2} confirmed={acked2}"),
+                    format!(
+                        "unroutable mandatory publish: returned={returned2} confirmed={acked2}"
+                    ),
                 );
                 continue 'conn;
             }

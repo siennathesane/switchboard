@@ -6,12 +6,18 @@ mod support;
 
 use std::time::Duration;
 
-use gateway_support::{start_gateway, with_timeout};
+use gateway_support::start_gateway;
+use gateway_support::with_timeout;
 use switchboard_server::protocols::ProtocolConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Tests boot full brokers; serialize them like the other suites.
@@ -31,11 +37,16 @@ async fn ws_upgrade_without_key_is_rejected() {
     let (addr, _node) = start_gateway(Default::default()).await;
     let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
     // Missing Sec-WebSocket-Key: the upgrade cannot be answered.
-    sock.write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+    sock.write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n")
+        .await
+        .unwrap();
     let mut buf = vec![0u8; 1024];
     let n = with_timeout(sock.read(&mut buf), 30).await.unwrap_or(0);
     let text = String::from_utf8_lossy(&buf[..n]);
-    assert!(text.contains("400") || n == 0, "expected rejection, got {text:?}");
+    assert!(
+        text.contains("400") || n == 0,
+        "expected rejection, got {text:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -55,7 +66,10 @@ async fn ws_no_hint_sniff_routes_amqp10_from_split_frames() {
     // The amqp10 server answers with SASL mechanisms inside WS frames.
     let mut buf = vec![0u8; 512];
     let n = with_timeout(sock.read(&mut buf), 30).await.unwrap();
-    assert!(n > 2 && buf[0] & 0x0F == 0x2, "binary frame with sasl-mechanisms, got {buf:?}");
+    assert!(
+        n > 2 && buf[0] & 0x0F == 0x2,
+        "binary frame with sasl-mechanisms, got {buf:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -80,7 +94,10 @@ async fn ws_no_hint_sniff_routes_mqtt() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_disabled_inner_protocol_closes_quietly() {
     let _g = lock().await;
-    let cfg = ProtocolConfig { mqtt: false, ..Default::default() };
+    let cfg = ProtocolConfig {
+        mqtt: false,
+        ..Default::default()
+    };
     let (addr, _node) = gw_custom(cfg).await;
     let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let req = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
@@ -107,7 +124,6 @@ async fn ws_disabled_inner_protocol_closes_quietly() {
         Ok(Err(e)) => panic!("read error {e}"),
     }
 }
-
 
 /// Read until the end of the HTTP 101 response head.
 async fn read_http_head(sock: &mut tokio::net::TcpStream) {
@@ -167,7 +183,10 @@ async fn ws_sniff_rejects_ftp_style_garbage_and_amqp091() {
         send_masked(&mut sock, payload).await.unwrap();
         // The connection ends without serving anything.
         let mut buf = [0u8; 128];
-        let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await.unwrap().unwrap_or(0);
+        let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap_or(0);
         assert_eq!(n, 0, "unroutable sniff must close, got {buf:?}");
     }
 }

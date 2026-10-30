@@ -12,10 +12,17 @@ use std::collections::BTreeSet;
 
 use switchboard_wire::BasicProperties;
 
-use support::{
-    basic_get, connect_and_open, declare_queue_everywhere, free_port, publish, spawn_client_accepts,
-    start_broker_node, start_cluster, teardown_cluster, wait_until, TestClient,
-};
+use support::TestClient;
+use support::basic_get;
+use support::connect_and_open;
+use support::declare_queue_everywhere;
+use support::free_port;
+use support::publish;
+use support::spawn_client_accepts;
+use support::start_broker_node;
+use support::start_cluster;
+use support::teardown_cluster;
+use support::wait_until;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_autoscales_up_from_3_to_9_nodes() {
@@ -26,9 +33,17 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
     // to prove placement is stable while the layout grows.
     let mut admin = connect_and_open(&addrs[0], "/").await.expect("open admin");
     declare_queue_everywhere(&mut admin, &nodes, "pinned").await;
-    publish(&mut admin, 1, "", "pinned", &BasicProperties::new(), b"early", false)
-        .await
-        .unwrap();
+    publish(
+        &mut admin,
+        1,
+        "",
+        "pinned",
+        &BasicProperties::new(),
+        b"early",
+        false,
+    )
+    .await
+    .unwrap();
 
     for id in 4..=9u64 {
         // Boot the joiner wired to the running cluster.
@@ -65,17 +80,17 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
         // joiner as a member, and every node agrees on it.
         let ok = wait_until(
             || {
-                nodes.iter().all(|n| {
-                    n.topology()
-                        .groups
-                        .values()
-                        .any(|m| m.contains(&id))
-                })
+                nodes
+                    .iter()
+                    .all(|n| n.topology().groups.values().any(|m| m.contains(&id)))
             },
             60,
         )
         .await;
-        assert!(ok, "join {id}: layout was never extended to cover the joiner");
+        assert!(
+            ok,
+            "join {id}: layout was never extended to cover the joiner"
+        );
 
         // Voter-cap invariant after the reconfiguration.
         for (g, members) in &nodes[0].topology().groups {
@@ -92,13 +107,23 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
         // queue, publishes, and the message is retrievable from node 1.
         // (Plain publishes are fire-and-forget — §4.2 — so the consumer
         // polls until the write resolves.)
-        let mut jc = connect_and_open(&addrs[id as usize - 1], "/").await.expect("open joiner");
+        let mut jc = connect_and_open(&addrs[id as usize - 1], "/")
+            .await
+            .expect("open joiner");
         let queue = format!("q{id}");
         declare_queue_everywhere(&mut jc, &nodes, &queue).await;
         let body = format!("from-{id}");
-        publish(&mut jc, 1, "", &queue, &BasicProperties::new(), body.as_bytes(), false)
-            .await
-            .unwrap();
+        publish(
+            &mut jc,
+            1,
+            "",
+            &queue,
+            &BasicProperties::new(),
+            body.as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
         get_eventually(&mut admin, &queue, body.as_bytes()).await;
 
         // Coverage invariant: every registered node sits in ≥1 group.
@@ -112,9 +137,17 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
     // Final state: 9 nodes, and every one of them still serves writes.
     assert_eq!(nodes.len(), 9);
     let mut last = connect_and_open(&addrs[8], "/").await.expect("open last");
-    publish(&mut last, 1, "", "pinned", &BasicProperties::new(), b"final", false)
-        .await
-        .unwrap();
+    publish(
+        &mut last,
+        1,
+        "",
+        "pinned",
+        &BasicProperties::new(),
+        b"final",
+        false,
+    )
+    .await
+    .unwrap();
     get_eventually(&mut admin, "pinned", b"early").await;
     get_eventually(&mut admin, "pinned", b"final").await;
 

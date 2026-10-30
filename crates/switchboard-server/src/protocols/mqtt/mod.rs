@@ -16,9 +16,9 @@
 
 pub mod packet;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -42,11 +42,13 @@ async fn set_retained(ctx: &Arc<BridgeContext>, topic: &str, message: Option<Sto
         .node
         .write(
             switchboard_cluster::META_GROUP,
-            switchboard_cluster::BrokerCommand::Meta(switchboard_core::topology::MetaCmd::SetRetained {
-                vhost: ctx.vhost.clone(),
-                topic: topic.to_string(),
-                message,
-            }),
+            switchboard_cluster::BrokerCommand::Meta(
+                switchboard_core::topology::MetaCmd::SetRetained {
+                    vhost: ctx.vhost.clone(),
+                    topic: topic.to_string(),
+                    message,
+                },
+            ),
         )
         .await;
     ctx.node.refresh_topology().await;
@@ -69,7 +71,13 @@ fn matching_retained(ctx: &BridgeContext, filter: &str) -> Vec<(String, StoredMe
 pub fn session_queue_name(client_id: &str) -> String {
     let safe: String = client_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("mqtt-session-{safe}")
 }
@@ -87,7 +95,13 @@ struct SubEntry {
 fn mqtt_to_amqp_filter(filter: &str) -> String {
     filter
         .split('/')
-        .map(|level| if level == "+" { "*".to_string() } else { level.to_string() })
+        .map(|level| {
+            if level == "+" {
+                "*".to_string()
+            } else {
+                level.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -115,8 +129,13 @@ where
     let (mut reader, mut writer) = tokio::io::split(io);
 
     // ---- CONNECT (must be the first packet) ----
-    let Some(Packet::Connect { clean_session, keep_alive, username, password, client_id }) =
-        self::packet::read_packet(&mut reader).await?
+    let Some(Packet::Connect {
+        clean_session,
+        keep_alive,
+        username,
+        password,
+        client_id,
+    }) = self::packet::read_packet(&mut reader).await?
     else {
         return Ok(()); // hung up, or spoke before CONNECT
     };
@@ -134,7 +153,10 @@ where
     .await;
     if let Err(e) = auth {
         // 4 = bad user name or password.
-        let nack = Out::ConnAck { session_present: false, code: 4 };
+        let nack = Out::ConnAck {
+            session_present: false,
+            code: 4,
+        };
         let _ = writer.write_all(&nack.encode()).await;
         let _ = writer.flush().await;
         tracing::debug!(err = %e, "mqtt: auth failed");
@@ -168,7 +190,13 @@ where
         .unwrap_or(false);
 
     writer
-        .write_all(&Out::ConnAck { session_present, code: 0 }.encode())
+        .write_all(
+            &Out::ConnAck {
+                session_present,
+                code: 0,
+            }
+            .encode(),
+        )
         .await?;
     writer.flush().await?;
 
@@ -264,7 +292,8 @@ where
                 if let Some((consumer, seq)) = outbound_rec.remove(&packet_id) {
                     outbound_comp.insert(packet_id, (consumer.clone(), seq));
                     let rel = Out::PubRel { packet_id };
-                    if writer.write_all(&rel.encode()).await.is_err() || writer.flush().await.is_err()
+                    if writer.write_all(&rel.encode()).await.is_err()
+                        || writer.flush().await.is_err()
                     {
                         break Ok(());
                     }
@@ -274,7 +303,8 @@ where
                 // Inbound qos2: the handshake completes; nothing to undo.
                 inbound_qos2.remove(&packet_id);
                 let comp = Out::PubComp { packet_id };
-                if writer.write_all(&comp.encode()).await.is_err() || writer.flush().await.is_err() {
+                if writer.write_all(&comp.encode()).await.is_err() || writer.flush().await.is_err()
+                {
                     break Ok(());
                 }
             }
@@ -284,7 +314,13 @@ where
                     let _ = consumer.ack(&node, seq).await;
                 }
             }
-            Packet::Publish { qos, retain, topic, packet_id, payload } => {
+            Packet::Publish {
+                qos,
+                retain,
+                topic,
+                packet_id,
+                payload,
+            } => {
                 let amqp_rk = topic.replace('/', ".");
                 let duplicate = qos == 2 && inbound_qos2.contains_key(&packet_id.unwrap_or(0));
                 if !duplicate {
@@ -356,7 +392,9 @@ where
                 }
                 // SUBACK first (the ack acknowledges the subscription),
                 // then any retained messages for the fresh filters.
-                writer.write_all(&Out::SubAck { packet_id, codes }.encode()).await?;
+                writer
+                    .write_all(&Out::SubAck { packet_id, codes }.encode())
+                    .await?;
                 writer.flush().await?;
                 for (filter, _) in &filters {
                     for (topic, msg) in matching_retained(&ctx, filter) {
@@ -385,7 +423,9 @@ where
                         cleanup_consumer(&ctx, &e.consumer, session_queue.is_none()).await;
                     }
                 }
-                writer.write_all(&Out::UnsubAck { packet_id }.encode()).await?;
+                writer
+                    .write_all(&Out::UnsubAck { packet_id }.encode())
+                    .await?;
                 writer.flush().await?;
             }
         }
@@ -408,7 +448,10 @@ async fn subscribe_one(
     qos: u8,
     session_queue: Option<&str>,
     subs: &mut HashMap<u64, SubEntry>,
-    merged_tx: &tokio::sync::mpsc::UnboundedSender<(shared::SubscriptionId2, switchboard_cluster::Delivery)>,
+    merged_tx: &tokio::sync::mpsc::UnboundedSender<(
+        shared::SubscriptionId2,
+        switchboard_cluster::Delivery,
+    )>,
 ) -> Result<(), switchboard_core::error::BrokerError> {
     let local = ctx.next_sub();
     let queue = match session_queue {
@@ -454,7 +497,12 @@ async fn subscribe_one(
     });
     subs.insert(
         local.0,
-        SubEntry { local, filter: filter.to_string(), qos: qos.min(2), consumer },
+        SubEntry {
+            local,
+            filter: filter.to_string(),
+            qos: qos.min(2),
+            consumer,
+        },
     );
     Ok(())
 }

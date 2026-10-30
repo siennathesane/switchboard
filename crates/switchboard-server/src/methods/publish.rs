@@ -8,24 +8,24 @@ use switchboard_wire::method::Method;
 
 use crate::channel::Channel;
 use crate::channel::ChannelResult;
+use crate::methods::authorize_ch;
 use crate::methods::inner_vhost;
 use crate::methods::send_frame;
-use crate::methods::authorize_ch;
 use crate::methods::shard_call;
-use switchboard_core::topology::Perm;
 use crate::methods::shard_call_lenient;
 use crate::methods::take_confirm_seq;
 use crate::outbound::OutboundFrame;
+use switchboard_core::topology::Perm;
 
-use switchboard_wire::BasicProperties;
 use crate::channel::TxOp as ChannelTxOp;
-use switchboard_core::routing::route;
-use switchboard_core::topology::VhostView;
-use switchboard_core::shard::ShardReply;
 use crate::outbound::message_frames;
+use switchboard_core::routing::route;
+use switchboard_core::shard::ShardReply;
+use switchboard_core::topology::VhostView;
+use switchboard_wire::BasicProperties;
 
 impl Channel {
-        pub async fn publish(
+    pub async fn publish(
         &self,
         node: &Arc<ClusterNode>,
         method: Method,
@@ -39,7 +39,12 @@ impl Channel {
                 mandatory,
                 immediate,
                 ..
-            } => (exchange.clone(), routing_key.clone(), *mandatory, *immediate),
+            } => (
+                exchange.clone(),
+                routing_key.clone(),
+                *mandatory,
+                *immediate,
+            ),
             _ => {
                 return Err(BrokerError {
                     code: switchboard_wire::constants::reply::UNEXPECTED_FRAME,
@@ -47,7 +52,7 @@ impl Channel {
                     level: switchboard_core::error::Level::Connection,
                     class_id: 0,
                     method_id: 0,
-                })
+                });
             }
         };
 
@@ -82,8 +87,12 @@ impl Channel {
         let deadline = tokio::time::Instant::now()
             + switchboard_core::tempo::scale(Duration::from_millis(750));
         let (vhost, destinations) = loop {
-            let destinations =
-                route(&VhostView { vhost: &vhost }, &exchange, &routing_key, &props);
+            let destinations = route(
+                &VhostView { vhost: &vhost },
+                &exchange,
+                &routing_key,
+                &props,
+            );
             if !destinations.is_empty() || tokio::time::Instant::now() >= deadline {
                 break (vhost, destinations);
             }
@@ -118,16 +127,31 @@ impl Channel {
 
         // immediate: every destination needs an active consumer right now.
         if immediate {
-            let Some(first) = topo.vhosts.get(&inner_vhost(self)).and_then(|v| v.queues.get(&destinations[0])) else {
-                return Err(BrokerError::not_found(format!("no queue {:?}", destinations[0])).channel_level());
+            let Some(first) = topo
+                .vhosts
+                .get(&inner_vhost(self))
+                .and_then(|v| v.queues.get(&destinations[0]))
+            else {
+                return Err(
+                    BrokerError::not_found(format!("no queue {:?}", destinations[0]))
+                        .channel_level(),
+                );
             };
             let stats = shard_call(
                 node,
                 first.shard,
-                ShardCmd::Stats { queue: destinations[0].clone() },
+                ShardCmd::Stats {
+                    queue: destinations[0].clone(),
+                },
             )
             .await?;
-            let empty = matches!(&stats, ShardReply::Stats { consumer_count: 0, .. });
+            let empty = matches!(
+                &stats,
+                ShardReply::Stats {
+                    consumer_count: 0,
+                    ..
+                }
+            );
             if empty {
                 self.return_message(312, "NO_CONSUMERS", &exchange, &routing_key, props, body)
                     .await?;
@@ -136,19 +160,17 @@ impl Channel {
             }
         }
 
-        let message = crate::channel::stored_message(
-            exchange.clone(),
-            routing_key.clone(),
-            props,
-            body,
-        );
+        let message =
+            crate::channel::stored_message(exchange.clone(), routing_key.clone(), props, body);
 
         // In tx mode the publishes join the transaction buffer (§2.2.9);
         // confirms fire at commit.
         let in_tx = self.inner.lock().unwrap().tx.is_some();
         if in_tx {
             let mut inner = self.inner.lock().unwrap();
-            let Some(tx) = inner.tx.as_mut() else { return Ok(()) };
+            let Some(tx) = inner.tx.as_mut() else {
+                return Ok(());
+            };
             for q in &destinations {
                 let Some(shard) = vhost.queues.get(q).map(|qi| qi.shard) else {
                     continue;
@@ -184,13 +206,9 @@ impl Channel {
                 .cloned()
                 .collect();
             if multi.len() > 1 {
-                node.fanout_publish(
-                    inner_vhost(self).to_string(),
-                    message.clone(),
-                    multi,
-                )
-                .await
-                .map_err(crate::methods::ce)?;
+                node.fanout_publish(inner_vhost(self).to_string(), message.clone(), multi)
+                    .await
+                    .map_err(crate::methods::ce)?;
                 self.confirm_fire(confirm_seq);
                 return Ok(());
             }
@@ -218,12 +236,13 @@ impl Channel {
     pub(crate) fn confirm_fire(&self, seq: u64) {
         let inner = self.inner.lock().unwrap();
         if inner.confirm.is_some() {
-            let _ = self
-                .outbound
-                .send(OutboundFrame::Method {
-                    channel: self.id,
-                    method: Method::BasicAck { delivery_tag: seq, multiple: false },
-                });
+            let _ = self.outbound.send(OutboundFrame::Method {
+                channel: self.id,
+                method: Method::BasicAck {
+                    delivery_tag: seq,
+                    multiple: false,
+                },
+            });
         }
     }
 

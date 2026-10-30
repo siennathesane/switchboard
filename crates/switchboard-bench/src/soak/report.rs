@@ -45,7 +45,11 @@ fn rate_of(snapshot: &[(String, u64)], name: &str) -> Option<f64> {
     let r = match p.get(name) {
         Some((old, at)) => {
             let dt = at.elapsed().as_secs_f64();
-            if dt > 0.2 { Some((now.saturating_sub(*old)) as f64 / dt) } else { None }
+            if dt > 0.2 {
+                Some((now.saturating_sub(*old)) as f64 / dt)
+            } else {
+                None
+            }
         }
         None => None,
     };
@@ -91,10 +95,8 @@ fn humantime_dur(d: Duration) -> String {
 /// Final human summary + machine JSON.
 pub async fn print_final(ctx: &Ctx, rep: &SoakReport) {
     let snap = ctx.ledger.metrics.snapshot();
-    let totals: serde_json::Map<String, serde_json::Value> = snap
-        .iter()
-        .map(|(k, v)| (k.clone(), json!(v)))
-        .collect();
+    let totals: serde_json::Map<String, serde_json::Value> =
+        snap.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
 
     println!();
     println!("================================================================");
@@ -115,14 +117,20 @@ pub async fn print_final(ctx: &Ctx, rep: &SoakReport) {
             println!("  [{}/{}] {}: {}", e.workload, e.kind, e.host, e.detail);
         }
         if rep.error_total > rep.errors.len() as u64 {
-            println!("  ... {} more suppressed (totals exact)", rep.error_total - rep.errors.len() as u64);
+            println!(
+                "  ... {} more suppressed (totals exact)",
+                rep.error_total - rep.errors.len() as u64
+            );
         }
     }
     let failed: Vec<&Check> = rep.reconcile.iter().filter(|c| !c.ok).collect();
     if !failed.is_empty() {
         println!(" failed reconciliation checks:");
         for c in failed {
-            println!("  {}: confirmed {} != delivered {}", c.name, c.expected, c.delivered);
+            println!(
+                "  {}: confirmed {} != delivered {}",
+                c.name, c.expected, c.delivered
+            );
         }
     }
     if !rep.notes.is_empty() {

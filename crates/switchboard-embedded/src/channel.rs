@@ -13,11 +13,17 @@ use std::sync::Arc;
 
 use switchboard_wire::method::Method;
 
-use crate::driver::{ChannelShared, call, publish_bytes, send_bytes};
+use crate::driver::ChannelShared;
+use crate::driver::call;
+use crate::driver::publish_bytes;
+use crate::driver::send_bytes;
 use crate::error::OpError;
-use crate::types::{
-    Arguments, ConfirmOutcome, Delivery, MessageProperties, PublishOutcome, QueueState,
-};
+use crate::types::Arguments;
+use crate::types::ConfirmOutcome;
+use crate::types::Delivery;
+use crate::types::MessageProperties;
+use crate::types::PublishOutcome;
+use crate::types::QueueState;
 
 /// Queue properties selected at declare time (§2.1.4.1). Builder-style;
 /// all fields default false/empty.

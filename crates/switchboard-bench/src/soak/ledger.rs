@@ -19,13 +19,13 @@
 //!   duplication, and corruption checks still apply in full.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 /// Maximum number of errors recorded verbatim; beyond this, per-key
 /// counts keep the totals exact while the report stays readable.

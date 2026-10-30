@@ -100,7 +100,13 @@ where
     let mut body = embedded.to_vec();
     if content_length > 0 {
         if content_length > MAX_BODY {
-            let _ = respond(&mut io, "413 Payload Too Large", None, "{\"error\":\"body too large\"}").await;
+            let _ = respond(
+                &mut io,
+                "413 Payload Too Large",
+                None,
+                "{\"error\":\"body too large\"}",
+            )
+            .await;
             return Ok(());
         }
         if body.len() < content_length {
@@ -127,7 +133,15 @@ where
         .map(percent_decode)
         .collect();
 
-    let outcome = dispatch(&node, &limits, &method, &segments, auth_header.as_deref(), &body).await;
+    let outcome = dispatch(
+        &node,
+        &limits,
+        &method,
+        &segments,
+        auth_header.as_deref(),
+        &body,
+    )
+    .await;
     let (status, extra, json) = match outcome {
         Ok(v) => ("200 OK", None, v),
         Err(ApiError::Unauthorized) => (
@@ -135,15 +149,21 @@ where
             Some("WWW-Authenticate: Basic realm=\"switchboard-admin\""),
             "{\"error\":\"authentication required\"}".to_string(),
         ),
-        Err(ApiError::Forbidden(msg)) => {
-            ("403 Forbidden", None, serde_json::json!({"error": msg}).to_string())
-        }
-        Err(ApiError::NotFound(msg)) => {
-            ("404 Not Found", None, serde_json::json!({"error": msg}).to_string())
-        }
-        Err(ApiError::BadRequest(msg)) => {
-            ("400 Bad Request", None, serde_json::json!({"error": msg}).to_string())
-        }
+        Err(ApiError::Forbidden(msg)) => (
+            "403 Forbidden",
+            None,
+            serde_json::json!({"error": msg}).to_string(),
+        ),
+        Err(ApiError::NotFound(msg)) => (
+            "404 Not Found",
+            None,
+            serde_json::json!({"error": msg}).to_string(),
+        ),
+        Err(ApiError::BadRequest(msg)) => (
+            "400 Bad Request",
+            None,
+            serde_json::json!({"error": msg}).to_string(),
+        ),
         Err(ApiError::MethodNotAllowed(msg)) => (
             "405 Method Not Allowed",
             None,
@@ -171,9 +191,15 @@ async fn dispatch(
 ) -> Result<String, ApiError> {
     // ---- authentication (HTTP basic) ----
     let (user, pass) = parse_basic_auth(auth_header).ok_or(ApiError::Unauthorized)?;
-    super::shared::authorize(node, &user, &pass, limits.peer_ip, limits.allow_remote_guest)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
+    super::shared::authorize(
+        node,
+        &user,
+        &pass,
+        limits.peer_ip,
+        limits.allow_remote_guest,
+    )
+    .await
+    .map_err(|_| ApiError::Unauthorized)?;
 
     // ---- authorization: the control plane is for UNRESTRICTED users ----
     if node.topology().permissions.contains_key(&user) {
@@ -243,7 +269,9 @@ fn header_value(head: &[u8], name: &str) -> Option<String> {
     let end = find_head_terminator(head).unwrap_or(head.len());
     let text = String::from_utf8_lossy(&head[..end]);
     for line in text.split("\r\n").skip(1) {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case(name) {
             return Some(v.to_string());
         }
@@ -342,7 +370,9 @@ async fn meta_write(node: &Arc<ClusterNode>, cmd: MetaCmd) -> Result<MetaReply, 
     match broker_reply {
         BrokerReply::Meta(r) => Ok(r),
         BrokerReply::Error(e) => Err(ApiError::from_broker(e)),
-        other => Err(ApiError::Internal(format!("unexpected meta reply {other:?}"))),
+        other => Err(ApiError::Internal(format!(
+            "unexpected meta reply {other:?}"
+        ))),
     }
 }
 
@@ -515,7 +545,14 @@ async fn put_user(node: &Arc<ClusterNode>, name: &str, body: &[u8]) -> Result<St
         .to_string();
     // CreateUser inserts or replaces the stored (hashed) credential: the
     // meta SM's create path is the password-rotate path too.
-    meta_write_then_refresh(node, MetaCmd::CreateUser { name: name.into(), password }).await?;
+    meta_write_then_refresh(
+        node,
+        MetaCmd::CreateUser {
+            name: name.into(),
+            password,
+        },
+    )
+    .await?;
     Ok(serde_json::json!({"name": name, "status": "ok"}).to_string())
 }
 
@@ -608,10 +645,16 @@ mod tests {
     #[test]
     fn header_lookup_is_case_insensitive() {
         let head = b"GET /api/users HTTP/1.1\r\nHost: x\r\naUtHoRiZaTiOn: Basic abc\r\n\r\n";
-        assert_eq!(header_value(head, "authorization").as_deref(), Some(" Basic abc"));
+        assert_eq!(
+            header_value(head, "authorization").as_deref(),
+            Some(" Basic abc")
+        );
         assert_eq!(header_value(head, "content-length"), None);
         let head2 = b"PUT /api/users HTTP/1.1\r\nContent-Length: 25\r\n\r\n";
-        assert_eq!(header_value(head2, "CONTENT-LENGTH").as_deref(), Some(" 25"));
+        assert_eq!(
+            header_value(head2, "CONTENT-LENGTH").as_deref(),
+            Some(" 25")
+        );
     }
 
     #[test]
@@ -644,7 +687,10 @@ mod tests {
         assert_eq!(parse_basic_auth(Some("Bearer xyz")), None);
         assert_eq!(parse_basic_auth(None), None);
         assert_eq!(parse_basic_auth(Some("Basic !notbase64!")), None);
-        assert_eq!(parse_basic_auth(Some(&format!("Basic {}", b64(":pw")))), None);
+        assert_eq!(
+            parse_basic_auth(Some(&format!("Basic {}", b64(":pw")))),
+            None
+        );
         // The raw header value carries the colon's trailing space.
         assert_eq!(
             parse_basic_auth(Some(&format!(" Basic {}", b64("u:p")))),

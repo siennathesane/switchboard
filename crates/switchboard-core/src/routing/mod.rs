@@ -6,10 +6,13 @@
 //! block on the meta leader, mirroring how real brokers treat the binding
 //! table as eventually-consistent routing configuration.
 
-use crate::model::{Binding, Exchange, ExchangeKind};
+use crate::model::Binding;
+use crate::model::Exchange;
+use crate::model::ExchangeKind;
 use crate::topic;
-use switchboard_wire::field::{FieldValue, FieldTable};
 use switchboard_wire::BasicProperties;
+use switchboard_wire::field::FieldTable;
+use switchboard_wire::field::FieldValue;
 
 /// Everything routing needs from the topology.
 pub trait TopologyView {
@@ -85,8 +88,7 @@ fn expand_routes<T: TopologyView + ?Sized>(
             if visited.iter().any(|v| v == &b.queue) {
                 continue; // cycle guard
             }
-            let binding_matched =
-                binding_matches(ex, b, routing_key, properties);
+            let binding_matched = binding_matches(ex, b, routing_key, properties);
             if binding_matched {
                 visited.push(b.queue.clone());
                 expand_routes(
@@ -183,10 +185,15 @@ mod tests {
 
     impl FakeTopo {
         fn new() -> Self {
-            FakeTopo { exchanges: BTreeMap::new(), bindings: Vec::new(), queues: Vec::new() }
+            FakeTopo {
+                exchanges: BTreeMap::new(),
+                bindings: Vec::new(),
+                queues: Vec::new(),
+            }
         }
         fn ex(mut self, name: &str, kind: ExchangeKind) -> Self {
-            self.exchanges.insert(name.into(), exchange(name, kind, false));
+            self.exchanges
+                .insert(name.into(), exchange(name, kind, false));
             self
         }
         fn bind(mut self, ex: &str, q: &str, key: &str) -> Self {
@@ -261,10 +268,17 @@ mod tests {
 
     #[test]
     fn unknown_exchange_and_missing_queues_drop() {
-        let topo = FakeTopo::new().ex("d", ExchangeKind::Direct).bind("d", "gone", "k");
+        let topo = FakeTopo::new()
+            .ex("d", ExchangeKind::Direct)
+            .bind("d", "gone", "k");
         assert!(route(&topo, "missing", "k", &props()).is_empty());
         // Queue "gone" is not in the queue list: binding is dead.
-        let topo = FakeTopo { queues: vec![], ..FakeTopo::new().ex("d", ExchangeKind::Direct).bind("d", "gone", "k") };
+        let topo = FakeTopo {
+            queues: vec![],
+            ..FakeTopo::new()
+                .ex("d", ExchangeKind::Direct)
+                .bind("d", "gone", "k")
+        };
         assert!(route(&topo, "d", "k", &props()).is_empty());
     }
 
@@ -353,7 +367,8 @@ mod tests {
 #[cfg(test)]
 mod e2e_exchange_tests {
     use super::*;
-    use crate::model::{Exchange, ExchangeKind};
+    use crate::model::Exchange;
+    use crate::model::ExchangeKind;
     use switchboard_wire::field::FieldTable;
 
     struct Vw {
@@ -408,7 +423,11 @@ mod e2e_exchange_tests {
         .into_iter()
         .collect();
         let queues = [("final-q".to_string(), ())].into_iter().collect();
-        Vw { exchanges, bindings, queues }
+        Vw {
+            exchanges,
+            bindings,
+            queues,
+        }
     }
 
     #[test]
@@ -423,7 +442,10 @@ mod e2e_exchange_tests {
     fn exchange_cycle_terminates() {
         let mut v = vw();
         // src → dst and dst → src (cycle), plus a real queue on dst.
-        v.bindings.get_mut("dst").unwrap().push(b("dst", "src", "k"));
+        v.bindings
+            .get_mut("dst")
+            .unwrap()
+            .push(b("dst", "src", "k"));
         let props = BasicProperties::new();
         assert_eq!(route(&v, "src", "k", &props), vec!["final-q".to_string()]);
     }
@@ -441,7 +463,8 @@ mod e2e_exchange_tests {
 #[cfg(test)]
 mod headers_binding_tests {
     use super::*;
-    use switchboard_wire::field::{FieldValue, FieldTable};
+    use switchboard_wire::field::FieldTable;
+    use switchboard_wire::field::FieldValue;
 
     fn ex_headers() -> Exchange {
         Exchange {
@@ -472,7 +495,12 @@ mod headers_binding_tests {
     }
 
     fn bind(args: FieldTable) -> Binding {
-        Binding { exchange: "h".into(), queue: "q".into(), routing_key: String::new(), arguments: args }
+        Binding {
+            exchange: "h".into(),
+            queue: "q".into(),
+            routing_key: String::new(),
+            arguments: args,
+        }
     }
 
     #[test]
@@ -485,14 +513,20 @@ mod headers_binding_tests {
         let mut msg_headers = FieldTable::new();
         msg_headers.insert("a", FieldValue::LongString(b"1".to_vec()));
         msg_headers.insert("b", FieldValue::LongString(b"anything".to_vec()));
-        let props = BasicProperties { headers: Some(msg_headers), ..BasicProperties::new() };
+        let props = BasicProperties {
+            headers: Some(msg_headers),
+            ..BasicProperties::new()
+        };
         assert!(binding_matches(&ex, &bind(args.clone()), "rk", &props));
 
         // Wrong value for a → no match.
         let mut wrong = FieldTable::new();
         wrong.insert("a", FieldValue::LongString(b"2".to_vec()));
         wrong.insert("b", FieldValue::LongString(b"anything".to_vec()));
-        let props = BasicProperties { headers: Some(wrong), ..BasicProperties::new() };
+        let props = BasicProperties {
+            headers: Some(wrong),
+            ..BasicProperties::new()
+        };
         assert!(!binding_matches(&ex, &bind(args), "rk", &props));
     }
 
@@ -506,7 +540,10 @@ mod headers_binding_tests {
         ]);
         let mut msg_headers = FieldTable::new();
         msg_headers.insert("a", FieldValue::LongString(b"1".to_vec()));
-        let props = BasicProperties { headers: Some(msg_headers), ..BasicProperties::new() };
+        let props = BasicProperties {
+            headers: Some(msg_headers),
+            ..BasicProperties::new()
+        };
         assert!(binding_matches(&ex, &bind(args), "rk", &props));
     }
 

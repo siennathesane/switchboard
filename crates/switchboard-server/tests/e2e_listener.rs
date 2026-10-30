@@ -5,7 +5,8 @@ mod support;
 
 use switchboard_server::ProtocolConfig;
 
-use support::{free_port, start_broker_node};
+use support::free_port;
+use support::start_broker_node;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_run_serves_amqp_clients() {
@@ -52,12 +53,18 @@ async fn listener_run_serves_amqp_clients() {
     )
     .await
     .unwrap();
-    assert!(matches!(c.expect(1).await.unwrap(), Method::QueueDeclareOk { .. }));
+    assert!(matches!(
+        c.expect(1).await.unwrap(),
+        Method::QueueDeclareOk { .. }
+    ));
 
     // HTTP health through the same listener.
     let mut sock = tokio::net::TcpStream::connect(&gateway).await.unwrap();
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
     let mut buf = Vec::new();
     sock.read_to_end(&mut buf).await.unwrap();
     assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
@@ -65,8 +72,8 @@ async fn listener_run_serves_amqp_clients() {
     listener.abort();
 }
 
-use switchboard_wire::method::Method;
 use std::sync::Arc;
+use switchboard_wire::method::Method;
 
 /// Grab a free TCP port (mirrors support's helper to avoid a pub-crate
 /// dependency on test-only items).
@@ -91,7 +98,14 @@ async fn listener_run_serves_amqp_over_tls() {
     let client = format!("127.0.0.1:{}", free_port());
     let gateway = format!("127.0.0.1:{}", free_port());
     let (node, _unused) = start_broker_node(
-        "tlsrun", 1, client.clone(), internal, vec![], true, 1, vec![],
+        "tlsrun",
+        1,
+        client.clone(),
+        internal,
+        vec![],
+        true,
+        1,
+        vec![],
     )
     .await;
 
@@ -136,14 +150,23 @@ async fn listener_run_serves_amqp_over_tls() {
 
     let tcp = tokio::net::TcpStream::connect(&gateway).await.unwrap();
     let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-    let mut tls_stream = connector.connect(server_name, tcp).await.expect("tls handshake");
+    let mut tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls handshake");
 
     // AMQP handshake over TLS: protocol header + read Connection.Start.
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tls_stream.write_all(&switchboard_wire::PROTOCOL_HEADER).await.unwrap();
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    tls_stream
+        .write_all(&switchboard_wire::PROTOCOL_HEADER)
+        .await
+        .unwrap();
     tls_stream.flush().await.unwrap();
     let mut buf = [0u8; 512];
-    let n = tokio::io::AsyncReadExt::read(&mut tls_stream, &mut buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tls_stream, &mut buf)
+        .await
+        .unwrap();
     assert!(n >= 11, "expected Connection.Start over TLS");
     // Decode: frame type 1 (method), channel 0 → Connection.Start.
     let mut fr = switchboard_wire::FrameReader::new();

@@ -1,11 +1,13 @@
 //! The embedded connection handle.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
 use crate::channel::EmbeddedChannel;
-use crate::driver::{self, ConnShared};
+use crate::driver::ConnShared;
+use crate::driver::{self};
 use crate::error::ConnectError;
 use crate::types::ReturnedMessage;
 

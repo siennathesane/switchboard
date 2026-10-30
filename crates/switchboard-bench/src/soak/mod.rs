@@ -31,8 +31,8 @@ pub mod report;
 pub mod workload;
 pub mod workload_idle;
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use serde_json::json;
@@ -142,7 +142,11 @@ pub struct LeakThresholds {
 
 impl Default for LeakThresholds {
     fn default() -> Self {
-        LeakThresholds { rss_mb_h: 8.0, disk_mb_h: 100.0, fds_h: 60.0 }
+        LeakThresholds {
+            rss_mb_h: 8.0,
+            disk_mb_h: 100.0,
+            fds_h: 60.0,
+        }
     }
 }
 
@@ -224,7 +228,10 @@ pub struct LoadGate {
 impl Default for LoadGate {
     fn default() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(true);
-        LoadGate { rx: Arc::new(rx), tx: Arc::new(tx) }
+        LoadGate {
+            rx: Arc::new(rx),
+            tx: Arc::new(tx),
+        }
     }
 }
 
@@ -287,7 +294,10 @@ impl Ctx {
     }
 
     pub fn uri(&self, host: &str) -> String {
-        format!("amqp://{}:{}@{}/{}", self.cfg.user, self.cfg.password, host, self.cfg.vhost)
+        format!(
+            "amqp://{}:{}@{}/{}",
+            self.cfg.user, self.cfg.password, host, self.cfg.vhost
+        )
     }
 
     pub async fn add_reconciler(&self, r: workload::Reconciler) {
@@ -363,7 +373,15 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     println!("soak: waiting for cluster convergence ...");
     if let Err(e) = wait_cluster_ready(&ctx).await {
         notes.push(format!("setup failed: {e}"));
-        return finish(ctx, started, SoakReport { notes, ..Default::default() }).await;
+        return finish(
+            ctx,
+            started,
+            SoakReport {
+                notes,
+                ..Default::default()
+            },
+        )
+        .await;
     }
     let hosts = endpoints.snapshot().await;
     println!(
@@ -375,7 +393,15 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     // ---- declare soak topology (durable, so churn never removes it) ----
     if let Err(e) = workload::declare_topology(&ctx).await {
         notes.push(format!("topology setup failed: {e}"));
-        return finish(ctx, started, SoakReport { notes, ..Default::default() }).await;
+        return finish(
+            ctx,
+            started,
+            SoakReport {
+                notes,
+                ..Default::default()
+            },
+        )
+        .await;
     }
     println!("soak: topology declared; starting workloads");
 
@@ -390,10 +416,7 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     let tasks = workload::spawn_all(&ctx);
     let proto_tasks = proto::spawn_all(&ctx);
     let monitor_task = if cfg.monitor {
-        Some(tokio::spawn(monitor::run(
-            ctx.clone(),
-            endpoints.clone(),
-        )))
+        Some(tokio::spawn(monitor::run(ctx.clone(), endpoints.clone())))
     } else {
         None
     };
@@ -406,7 +429,8 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     // Windows cannot catch external termination, so there the deadline
     // (or an injected stop) ends the run.
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
     let stop = async {
@@ -476,8 +500,7 @@ async fn finish(ctx: Arc<Ctx>, started: std::time::Instant, mut rep: SoakReport)
     rep.transitions = ctx.ledger.transitions();
     rep.legal_dups = ctx.ledger.legal_dups();
     rep.metrics = ctx.ledger.metrics.snapshot();
-    rep.passed = rep.error_total == 0
-        && rep.reconcile.iter().all(|c| c.ok);
+    rep.passed = rep.error_total == 0 && rep.reconcile.iter().all(|c| c.ok);
     report::print_final(&ctx, &rep).await;
     rep
 }

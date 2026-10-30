@@ -3,7 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Options, DB};
+use rocksdb::DB;
+use rocksdb::Options;
 // Direction used by pairs_from iterator mode.
 
 /// A small, synchronous RocksDB handle. Raft storage layers call into this
@@ -129,9 +130,10 @@ impl RocksKv {
         bound_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error> {
         let mut out = Vec::new();
-        let it = self
-            .db
-            .iterator(rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward));
+        let it = self.db.iterator(rocksdb::IteratorMode::From(
+            start,
+            rocksdb::Direction::Forward,
+        ));
         for item in it {
             let (k, v) = item?;
             if !k.starts_with(bound_prefix) {
@@ -254,11 +256,20 @@ mod tests {
     fn prefix_scans_are_ordered() {
         let kv = RocksKv::open_temp("kv-prefix");
         for i in [3u64, 1, 10, 2] {
-            kv.put(format!("p/{i:03}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            kv.put(format!("p/{i:03}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
         }
         kv.put(b"other", b"x").unwrap();
         let vs = kv.prefix_values(b"p/").unwrap();
-        assert_eq!(vs, vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec(), b"v10".to_vec()]);
+        assert_eq!(
+            vs,
+            vec![
+                b"v1".to_vec(),
+                b"v2".to_vec(),
+                b"v3".to_vec(),
+                b"v10".to_vec()
+            ]
+        );
         let pairs = kv.prefix_pairs(b"p/").unwrap();
         assert_eq!(pairs.len(), 4);
         kv.delete_prefix(b"p/").unwrap();
@@ -269,10 +280,15 @@ mod tests {
     #[test]
     fn batches_are_atomic_and_seek_scans_work() {
         let kv = RocksKv::open_temp("kv-batch");
-        kv.write_batch([(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())]).unwrap();
+        kv.write_batch([
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ])
+        .unwrap();
         // Empty batch is a no-op, not an error.
         kv.write_batch([]).unwrap();
-        kv.write_mixed([(b"c".to_vec(), b"3".to_vec())], [b"a".to_vec()]).unwrap();
+        kv.write_mixed([(b"c".to_vec(), b"3".to_vec())], [b"a".to_vec()])
+            .unwrap();
         assert_eq!(kv.get(b"a").unwrap(), None);
         assert_eq!(kv.get(b"c").unwrap(), Some(b"3".to_vec()));
         // Seek-scan from "b" bounded by "b" prefix: only key "b".

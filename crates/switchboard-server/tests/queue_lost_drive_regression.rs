@@ -20,12 +20,19 @@ mod support;
 
 use std::time::Duration;
 
-use support::{basic_get, connect_and_open, publish, start_broker};
+use support::basic_get;
+use support::connect_and_open;
+use support::publish;
+use support::start_broker;
 
-use switchboard_cluster::{BrokerCommand, BrokerReply, META_GROUP};
-use switchboard_core::model::{ConnectionId, QueueOptions};
+use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::BrokerReply;
+use switchboard_cluster::META_GROUP;
+use switchboard_core::model::ConnectionId;
+use switchboard_core::model::QueueOptions;
 use switchboard_core::shard::ShardCmd;
-use switchboard_core::topology::{MetaCmd, MetaReply};
+use switchboard_core::topology::MetaCmd;
+use switchboard_core::topology::MetaReply;
 use switchboard_wire::method::Method;
 
 /// Commit a meta-only `DeclareQueue` (no shard-side `CreateQueueData`):
@@ -149,15 +156,25 @@ async fn active_declare_heals_queue_missing_shard_data() {
     assert_eq!(queue, "stuck");
 
     // The jepsen `:exists` read: passive declare now sees the queue.
-    let got = declare_wire(&mut c, "stuck", true).await.expect("passive declare");
+    let got = declare_wire(&mut c, "stuck", true)
+        .await
+        .expect("passive declare");
     let Method::QueueDeclareOk { .. } = got else {
         panic!("expected passive QueueDeclareOk after heal, got {got:?}");
     };
 
     // The healed queue is usable: publish + get roundtrip.
-    publish(&mut c, 1, "", "stuck", &switchboard_wire::BasicProperties::new(), b"healed", false)
-        .await
-        .unwrap();
+    publish(
+        &mut c,
+        1,
+        "",
+        "stuck",
+        &switchboard_wire::BasicProperties::new(),
+        b"healed",
+        false,
+    )
+    .await
+    .unwrap();
     let got = basic_get(&mut c, 1, "stuck", true).await.unwrap();
     assert_eq!(got.map(|(_, body)| body), Some(b"healed".to_vec()));
 
@@ -168,7 +185,9 @@ async fn active_declare_heals_queue_missing_shard_data() {
     };
 
     // Control: a fresh queue's normal lifecycle is untouched.
-    let got = declare_wire(&mut c, "fresh", false).await.expect("fresh declare");
+    let got = declare_wire(&mut c, "fresh", false)
+        .await
+        .expect("fresh declare");
     let Method::QueueDeclareOk { queue, .. } = got else {
         panic!("expected QueueDeclareOk, got {got:?}");
     };
@@ -204,7 +223,9 @@ async fn delete_succeeds_when_shard_data_missing() {
     // The queue is gone from meta: a passive declare answers the
     // meta-level 404 ("in vhost" — the client's definitively-absent
     // classification), not the shard-level one.
-    let got = declare_wire(&mut c, "orphan", true).await.expect("passive declare");
+    let got = declare_wire(&mut c, "orphan", true)
+        .await
+        .expect("passive declare");
     match got {
         Method::ChannelClose {
             reply_code,

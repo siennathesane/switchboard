@@ -6,9 +6,9 @@
 //! drops the gauge when the connection finishes — including panics and
 //! early returns, because the bump is released in `Drop`.
 
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::OnceLock;
 
 use super::detect::Detected;
 

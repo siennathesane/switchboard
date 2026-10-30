@@ -26,7 +26,11 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::status::{SB_ERR_HANDLE_DEAD, SB_ERR_INVALID_HANDLE, SB_ERR_NULL_ARG, SbStatus, fail};
+use crate::status::SB_ERR_HANDLE_DEAD;
+use crate::status::SB_ERR_INVALID_HANDLE;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::fail;
 
 /// Which kind of opaque handle an address holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

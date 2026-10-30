@@ -10,9 +10,11 @@ static TRACING: std::sync::Once = std::sync::Once::new();
 
 fn init_tracing() {
     TRACING.call_once(|| {
-    // Test tempo: shrink fixed delays (raft elections, ticks, join
-    // deadlines) 50x. Uniform time-warp — ordering unchanged.
-    unsafe { std::env::set_var("SB_TIME_SCALE", "50"); }
+        // Test tempo: shrink fixed delays (raft elections, ticks, join
+        // deadlines) 50x. Uniform time-warp — ordering unchanged.
+        unsafe {
+            std::env::set_var("SB_TIME_SCALE", "50");
+        }
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -25,7 +27,10 @@ fn init_tracing() {
 }
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// Grab a free TCP port.
@@ -44,8 +49,7 @@ pub fn free_port() -> u16 {
 static LAST_NODE: std::sync::OnceLock<Arc<switchboard_cluster::ClusterNode>> =
     std::sync::OnceLock::new();
 
-static SHARED: std::sync::OnceLock<(tokio::runtime::Runtime, String)> =
-    std::sync::OnceLock::new();
+static SHARED: std::sync::OnceLock<(tokio::runtime::Runtime, String)> = std::sync::OnceLock::new();
 
 /// The shared gateway's client address (starts the gateway on first use).
 /// Initialization happens on a dedicated thread because callers are inside
@@ -69,9 +73,8 @@ pub async fn shared_gateway() -> String {
             .worker_threads(6)
             .build()
             .unwrap();
-        let (addr, guard) = rt.block_on(async {
-            start_gateway(switchboard_server::ProtocolConfig::all()).await
-        });
+        let (addr, guard) =
+            rt.block_on(async { start_gateway(switchboard_server::ProtocolConfig::all()).await });
         // The shared node lives for the whole binary.
         std::mem::forget(guard);
         let _ = SHARED.set((rt, addr.clone()));
@@ -98,7 +101,8 @@ impl Drop for NodeGuard {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await;
             });
         })
         .join();
@@ -107,9 +111,7 @@ impl Drop for NodeGuard {
 
 /// Start one bootstrap node and serve the FULL protocol gateway on the
 /// returned address. The returned guard shuts the node down when dropped.
-pub async fn start_gateway(
-    protocols: switchboard_server::ProtocolConfig,
-) -> (String, NodeGuard) {
+pub async fn start_gateway(protocols: switchboard_server::ProtocolConfig) -> (String, NodeGuard) {
     start_gateway_tagged(protocols, "gw").await
 }
 
@@ -135,7 +137,7 @@ pub async fn start_gateway_tagged(
         bootstrap: true,
         expected_nodes: 1,
         peers: vec![],
-            timeouts: Default::default(),
+        timeouts: Default::default(),
     };
     let node: Arc<switchboard_cluster::ClusterNode> =
         switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
@@ -153,13 +155,8 @@ pub async fn start_gateway_tagged(
             let mut limits = switchboard_server::ConnectionLimits::default();
             limits.peer_ip = sock.peer_addr().ok().map(|a| a.ip());
             tokio::spawn(async move {
-                let _ = switchboard_server::protocols::serve_client(
-                    sock,
-                    node2,
-                    limits,
-                    protocols,
-                )
-                .await;
+                let _ = switchboard_server::protocols::serve_client(sock, node2, limits, protocols)
+                    .await;
             });
         }
     });
@@ -176,11 +173,7 @@ pub async fn start_gateway_tagged(
     }
     for _ in 0..400 {
         match switchboard_server::protocols::shared::declare_queue(
-            &switchboard_server::protocols::BridgeContext::create(
-                node.clone(),
-                "/".into(),
-            )
-            .await,
+            &switchboard_server::protocols::BridgeContext::create(node.clone(), "/".into()).await,
             "gw-ready-probe",
             false,
             false,
@@ -288,9 +281,7 @@ pub fn mqtt_remaining(mut n: usize, out: &mut Vec<u8>) {
 }
 
 /// Read one MQTT packet: returns (type, body).
-pub async fn mqtt_read<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+pub async fn mqtt_read<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>> {
     let mut b = [0u8; 1];
     let n = r.read(&mut b).await?;
     if n == 0 {
@@ -332,7 +323,9 @@ pub async fn ws_connect(addr: &str, path: &str, subprotocol: Option<&str>) -> Ws
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     loop {
-        let n = tokio::io::AsyncReadExt::read(&mut r, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut r, &mut buf)
+            .await
+            .unwrap();
         assert!(n > 0, "ws upgrade failed");
         head.extend_from_slice(&buf[..n]);
         if head.windows(4).any(|x| x == b"\r\n\r\n") {
@@ -346,7 +339,11 @@ pub async fn ws_connect(addr: &str, path: &str, subprotocol: Option<&str>) -> Ws
         .position(|x| x == b"\r\n\r\n")
         .map(|i| head[i + 4..].to_vec())
         .unwrap_or_default();
-    WsClient { reader: r, writer: w, leftover }
+    WsClient {
+        reader: r,
+        writer: w,
+        leftover,
+    }
 }
 
 pub struct WsClient {
@@ -387,7 +384,9 @@ impl WsClient {
                 return Some(payload);
             }
             let mut buf = [0u8; 4096];
-            let n = AsyncReadExt::read(&mut self.reader, &mut buf).await.unwrap();
+            let n = AsyncReadExt::read(&mut self.reader, &mut buf)
+                .await
+                .unwrap();
             if n == 0 {
                 return None;
             }
@@ -430,10 +429,7 @@ fn try_parse_frame(raw: &[u8]) -> Option<(Vec<u8>, usize)> {
 pub fn basic_get_unused() {}
 
 /// Convenience: run a closure with a timeout (tests must not hang).
-pub async fn with_timeout<F: std::future::Future>(
-    fut: F,
-    secs: u64,
-) -> F::Output {
+pub async fn with_timeout<F: std::future::Future>(fut: F, secs: u64) -> F::Output {
     tokio::time::timeout(Duration::from_secs(secs), fut)
         .await
         .expect("test timed out")
@@ -457,7 +453,10 @@ pub async fn read_stomp_frame<R: AsyncRead + Unpin>(
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (command, rest) = text.split_once('\n').unwrap_or((text.as_str(), ""));
     let body_start = rest.find("\n\n").map(|i| i + 2).unwrap_or(rest.len());
-    Ok(Some((command.to_string(), rest[body_start..].as_bytes().to_vec())))
+    Ok(Some((
+        command.to_string(),
+        rest[body_start..].as_bytes().to_vec(),
+    )))
 }
 
 /// Like [`read_stomp_frame`], but also returns the frame's headers

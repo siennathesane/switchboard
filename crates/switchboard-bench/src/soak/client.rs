@@ -8,6 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lapin::Channel;
+use lapin::Connection;
+use lapin::ConnectionProperties;
+use lapin::message::Delivery;
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicConsumeOptions;
 use lapin::options::BasicPublishOptions;
@@ -16,10 +20,6 @@ use lapin::options::ConfirmSelectOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
-use lapin::Channel;
-use lapin::Connection;
-use lapin::ConnectionProperties;
-use lapin::message::Delivery;
 
 use super::Ctx;
 
@@ -43,16 +43,18 @@ pub async fn connect(ctx: &Arc<Ctx>, workload: &str) -> Option<(Connection, Stri
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
             }
-            Some(h) => match Connection::connect(&ctx.uri(&h), ConnectionProperties::default()).await {
-                Ok(c) => return Some((c, h)),
-                Err(e) => {
-                    ctx.infra_bounce(workload, &h, format!("amqp connect failed: {e}"));
-                    tokio::select! {
-                        _ = ctx.token.cancelled() => return None,
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            Some(h) => {
+                match Connection::connect(&ctx.uri(&h), ConnectionProperties::default()).await {
+                    Ok(c) => return Some((c, h)),
+                    Err(e) => {
+                        ctx.infra_bounce(workload, &h, format!("amqp connect failed: {e}"));
+                        tokio::select! {
+                            _ = ctx.token.cancelled() => return None,
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -70,7 +72,12 @@ pub async fn connect_setup(ctx: &Arc<Ctx>, host: &str, workload: &str) -> Option
             Err(e) => {
                 attempt += 1;
                 if attempt > 30 {
-                    ctx.error(workload, "connect", host, format!("amqp connect failed: {e}"));
+                    ctx.error(
+                        workload,
+                        "connect",
+                        host,
+                        format!("amqp connect failed: {e}"),
+                    );
                     return None;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -89,7 +96,12 @@ pub async fn channel(
     match conn.create_channel().await {
         Ok(c) => Some(c),
         Err(e) => {
-            ctx.error(workload, "channel.open", host, format!("create_channel failed: {e}"));
+            ctx.error(
+                workload,
+                "channel.open",
+                host,
+                format!("create_channel failed: {e}"),
+            );
             None
         }
     }
@@ -100,7 +112,12 @@ pub async fn confirm_mode(ctx: &Arc<Ctx>, ch: &Channel, workload: &str, host: &s
     match ch.confirm_select(ConfirmSelectOptions::default()).await {
         Ok(_) => true,
         Err(e) => {
-            ctx.error(workload, "confirm.select", host, format!("confirm_select failed: {e}"));
+            ctx.error(
+                workload,
+                "confirm.select",
+                host,
+                format!("confirm_select failed: {e}"),
+            );
             false
         }
     }
@@ -122,7 +139,10 @@ pub async fn declare_durable(
     match ch
         .queue_declare(
             queue,
-            QueueDeclareOptions { durable: true, ..Default::default() },
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
@@ -146,11 +166,7 @@ fn poll_cache() -> &'static tokio::sync::Mutex<PollCache> {
     CACHE.get_or_init(|| tokio::sync::Mutex::new(Default::default()))
 }
 
-async fn polling_connection(
-    ctx: &Arc<Ctx>,
-    host: &str,
-    workload: &str,
-) -> Option<Channel> {
+async fn polling_connection(ctx: &Arc<Ctx>, host: &str, workload: &str) -> Option<Channel> {
     let cache = poll_cache();
     let mut map = cache.lock().await;
     if let Some(ch) = map.get(host) {
@@ -182,7 +198,10 @@ pub async fn declare_durable_expect(
     match ch
         .queue_declare(
             queue,
-            QueueDeclareOptions { durable: true, ..Default::default() },
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
@@ -235,7 +254,12 @@ pub async fn publish_confirmed(
     match tokio::time::timeout(ctx.cfg.confirm_timeout, confirm).await {
         Ok(Ok(Confirmation::Ack(_))) => Some(true),
         Ok(Ok(other)) => {
-            ctx.error(workload, "confirm", host, format!("publish not acked: {other:?}"));
+            ctx.error(
+                workload,
+                "confirm",
+                host,
+                format!("publish not acked: {other:?}"),
+            );
             Some(false)
         }
         Ok(Err(e)) => {
@@ -319,16 +343,18 @@ pub async fn connect_drain(ctx: &Arc<Ctx>, workload: &str) -> Option<(Connection
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
             }
-            Some(h) => match Connection::connect(&ctx.uri(&h), ConnectionProperties::default()).await {
-                Ok(c) => return Some((c, h)),
-                Err(e) => {
-                    ctx.infra_bounce(workload, &h, format!("amqp connect failed: {e}"));
-                    tokio::select! {
-                        _ = ctx.halt.cancelled() => return None,
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            Some(h) => {
+                match Connection::connect(&ctx.uri(&h), ConnectionProperties::default()).await {
+                    Ok(c) => return Some((c, h)),
+                    Err(e) => {
+                        ctx.infra_bounce(workload, &h, format!("amqp connect failed: {e}"));
+                        tokio::select! {
+                            _ = ctx.halt.cancelled() => return None,
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
                     }
                 }
-            },
+            }
         }
     }
 }

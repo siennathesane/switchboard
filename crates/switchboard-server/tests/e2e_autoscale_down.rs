@@ -11,10 +11,14 @@ mod support;
 
 use switchboard_wire::BasicProperties;
 
-use support::{
-    basic_get, connect_and_open, declare_queue_everywhere, publish, start_cluster,
-    teardown_cluster, wait_until, TestClient,
-};
+use support::TestClient;
+use support::basic_get;
+use support::connect_and_open;
+use support::declare_queue_everywhere;
+use support::publish;
+use support::start_cluster;
+use support::teardown_cluster;
+use support::wait_until;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_autoscales_down_from_9_to_3_nodes() {
@@ -36,7 +40,11 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
         // winding down and no longer counts).
         let survivors = &nodes[..id as usize - 1];
         let ok = wait_until(
-            || survivors.iter().all(|n| !n.topology().nodes.contains_key(&id)),
+            || {
+                survivors
+                    .iter()
+                    .all(|n| !n.topology().nodes.contains_key(&id))
+            },
             60,
         )
         .await;
@@ -45,12 +53,9 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
         // Group member lists no longer mention the departed node.
         let ok = wait_until(
             || {
-                survivors.iter().all(|n| {
-                    n.topology()
-                        .groups
-                        .values()
-                        .all(|m| !m.contains(&id))
-                })
+                survivors
+                    .iter()
+                    .all(|n| n.topology().groups.values().all(|m| !m.contains(&id)))
             },
             60,
         )
@@ -89,11 +94,21 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
 
         // The cluster keeps serving writes through distinct survivors.
         // (Publishes are fire-and-forget across connections, so poll.)
-        let mut w = connect_and_open(&addrs[id as usize - 2], "/").await.expect("open writer");
-        let body = format!("round-{id}");
-        publish(&mut w, 1, "", "dd", &BasicProperties::new(), body.as_bytes(), false)
+        let mut w = connect_and_open(&addrs[id as usize - 2], "/")
             .await
-            .unwrap();
+            .expect("open writer");
+        let body = format!("round-{id}");
+        publish(
+            &mut w,
+            1,
+            "",
+            "dd",
+            &BasicProperties::new(),
+            body.as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
         get_eventually(&mut admin, "dd", body.as_bytes()).await;
     }
 
@@ -106,16 +121,27 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
         clients.push(connect_and_open(addr, "/").await.expect("open survivor"));
     }
     for (i, c) in clients.iter_mut().enumerate() {
-        publish(c, 1, "", "dd", &BasicProperties::new(), format!("survivor{i}").as_bytes(), false)
-            .await
-            .unwrap();
+        publish(
+            c,
+            1,
+            "",
+            "dd",
+            &BasicProperties::new(),
+            format!("survivor{i}").as_bytes(),
+            false,
+        )
+        .await
+        .unwrap();
     }
     // Enqueues from three distinct connections race, so drain the queue
     // and assert on the set, not on FIFO order.
     let mut drained: Vec<Vec<u8>> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while drained.len() < 3 {
-        assert!(tokio::time::Instant::now() < deadline, "survivor messages incomplete: {drained:?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "survivor messages incomplete: {drained:?}"
+        );
         match basic_get(&mut admin, 1, "dd", true).await {
             Ok(Some((_, body))) => drained.push(body),
             Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
@@ -125,7 +151,11 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
     drained.sort();
     assert_eq!(
         drained,
-        vec![b"survivor0".to_vec(), b"survivor1".to_vec(), b"survivor2".to_vec()],
+        vec![
+            b"survivor0".to_vec(),
+            b"survivor1".to_vec(),
+            b"survivor2".to_vec()
+        ],
         "exactly the survivor writes must land"
     );
 

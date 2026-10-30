@@ -7,21 +7,33 @@
 //! fire-and-forget scenarios release it when a consumer receives — this
 //! bounds client memory and measures the sustainable pipeline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use anyhow::bail;
+use lapin::BasicProperties;
+use lapin::Channel;
+use lapin::Connection;
+use lapin::ConnectionProperties;
 use lapin::message::Delivery;
 use lapin::options::*;
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
-use serde_json::{json, Map, Value};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use switchboard_bench::stats::{mean, percentile, Counter, RateSampler};
+use switchboard_bench::stats::Counter;
+use switchboard_bench::stats::RateSampler;
+use switchboard_bench::stats::mean;
+use switchboard_bench::stats::percentile;
 
 static FAILED: AtomicU64 = AtomicU64::new(0);
 
@@ -77,8 +89,15 @@ async fn reset_queue(conn: &Connection, name: &str) -> Result<()> {
         let _ = ch.queue_delete(name, QueueDeleteOptions::default()).await;
     }
     let ch = conn.create_channel().await?;
-    ch.queue_declare(name, QueueDeclareOptions { durable: true, ..Default::default() }, FieldTable::default())
-        .await?;
+    ch.queue_declare(
+        name,
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -117,12 +136,16 @@ async fn publisher_task(
                 continue;
             }
         };
-        let Ok(ch) = conn.create_channel().await else { continue };
+        let Ok(ch) = conn.create_channel().await else {
+            continue;
+        };
         // Ack-counting publishers require confirm mode; without it the
         // broker never sends Basic.Ack and every awaited confirm times
         // out.
         if wait_for_ack {
-            let _ = ch.confirm_select(lapin::options::ConfirmSelectOptions::default()).await;
+            let _ = ch
+                .confirm_select(lapin::options::ConfirmSelectOptions::default())
+                .await;
         }
         let props = persistent_props();
         let size = payload.len() as u64;
@@ -138,8 +161,26 @@ async fn publisher_task(
                 return;
             }
             let confirm = match &exchange {
-                Some(x) => ch.basic_publish(x, "", BasicPublishOptions::default(), &payload, props.clone()).await,
-                None => ch.basic_publish("", &queue, BasicPublishOptions::default(), &payload, props.clone()).await,
+                Some(x) => {
+                    ch.basic_publish(
+                        x,
+                        "",
+                        BasicPublishOptions::default(),
+                        &payload,
+                        props.clone(),
+                    )
+                    .await
+                }
+                None => {
+                    ch.basic_publish(
+                        "",
+                        &queue,
+                        BasicPublishOptions::default(),
+                        &payload,
+                        props.clone(),
+                    )
+                    .await
+                }
             };
             match confirm {
                 Ok(pc) => {
@@ -213,7 +254,15 @@ async fn consumer_task(
             }
         };
         match ch
-            .basic_consume(&queue, "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
+            .basic_consume(
+                &queue,
+                "",
+                BasicConsumeOptions {
+                    no_ack: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
             .await
         {
             Ok(c) => break c,
@@ -250,7 +299,11 @@ struct Window {
 
 impl Window {
     fn new(counter: Arc<Counter>) -> Self {
-        Window { token: CancellationToken::new(), counter, sampler: None }
+        Window {
+            token: CancellationToken::new(),
+            counter,
+            sampler: None,
+        }
     }
 
     async fn warmup(&self, secs: u64) {
@@ -323,7 +376,10 @@ pub async fn publish(b: &Bench) -> Result<Value> {
             "bench.pub".into(),
             payload.clone(),
             release.clone(),
-            TaskCounters { sent: Some(sent.clone()), ..Default::default() },
+            TaskCounters {
+                sent: Some(sent.clone()),
+                ..Default::default()
+            },
             false,
         )));
     }
@@ -396,7 +452,11 @@ async fn sharded_with_queues(b: &Bench, k: usize, prefix: &str) -> Result<Value>
             queues[p % queues.len()].clone(),
             payload.clone(),
             sem.clone(),
-            TaskCounters { acks: Some(acks.clone()), sent: Some(sent.clone()), ..Default::default() },
+            TaskCounters {
+                acks: Some(acks.clone()),
+                sent: Some(sent.clone()),
+                ..Default::default()
+            },
             true,
         )));
     }
@@ -430,7 +490,10 @@ pub async fn fanout(b: &Bench) -> Result<Value> {
     sch.exchange_declare(
         "bench.fx",
         lapin::ExchangeKind::Fanout,
-        ExchangeDeclareOptions { durable: true, ..Default::default() },
+        ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
         FieldTable::default(),
     )
     .await?;
@@ -439,7 +502,15 @@ pub async fn fanout(b: &Bench) -> Result<Value> {
         let q = format!("bench.f.{i}");
         reset_queue(&setup, &q).await?;
         let bind_ch = setup.create_channel().await?;
-        bind_ch.queue_bind(&q, "bench.fx", "", QueueBindOptions::default(), FieldTable::default()).await?;
+        bind_ch
+            .queue_bind(
+                &q,
+                "bench.fx",
+                "",
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
         queues.push(q);
     }
     drop(setup);
@@ -471,7 +542,11 @@ pub async fn fanout(b: &Bench) -> Result<Value> {
         String::new(),
         payload.clone(),
         sem.clone(),
-        TaskCounters { acks: Some(acks.clone()), sent: Some(sent.clone()), ..Default::default() },
+        TaskCounters {
+            acks: Some(acks.clone()),
+            sent: Some(sent.clone()),
+            ..Default::default()
+        },
         true,
     )));
 
@@ -501,7 +576,14 @@ async fn queue_depth(b: &Bench, queue: &str) -> Result<u64> {
     let conn = connect_uri(&b.uri(&b.host(0))).await?;
     let ch = conn.create_channel().await?;
     let q = ch
-        .queue_declare(queue, QueueDeclareOptions { passive: true, ..Default::default() }, FieldTable::default())
+        .queue_declare(
+            queue,
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
         .await?;
     let _ = ch.close(0, "");
     drop(conn);
@@ -530,7 +612,10 @@ pub async fn drain(b: &Bench) -> Result<Value> {
             "bench.drain".into(),
             payload,
             sem,
-            TaskCounters { sent: Some(sent.clone()), ..Default::default() },
+            TaskCounters {
+                sent: Some(sent.clone()),
+                ..Default::default()
+            },
             false,
         ));
     }
@@ -607,41 +692,65 @@ pub async fn latency(b: &Bench) -> Result<Value> {
         tokio::spawn(async move {
             let conn = match connect_uri(&uri).await {
                 Ok(c) => c,
-                Err(e) => { eprintln!("latency: echo connect failed: {e}"); return },
+                Err(e) => {
+                    eprintln!("latency: echo connect failed: {e}");
+                    return;
+                }
             };
             let in_ch = match conn.create_channel().await {
                 Ok(c) => c,
-                Err(e) => { eprintln!("latency: echo in-channel failed: {e}"); return },
+                Err(e) => {
+                    eprintln!("latency: echo in-channel failed: {e}");
+                    return;
+                }
             };
             let out_ch = match conn.create_channel().await {
                 Ok(c) => c,
-                Err(e) => { eprintln!("latency: echo out-channel failed: {e}"); return },
+                Err(e) => {
+                    eprintln!("latency: echo out-channel failed: {e}");
+                    return;
+                }
             };
             match in_ch
-                .basic_consume("bench.lat.req", "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
+                .basic_consume(
+                    "bench.lat.req",
+                    "",
+                    BasicConsumeOptions {
+                        no_ack: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
                 .await
             {
-                Ok(mut consumer) => {
-                    loop {
-                        let d: Delivery = tokio::select! {
-                            _ = t.cancelled() => return,
-                            d = futures_lite::StreamExt::next(&mut consumer) => match d {
-                                Some(Ok(d)) => d,
-                                Some(Err(e)) => { eprintln!("latency: echo consume error: {e}"); return }
-                                None => return,
-                            }
-                        };
-                        let _ = d;
-                        if let Err(e) = out_ch
-                            .basic_publish("", "bench.lat.rep", BasicPublishOptions::default(), &payload, persistent_props())
-                            .await
-                        {
-                            eprintln!("latency: echo republish failed: {e}");
-                            return;
+                Ok(mut consumer) => loop {
+                    let d: Delivery = tokio::select! {
+                        _ = t.cancelled() => return,
+                        d = futures_lite::StreamExt::next(&mut consumer) => match d {
+                            Some(Ok(d)) => d,
+                            Some(Err(e)) => { eprintln!("latency: echo consume error: {e}"); return }
+                            None => return,
                         }
+                    };
+                    let _ = d;
+                    if let Err(e) = out_ch
+                        .basic_publish(
+                            "",
+                            "bench.lat.rep",
+                            BasicPublishOptions::default(),
+                            &payload,
+                            persistent_props(),
+                        )
+                        .await
+                    {
+                        eprintln!("latency: echo republish failed: {e}");
+                        return;
                     }
+                },
+                Err(e) => {
+                    eprintln!("latency: echo subscribe failed: {e}");
+                    return;
                 }
-                Err(e) => { eprintln!("latency: echo subscribe failed: {e}"); return },
             }
         });
     }
@@ -651,7 +760,15 @@ pub async fn latency(b: &Bench) -> Result<Value> {
     let pub_ch = conn.create_channel().await?;
     let sub_ch = conn.create_channel().await?;
     let mut replies = sub_ch
-        .basic_consume("bench.lat.rep", "", BasicConsumeOptions { no_ack: true, ..Default::default() }, FieldTable::default())
+        .basic_consume(
+            "bench.lat.rep",
+            "",
+            BasicConsumeOptions {
+                no_ack: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
         .await?;
     let deadline = Instant::now() + Duration::from_secs(b.duration + 10);
     let measure_from = Instant::now() + Duration::from_secs(b.warmup);
@@ -665,15 +782,27 @@ pub async fn latency(b: &Bench) -> Result<Value> {
         }
         let t0 = Instant::now();
         pub_ch
-            .basic_publish("", "bench.lat.req", BasicPublishOptions::default(), &payload, persistent_props())
+            .basic_publish(
+                "",
+                "bench.lat.req",
+                BasicPublishOptions::default(),
+                &payload,
+                persistent_props(),
+            )
             .await?;
-        let got = tokio::time::timeout(Duration::from_secs(5), futures_lite::StreamExt::next(&mut replies)).await;
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_lite::StreamExt::next(&mut replies),
+        )
+        .await;
         match got {
             Ok(Some(Ok(_))) => consecutive_misses = 0,
             _ => {
                 consecutive_misses += 1;
                 if consecutive_misses >= 3 {
-                    bail!("latency: three consecutive probes got no reply (timeout or consumer error)");
+                    bail!(
+                        "latency: three consecutive probes got no reply (timeout or consumer error)"
+                    );
                 }
                 continue;
             }
@@ -705,7 +834,9 @@ pub async fn latency(b: &Bench) -> Result<Value> {
 /// Run the named scenario(s). Returns {scenario: result-map}.
 pub async fn run(b: &Bench, scenario: &str) -> Result<Map<String, Value>> {
     let names: Vec<&str> = match scenario {
-        "all" => vec!["publish", "confirm", "sharded", "fanout", "drain", "latency"],
+        "all" => vec![
+            "publish", "confirm", "sharded", "fanout", "drain", "latency",
+        ],
         other => vec![other],
     };
     let mut out = Map::new();

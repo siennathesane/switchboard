@@ -7,8 +7,11 @@
 //! cdylib exports), so `cargo test -p switchboard-capi` exercises the
 //! shipping surface.
 
-use std::ffi::{CStr, CString, c_char};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::c_char;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use switchboard_capi::*;
 

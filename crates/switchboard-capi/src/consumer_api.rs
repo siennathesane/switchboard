@@ -7,7 +7,8 @@
 //! `sb_consumer_next`, which parks the calling thread for up to
 //! `timeout_ms`. `sb_channel_get` is the non-blocking alternative.
 
-use std::ffi::{c_char, c_int};
+use std::ffi::c_char;
+use std::ffi::c_int;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -16,9 +17,15 @@ use tokio::runtime::Handle;
 
 use crate::handles::as_consumer;
 use crate::map::op_status;
-use crate::message::{SbMessage, alloc_string};
-use crate::status::{SB_ERR_CONSUMER_CANCELLED, SB_ERR_NULL_ARG, SbStatus, entry_status, fail};
-use crate::table::{self, Kind};
+use crate::message::SbMessage;
+use crate::message::alloc_string;
+use crate::status::SB_ERR_CONSUMER_CANCELLED;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::entry_status;
+use crate::status::fail;
+use crate::table::Kind;
+use crate::table::{self};
 
 /// One active push consumer (C side of `sb_consumer_t`).
 pub struct SbConsumer {

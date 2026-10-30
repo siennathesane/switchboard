@@ -15,18 +15,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use sha1::{Digest, Sha1};
+use base64::engine::general_purpose::STANDARD as B64;
+use sha1::Digest;
+use sha1::Sha1;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
 use switchboard_cluster::ClusterNode;
 
-use super::detect::classify;
 use super::detect::Classify;
 use super::detect::Detected;
+use super::detect::classify;
 use super::gateway::Prefixed;
 use super::shared::ProtocolConfig;
 
@@ -80,7 +81,9 @@ fn parse_handshake(head: &[u8]) -> Option<Handshake> {
     let mut subprotocol = None;
     let mut key = None;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim();
         if name == "sec-websocket-protocol" {
@@ -89,7 +92,11 @@ fn parse_handshake(head: &[u8]) -> Option<Handshake> {
             key = Some(value.to_string());
         }
     }
-    Some(Handshake { path, subprotocol, accept_key: key? })
+    Some(Handshake {
+        path,
+        subprotocol,
+        accept_key: key?,
+    })
 }
 
 /// The selected inner protocol for a WebSocket connection.
@@ -181,7 +188,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
             close_frame: None,
         }
     }
-
 }
 
 fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> {
@@ -190,9 +196,8 @@ fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> 
     }
     let b0 = raw[0];
     let b1 = raw[1];
-    let opcode = Opcode::from_u8(b0 & 0x0F).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "ws: bad opcode")
-    })?;
+    let opcode = Opcode::from_u8(b0 & 0x0F)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ws: bad opcode"))?;
     if b1 & 0x80 == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -227,7 +232,12 @@ fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> 
     if raw.len() < offset + 4 + len {
         return Ok(None);
     }
-    let mask = [raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3]];
+    let mask = [
+        raw[offset],
+        raw[offset + 1],
+        raw[offset + 2],
+        raw[offset + 3],
+    ];
     let payload_start = offset + 4;
     let mut payload = raw[payload_start..payload_start + len].to_vec();
     for (i, b) in payload.iter_mut().enumerate() {
@@ -496,7 +506,10 @@ mod tests {
     #[test]
     fn accept_key_is_rfc6455_example() {
         // The example from RFC 6455 §1.3.
-        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 
     #[test]
@@ -580,7 +593,6 @@ mod frame_tests {
         assert!(s.absorb_frames().unwrap());
         assert!(s.close_sent);
     }
-
 
     #[test]
     fn select_inner_recognizes_amqp_subprotocols() {
@@ -690,7 +702,10 @@ mod frame_tests {
             // gone.
             use tokio::io::AsyncWriteExt;
             ws.write_all(b"payload").await.unwrap();
-            assert!(ws.flush().await.is_err(), "flush must surface the peer's disappearance");
+            assert!(
+                ws.flush().await.is_err(),
+                "flush must surface the peer's disappearance"
+            );
         });
     }
 
@@ -699,7 +714,10 @@ mod frame_tests {
         let mut raw = vec![0x82, 0x80 | 127];
         raw.extend_from_slice(&u64::MAX.to_be_bytes());
         raw.extend_from_slice(&[1, 2, 3, 4]);
-        assert!(parse_frame_free(&mut raw).is_err(), "absurd 64-bit length must be rejected");
+        assert!(
+            parse_frame_free(&mut raw).is_err(),
+            "absurd 64-bit length must be rejected"
+        );
     }
 
     /// Build a masked client frame (helper local to this module).
@@ -743,7 +761,9 @@ mod frame_tests {
             // The peer sees a close frame (retry reads: the flush may
             // need a couple of polls to move the queued frame).
             let mut buf = vec![0u8; 64];
-            let n = tokio::io::AsyncReadExt::read(&mut b, &mut buf).await.unwrap_or(0);
+            let n = tokio::io::AsyncReadExt::read(&mut b, &mut buf)
+                .await
+                .unwrap_or(0);
             assert!(
                 n > 0 && buf[0] & 0x0F == 0x8,
                 "close frame written (n={n}, buf={:?})",
@@ -781,7 +801,9 @@ mod stream_tests {
         use tokio::io::AsyncWriteExt;
         client.write_all(&frame).await.unwrap();
         let mut buf = [0u8; 32];
-        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
 
@@ -789,17 +811,23 @@ mod stream_tests {
     async fn ws_stream_writes_are_framed_for_the_peer() {
         let (mut client, server) = duplex(4096);
         let mut ws = WsStream::new(server);
-        tokio::io::AsyncWriteExt::write_all(&mut ws, b"payload").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut ws, b"payload")
+            .await
+            .unwrap();
         tokio::io::AsyncWriteExt::flush(&mut ws).await.unwrap();
         // The peer sees a framed binary message.
         let mut hdr = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut client, &mut hdr).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut hdr)
+            .await
+            .unwrap();
         assert_eq!(hdr[0] & 0x80, 0x80, "FIN set");
         assert_eq!(hdr[0] & 0x0F, 2, "binary opcode");
         assert_eq!(hdr[1] & 0x80, 0, "server frames are unmasked");
         let len = (hdr[1] & 0x7F) as usize;
         let mut payload = vec![0u8; len];
-        tokio::io::AsyncReadExt::read_exact(&mut client, &mut payload).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut payload)
+            .await
+            .unwrap();
         assert_eq!(payload, b"payload");
     }
 
@@ -817,7 +845,9 @@ mod stream_tests {
         let mut buf = [0u8; 32];
         // First read may see queued data; the loop must terminate.
         loop {
-            let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+            let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
+                .await
+                .unwrap();
             if n == 0 {
                 break;
             }
@@ -829,14 +859,22 @@ mod stream_tests {
         let (mut client, server) = duplex(4096);
         let mut ws = WsStream::new(server);
         // FIN=0 text fragment + FIN=1 continuation, each masked.
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x01, 0x83, 1, 2, 3, 4]).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x01, 0x83, 1, 2, 3, 4])
+            .await
+            .unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client, &[b'a' ^ 1, b'b' ^ 2, b'c' ^ 3])
             .await
             .unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x80, 0x82, 5, 6, 7, 8]).await.unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[b'd' ^ 5, b'e' ^ 6]).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x80, 0x82, 5, 6, 7, 8])
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &[b'd' ^ 5, b'e' ^ 6])
+            .await
+            .unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf[..n], b"abcde");
     }
 

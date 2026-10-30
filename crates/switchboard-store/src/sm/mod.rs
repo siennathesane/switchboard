@@ -14,17 +14,17 @@ use std::sync::Arc;
 
 use crate::typ::BrokerCommand;
 
-use openraft::storage::RaftStateMachine;
-use openraft::storage::Snapshot;
-use openraft::raft::ClientWriteResponse;
 use openraft::AnyError;
 use openraft::Entry;
 use openraft::LogId;
 use openraft::RaftSnapshotBuilder;
 use openraft::SnapshotMeta;
-use openraft::StoredMembership;
 use openraft::StorageError;
 use openraft::StorageIOError;
+use openraft::StoredMembership;
+use openraft::raft::ClientWriteResponse;
+use openraft::storage::RaftStateMachine;
+use openraft::storage::Snapshot;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -151,7 +151,11 @@ impl BrokerStateImage {
                     .map(|(name, q)| {
                         (
                             name.clone(),
-                            QueueImage { next_seq: q.next_seq, msgs: q.msgs.clone(), policy: q.policy.clone() },
+                            QueueImage {
+                                next_seq: q.next_seq,
+                                msgs: q.msgs.clone(),
+                                policy: q.policy.clone(),
+                            },
                         )
                     })
                     .collect(),
@@ -201,16 +205,38 @@ fn any_err(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
     AnyError::new(&e)
 }
 
-fn io_fail(verb: openraft::ErrorVerb, e: impl std::error::Error + Send + Sync + 'static) -> StorageError<NodeId> {
-    StorageIOError::new(openraft::ErrorSubject::StateMachine, verb, AnyError::new(&e)).into()
+fn io_fail(
+    verb: openraft::ErrorVerb,
+    e: impl std::error::Error + Send + Sync + 'static,
+) -> StorageError<NodeId> {
+    StorageIOError::new(
+        openraft::ErrorSubject::StateMachine,
+        verb,
+        AnyError::new(&e),
+    )
+    .into()
 }
 
 fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
-    bincode::serialize(v).map_err(|e| StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, any_err(e)).into())
+    bincode::serialize(v).map_err(|e| {
+        StorageIOError::new(
+            openraft::ErrorSubject::Store,
+            openraft::ErrorVerb::Write,
+            any_err(e),
+        )
+        .into()
+    })
 }
 
 fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<NodeId>> {
-    bincode::deserialize(bytes).map_err(|e| StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, any_err(e)).into())
+    bincode::deserialize(bytes).map_err(|e| {
+        StorageIOError::new(
+            openraft::ErrorSubject::Store,
+            openraft::ErrorVerb::Read,
+            any_err(e),
+        )
+        .into()
+    })
 }
 
 /// A snapshot builder that serializes the group's full state (message
@@ -223,7 +249,9 @@ pub struct SnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<SwitchboardTypeConfig> for SnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<SwitchboardTypeConfig>, StorageError<NodeId>> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<SwitchboardTypeConfig>, StorageError<NodeId>> {
         let last_applied = self
             .kv
             .get(&last_applied_key(&self.prefix))
@@ -341,9 +369,16 @@ impl StateMachine {
         }
     }
 
-    pub fn new(kv: RocksKv, group_id: u32, effects_tx: UnboundedSender<Effect>) -> Result<Self, StorageError<NodeId>> {
+    pub fn new(
+        kv: RocksKv,
+        group_id: u32,
+        effects_tx: UnboundedSender<Effect>,
+    ) -> Result<Self, StorageError<NodeId>> {
         let prefix = format!("g{group_id}:").into_bytes();
-        let mut state = match kv.get(&sm_key(&prefix)).map_err(|e| io_fail(openraft::ErrorVerb::Read, e))? {
+        let mut state = match kv
+            .get(&sm_key(&prefix))
+            .map_err(|e| io_fail(openraft::ErrorVerb::Read, e))?
+        {
             Some(bytes) => de::<BrokerState>(&bytes)?,
             None => BrokerState::default(),
         };
@@ -352,7 +387,10 @@ impl StateMachine {
         // the state no longer knows are stale debris (e.g. a crash
         // between a queue's message purge and its blob persist) — drop.
         let mut orphan_queues: BTreeMap<String, ()> = BTreeMap::new();
-        for (k, v) in kv.prefix_pairs(&msg_prefix(&prefix)).map_err(|e| io_fail(openraft::ErrorVerb::Read, e))? {
+        for (k, v) in kv
+            .prefix_pairs(&msg_prefix(&prefix))
+            .map_err(|e| io_fail(openraft::ErrorVerb::Read, e))?
+        {
             let Some((queue, seq)) = parse_msg_key(&k, &prefix) else {
                 return Err(io_fail(
                     openraft::ErrorVerb::Read,
@@ -465,12 +503,7 @@ impl StateMachine {
 
 /// Tally one unwrapped (post-Idempotent, post-Batch) command against the
 /// group's lifecycle counters.
-fn count_one(
-    c: &SmCounters,
-    cmd: &BrokerCommand,
-    reply: &BrokerReply,
-    effects: &[Effect],
-) {
+fn count_one(c: &SmCounters, cmd: &BrokerCommand, reply: &BrokerReply, effects: &[Effect]) {
     use std::sync::atomic::Ordering;
     let cmd = match cmd {
         BrokerCommand::Idempotent { command, .. } => command.as_ref(),
@@ -489,7 +522,8 @@ fn count_one(
                     message_count,
                 }) = reply
                 {
-                    c.purged.fetch_add(u64::from(*message_count), Ordering::Relaxed);
+                    c.purged
+                        .fetch_add(u64::from(*message_count), Ordering::Relaxed);
                 }
             }
             switchboard_core::shard::ShardCmd::DeleteQueueData { queue: _ } => {
@@ -501,7 +535,10 @@ fn count_one(
         }
     }
     for eff in effects {
-        if let Effect::Shard(switchboard_core::shard::ShardEffect::MessageReady { deleted, .. }) = eff {
+        if let Effect::Shard(switchboard_core::shard::ShardEffect::MessageReady {
+            deleted, ..
+        }) = eff
+        {
             if *deleted {
                 c.noack_removed.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -510,7 +547,8 @@ fn count_one(
         }
     }
     if let BrokerReply::Shard(switchboard_core::shard::ShardReply::Released { released }) = reply {
-        c.released.fetch_add(u64::from(*released), Ordering::Relaxed);
+        c.released
+            .fetch_add(u64::from(*released), Ordering::Relaxed);
     }
 }
 
@@ -519,9 +557,17 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, openraft::impls::BasicNode>), StorageError<NodeId>>
-    {
-        Ok((self.last_applied(), self.membership.lock().expect("sm lock").clone()))
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::impls::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
+        Ok((
+            self.last_applied(),
+            self.membership.lock().expect("sm lock").clone(),
+        ))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<BrokerReply>, StorageError<NodeId>>
@@ -552,7 +598,8 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
                                     if let Some(m) =
                                         st.shard.queues.get(&queue).and_then(|q| q.msgs.get(&seq))
                                     {
-                                        msg_puts.push((msg_key(&self.prefix, &queue, seq), ser(m)?));
+                                        msg_puts
+                                            .push((msg_key(&self.prefix, &queue, seq), ser(m)?));
                                     }
                                 }
                                 switchboard_core::shard::ShardStoreOp::Del { queue, seq } => {
@@ -615,10 +662,16 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        SnapshotBuilder { kv: self.kv.clone(), prefix: self.prefix.clone(), state: self.state.clone() }
+        SnapshotBuilder {
+            kv: self.kv.clone(),
+            prefix: self.prefix.clone(),
+            state: self.state.clone(),
+        }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -648,7 +701,10 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
         let meta_bytes = ser(meta)?;
         self.kv
             .write_mixed(
-                [(snap_meta_key(&self.prefix), meta_bytes), (snap_data_key(&self.prefix), snap_bytes)],
+                [
+                    (snap_meta_key(&self.prefix), meta_bytes),
+                    (snap_data_key(&self.prefix), snap_bytes),
+                ],
                 [],
             )
             .map_err(|e| io_fail(openraft::ErrorVerb::Write, e))?;
@@ -669,7 +725,10 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
         match (meta, data) {
             (Some(m), Some(d)) => {
                 let meta = de::<SnapshotMeta<NodeId, openraft::impls::BasicNode>>(&m)?;
-                Ok(Some(Snapshot { meta, snapshot: Box::new(Cursor::new(d)) }))
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Box::new(Cursor::new(d)),
+                }))
             }
             _ => Ok(None),
         }
@@ -713,7 +772,9 @@ mod tests {
                     0,
                 ),
                 entry(
-                    BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "staging".into() }),
+                    BrokerCommand::Meta(MetaCmd::DeclareVhost {
+                        name: "staging".into(),
+                    }),
                     1,
                 ),
             ])
@@ -721,7 +782,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.len(), 2);
         assert_eq!(resp[0], BrokerReply::Bootstrapped);
-        assert_eq!(resp[1], BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok));
+        assert_eq!(
+            resp[1],
+            BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok)
+        );
 
         // State survives reopening from disk.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -739,7 +803,13 @@ mod tests {
 
         machine
             .apply([
-                entry(BrokerCommand::Shard(ShardCmd::CreateQueueData { queue: "q".into(), policy: Default::default() }), 0),
+                entry(
+                    BrokerCommand::Shard(ShardCmd::CreateQueueData {
+                        queue: "q".into(),
+                        policy: Default::default(),
+                    }),
+                    0,
+                ),
                 entry(
                     BrokerCommand::Shard(ShardCmd::Enqueue {
                         at_ms: 100,
@@ -823,7 +893,10 @@ mod tests {
                 },
                 0,
             ),
-            entry(BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "x".into() }), 1),
+            entry(
+                BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "x".into() }),
+                1,
+            ),
         ])
         .await
         .unwrap();
@@ -837,12 +910,19 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut target = StateMachine::new(kv, 9, tx).unwrap();
         let data = *snap.snapshot;
-        target.install_snapshot(&snap.meta, Box::new(data)).await.unwrap();
+        target
+            .install_snapshot(&snap.meta, Box::new(data))
+            .await
+            .unwrap();
         assert_eq!(target.read_state(), m2.read_state());
         assert_eq!(target.last_applied().unwrap().index, 1);
 
         // And it can be read back.
-        let got = target.get_current_snapshot().await.unwrap().expect("snapshot");
+        let got = target
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot");
         assert_eq!(got.meta.snapshot_id, snap.meta.snapshot_id);
     }
 }

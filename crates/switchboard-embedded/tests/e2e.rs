@@ -8,11 +8,17 @@ mod support;
 
 use std::time::Duration;
 
-use switchboard_embedded::{
-    Broker, BrokerConfig, ConnectError, ConsumeOptions, EmbeddedChannel, OpError,
-    QueueDeleteOptions, QueueOptions, StartError,
-};
-use switchboard_embedded::{ConfirmOutcome, MessageProperties};
+use switchboard_embedded::Broker;
+use switchboard_embedded::BrokerConfig;
+use switchboard_embedded::ConfirmOutcome;
+use switchboard_embedded::ConnectError;
+use switchboard_embedded::ConsumeOptions;
+use switchboard_embedded::EmbeddedChannel;
+use switchboard_embedded::MessageProperties;
+use switchboard_embedded::OpError;
+use switchboard_embedded::QueueDeleteOptions;
+use switchboard_embedded::QueueOptions;
+use switchboard_embedded::StartError;
 use switchboard_wire::field::FieldTable;
 
 use support::init;
@@ -477,7 +483,10 @@ async fn authz_errors_and_gates() {
     // routing, methods/publish.rs:54-58): the guest still sees an empty
     // queue.
     assert!(
-        gch.get("denied-q", true).await.expect("guest get").is_none(),
+        gch.get("denied-q", true)
+            .await
+            .expect("guest get")
+            .is_none(),
         "the refused publish landed anyway"
     );
 

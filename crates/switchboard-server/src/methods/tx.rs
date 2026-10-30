@@ -12,27 +12,32 @@ use crate::channel::ChannelResult;
 use crate::methods::shard_call;
 use crate::outbound::OutboundFrame;
 
-use switchboard_cluster::BrokerCommand;
-use switchboard_core::shard::TxOp;
-use crate::channel::TxOp as ChannelTxOp;
 use crate::channel::LocalConsumer;
+use crate::channel::TxOp as ChannelTxOp;
 use crate::channel::Unacked;
+use switchboard_cluster::BrokerCommand;
 use switchboard_core::model::SubscriptionId;
+use switchboard_core::shard::TxOp;
 
 impl Channel {
-        pub(crate) async fn commit(&self, node: &Arc<ClusterNode>) -> ChannelResult<()> {
+    pub(crate) async fn commit(&self, node: &Arc<ClusterNode>) -> ChannelResult<()> {
         let (ops, tx_id) = {
             let mut inner = self.inner.lock().unwrap();
             let conn = inner.conn;
             let Some(tx) = inner.tx.as_mut() else {
-                return Err(BrokerError::precondition_failed("channel is not transacted")
-                    .for_method(90, 20));
+                return Err(
+                    BrokerError::precondition_failed("channel is not transacted")
+                        .for_method(90, 20),
+                );
             };
             let ops = std::mem::take(&mut tx.ops);
             tx.counter += 1;
             // Unique per (node, connection, commit): prepared state on the
             // shards is keyed by this id.
-            let tx_id: (u64, u64) = (conn.node, conn.conn.wrapping_mul(1_000_003).wrapping_add(tx.counter));
+            let tx_id: (u64, u64) = (
+                conn.node,
+                conn.conn.wrapping_mul(1_000_003).wrapping_add(tx.counter),
+            );
             (ops, tx_id)
         };
         if ops.is_empty() {
@@ -49,26 +54,16 @@ impl Channel {
                     message,
                     ..
                 } => {
-                    per_shard
-                        .entry(*shard)
-                        .or_default()
-                        .push(TxOp::Enqueue {
-                            queue: queue.clone(),
-                            message: message.clone(),
-                        });
+                    per_shard.entry(*shard).or_default().push(TxOp::Enqueue {
+                        queue: queue.clone(),
+                        message: message.clone(),
+                    });
                 }
-                ChannelTxOp::Ack {
-                    queue,
-                    shard,
-                    seq,
-                } => {
-                    per_shard
-                        .entry(*shard)
-                        .or_default()
-                        .push(TxOp::Ack {
-                            queue: queue.clone(),
-                            seq: *seq,
-                        });
+                ChannelTxOp::Ack { queue, shard, seq } => {
+                    per_shard.entry(*shard).or_default().push(TxOp::Ack {
+                        queue: queue.clone(),
+                        seq: *seq,
+                    });
                 }
             }
         }
@@ -99,15 +94,13 @@ impl Channel {
                     ..
                 } = op
                 {
-                    let _ = self
-                        .outbound
-                        .send(OutboundFrame::Method {
-                            channel: self.id,
-                            method: Method::BasicAck {
-                                delivery_tag: seq,
-                                multiple: false,
-                            },
-                        });
+                    let _ = self.outbound.send(OutboundFrame::Method {
+                        channel: self.id,
+                        method: Method::BasicAck {
+                            delivery_tag: seq,
+                            multiple: false,
+                        },
+                    });
                 }
             }
         }
@@ -147,19 +140,18 @@ impl Channel {
         let requeues: Vec<(u64, Unacked)> = holds
             .into_iter()
             .flat_map(|(shard, queue, sub, seqs)| {
-                seqs.into_iter()
-                    .map(move |seq| {
-                        (
-                            0,
-                            Unacked {
-                                queue: queue.clone(),
-                                shard,
-                                seq,
-                                sub,
-                                consumer_tag: None,
-                            },
-                        )
-                    })
+                seqs.into_iter().map(move |seq| {
+                    (
+                        0,
+                        Unacked {
+                            queue: queue.clone(),
+                            shard,
+                            seq,
+                            sub,
+                            consumer_tag: None,
+                        },
+                    )
+                })
             })
             .collect();
         let _ = self.settle_requeues(node, &requeues).await;

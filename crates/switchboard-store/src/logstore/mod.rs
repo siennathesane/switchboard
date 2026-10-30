@@ -6,15 +6,15 @@
 //! * `log/{index:020}` — log entries, ordered by zero-padded index so
 //!   RocksDB prefix iteration yields log order.
 
-use openraft::storage::LogFlushed;
-use openraft::storage::LogState;
-use openraft::storage::RaftLogStorage;
 use openraft::AnyError;
 use openraft::LogId;
 use openraft::RaftLogReader;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::Vote;
+use openraft::storage::LogFlushed;
+use openraft::storage::LogState;
+use openraft::storage::RaftLogStorage;
 use serde::de::DeserializeOwned;
 
 use crate::kv::RocksKv;
@@ -54,16 +54,34 @@ fn any_err(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
     AnyError::new(&e)
 }
 
-fn io_fail(subject: openraft::ErrorSubject<NodeId>, verb: openraft::ErrorVerb, e: impl std::error::Error + Send + Sync + 'static) -> StorageError<NodeId> {
+fn io_fail(
+    subject: openraft::ErrorSubject<NodeId>,
+    verb: openraft::ErrorVerb,
+    e: impl std::error::Error + Send + Sync + 'static,
+) -> StorageError<NodeId> {
     StorageIOError::new(subject, verb, AnyError::new(&e)).into()
 }
 
 fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
-    bincode::serialize(v).map_err(|e| StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, any_err(e)).into())
+    bincode::serialize(v).map_err(|e| {
+        StorageIOError::new(
+            openraft::ErrorSubject::Store,
+            openraft::ErrorVerb::Write,
+            any_err(e),
+        )
+        .into()
+    })
 }
 
 fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<NodeId>> {
-    bincode::deserialize(bytes).map_err(|e| StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, any_err(e)).into())
+    bincode::deserialize(bytes).map_err(|e| {
+        StorageIOError::new(
+            openraft::ErrorSubject::Store,
+            openraft::ErrorVerb::Read,
+            any_err(e),
+        )
+        .into()
+    })
 }
 
 /// Per-group raft log storage.
@@ -77,10 +95,15 @@ impl LogStore {
     /// `group_id` namespaces this store inside the shared database: group 0
     /// is the meta group, 1.. the shard groups.
     pub fn new(kv: RocksKv, group_id: u32) -> Self {
-        LogStore { kv, prefix: format!("g{group_id}:").into_bytes() }
+        LogStore {
+            kv,
+            prefix: format!("g{group_id}:").into_bytes(),
+        }
     }
 
-    fn log_state_raw(&self) -> Result<(Option<LogId<NodeId>>, Option<LogId<NodeId>>), StorageError<NodeId>> {
+    fn log_state_raw(
+        &self,
+    ) -> Result<(Option<LogId<NodeId>>, Option<LogId<NodeId>>), StorageError<NodeId>> {
         let purged = self
             .kv
             .get(&last_purged_key(&self.prefix))
@@ -97,10 +120,7 @@ impl LogStore {
 
     /// Persist a batch of entries; split out of the trait method so tests
     /// can drive it without openraft's flush callback.
-    async fn append_batch<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<(), StorageError<NodeId>>
+    async fn append_batch<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = openraft::Entry<SwitchboardTypeConfig>> + Send,
     {
@@ -127,7 +147,9 @@ impl LogStore {
 }
 
 impl RaftLogReader<SwitchboardTypeConfig> for LogStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend>(
+    async fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend,
+    >(
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<SwitchboardTypeConfig>>, StorageError<NodeId>> {
@@ -175,7 +197,9 @@ impl RaftLogReader<SwitchboardTypeConfig> for LogStore {
 impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
     type LogReader = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<SwitchboardTypeConfig>, StorageError<NodeId>> {
+    async fn get_log_state(
+        &mut self,
+    ) -> Result<LogState<SwitchboardTypeConfig>, StorageError<NodeId>> {
         let (last_purged, last) = self.log_state_raw()?;
         // If the log has no entries, the "last" is the purged id (its
         // index), per openraft's LogState contract.
@@ -183,7 +207,10 @@ impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
             Some(l) => Some(l),
             None => last_purged,
         };
-        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last })
+        Ok(LogState {
+            last_purged_log_id: last_purged,
+            last_log_id: last,
+        })
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
@@ -200,8 +227,7 @@ impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
             .map_err(|e| io_fail(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e))?
             .map(|b| de(&b))
             .transpose()?;
-        if let Some(_v) = &v {
-        }
+        if let Some(_v) = &v {}
         Ok(v)
     }
 
@@ -228,7 +254,10 @@ impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
         // Delete every entry from `log_id.index` upwards.
         let dels: Vec<Vec<u8>> = self
             .kv
-            .pairs_from(&log_key(&self.prefix, log_id.index), &logs_prefix(&self.prefix))
+            .pairs_from(
+                &log_key(&self.prefix, log_id.index),
+                &logs_prefix(&self.prefix),
+            )
             .map_err(|e| io_fail(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Delete, e))?
             .into_iter()
             .map(|(k, _)| k)
@@ -255,10 +284,7 @@ impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
             .collect();
         let watermark = ser(&log_id)?;
         self.kv
-            .write_mixed(
-                [(last_purged_key(&self.prefix), watermark)],
-                dels,
-            )
+            .write_mixed([(last_purged_key(&self.prefix), watermark)], dels)
             .map_err(|e| io_fail(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Delete, e))
     }
 
@@ -290,7 +316,9 @@ mod tests {
         let mut st = store("logstore-basic");
         assert_eq!(st.get_log_state().await.unwrap().last_log_id, None);
 
-        st.append_batch([entry(0, 1), entry(1, 1), entry(2, 2)]).await.unwrap();
+        st.append_batch([entry(0, 1), entry(1, 1), entry(2, 2)])
+            .await
+            .unwrap();
 
         let state = st.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id, None);
@@ -314,12 +342,16 @@ mod tests {
             .unwrap();
 
         // Truncate removes [2..): a conflicting suffix from another leader.
-        st.truncate(LogId::new(CommittedLeaderId::new(1, 1), 2)).await.unwrap();
+        st.truncate(LogId::new(CommittedLeaderId::new(1, 1), 2))
+            .await
+            .unwrap();
         let ents = st.try_get_log_entries(0..u64::MAX).await.unwrap();
         assert_eq!(ents.len(), 2);
 
         // Purge removes [..=1] and records the purged watermark.
-        st.purge(LogId::new(CommittedLeaderId::new(1, 1), 1)).await.unwrap();
+        st.purge(LogId::new(CommittedLeaderId::new(1, 1), 1))
+            .await
+            .unwrap();
         let state = st.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id.unwrap().index, 1);
         let ents = st.try_get_log_entries(0..u64::MAX).await.unwrap();
@@ -376,13 +408,22 @@ mod bounds_tests {
         let all = st.try_get_log_entries(..).await.unwrap();
         assert_eq!(all.len(), 4);
         // Excluded start skips the boundary index.
-        let excl = st.try_get_log_entries((std::ops::Bound::Excluded(1), std::ops::Bound::Unbounded)).await.unwrap();
+        let excl = st
+            .try_get_log_entries((std::ops::Bound::Excluded(1), std::ops::Bound::Unbounded))
+            .await
+            .unwrap();
         assert_eq!(excl.len(), 2, "indices 2 and 3");
         // Included end is inclusive.
-        let incl = st.try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Included(1))).await.unwrap();
+        let incl = st
+            .try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Included(1)))
+            .await
+            .unwrap();
         assert_eq!(incl.len(), 2, "indices 0 and 1");
         // Excluded end is exclusive.
-        let excl_end = st.try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(2))).await.unwrap();
+        let excl_end = st
+            .try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(2)))
+            .await
+            .unwrap();
         assert_eq!(excl_end.len(), 2, "indices 0 and 1");
     }
 

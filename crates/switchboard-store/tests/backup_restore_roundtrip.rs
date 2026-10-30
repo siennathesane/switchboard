@@ -27,8 +27,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use switchboard_embedded::{Broker, BrokerConfig, MessageProperties, QueueOptions};
-use switchboard_store::{backup_store, restore_store, BACKUP_FORMAT_VERSION};
+use switchboard_embedded::Broker;
+use switchboard_embedded::BrokerConfig;
+use switchboard_embedded::MessageProperties;
+use switchboard_embedded::QueueOptions;
+use switchboard_store::BACKUP_FORMAT_VERSION;
+use switchboard_store::backup_store;
+use switchboard_store::restore_store;
 
 const PHASE_ENV: &str = "SWITCHBOARD_STORE_BACKUP_PHASE";
 const DIR_A_ENV: &str = "SWITCHBOARD_STORE_BACKUP_DIR_A";
@@ -119,7 +124,8 @@ fn spawn_phase(
     cmd.env(DIR_A_ENV, dir_a);
     cmd.env(DIR_B_ENV, dir_b);
     cmd.env(ARCHIVE_ENV, archive);
-    cmd.status().expect("failed to spawn backup round-trip phase child")
+    cmd.status()
+        .expect("failed to spawn backup round-trip phase child")
 }
 
 fn child_runtime() -> tokio::runtime::Runtime {
@@ -170,7 +176,10 @@ fn backup_restore_roundtrip_survives_restart() {
                 }
                 // Graceful stop: quiesced store, ready for the parent's
                 // backup.
-                broker.stop(Duration::from_secs(60)).await.expect("graceful stop");
+                broker
+                    .stop(Duration::from_secs(60))
+                    .await
+                    .expect("graceful stop");
             });
             // Explicit exit: lingering join handles must not hang the
             // libtest child after the phase body is done.
@@ -238,7 +247,10 @@ fn backup_restore_roundtrip_survives_restart() {
     assert!(dir_a.exists(), "phase a must have left a store at dir A");
     let header = backup_store(&dir_a, &archive).expect("backup of the stopped broker's store");
     assert_eq!(header.format_version, BACKUP_FORMAT_VERSION);
-    assert!(!header.files.is_empty(), "the archive must carry the store's files");
+    assert!(
+        !header.files.is_empty(),
+        "the archive must carry the store's files"
+    );
     assert!(archive.exists());
 
     let b = spawn_phase(test_name, "b", &dir_a, &dir_b, &archive);

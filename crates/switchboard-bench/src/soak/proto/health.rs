@@ -11,8 +11,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::soak::client;
 use crate::soak::Ctx;
+use crate::soak::client;
 
 pub async fn run(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(ctx.cfg.health_every);
@@ -45,7 +45,12 @@ async fn probe(ctx: &Arc<Ctx>, host: &str) {
     match get_health(host).await {
         Some(true) => ctx.ledger.metrics.add("health.ok", 1),
         Some(false) => {
-            ctx.error("health", "body", host, "/health answered but not {\"status\":\"ok\"}".into());
+            ctx.error(
+                "health",
+                "body",
+                host,
+                "/health answered but not {\"status\":\"ok\"}".into(),
+            );
         }
         None => {
             ctx.infra_bounce("health", host, "/health unreachable".into());

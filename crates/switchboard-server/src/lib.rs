@@ -20,11 +20,15 @@
 pub mod channel;
 pub mod listener;
 pub mod methods;
-pub mod protocols;
 pub mod outbound;
+pub mod protocols;
 pub mod session;
 pub mod tls;
 
-pub use channel::{Channel, ChannelInner, ConnectionLimits, LocalConsumer, Unacked};
+pub use channel::Channel;
+pub use channel::ChannelInner;
+pub use channel::ConnectionLimits;
+pub use channel::LocalConsumer;
+pub use channel::Unacked;
 pub use protocols::ProtocolConfig;
 pub use session::serve;

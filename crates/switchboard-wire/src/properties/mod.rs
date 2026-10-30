@@ -12,12 +12,14 @@
 //! their respective property flag and are never present in the property
 //! list."
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::error::CodecError;
 use crate::field::FieldTable;
 use crate::method::BASIC_CLASS_ID;
-use crate::wireio::{Decoder, Encoder};
+use crate::wireio::Decoder;
+use crate::wireio::Encoder;
 
 /// The property set of the Basic class, in wire order.
 ///
@@ -117,20 +119,48 @@ impl BasicProperties {
             e.u16(*w);
         }
 
-        if let Some(v) = &self.content_type { e.short_str(v); }
-        if let Some(v) = &self.content_encoding { e.short_str(v); }
-        if let Some(v) = &self.headers { v.encode(e); }
-        if let Some(v) = &self.delivery_mode { e.u8(*v); }
-        if let Some(v) = &self.priority { e.u8(*v); }
-        if let Some(v) = &self.correlation_id { e.short_str(v); }
-        if let Some(v) = &self.reply_to { e.short_str(v); }
-        if let Some(v) = &self.expiration { e.short_str(v); }
-        if let Some(v) = &self.message_id { e.short_str(v); }
-        if let Some(v) = &self.timestamp { e.u64(*v); }
-        if let Some(v) = &self.message_type { e.short_str(v); }
-        if let Some(v) = &self.user_id { e.short_str(v); }
-        if let Some(v) = &self.app_id { e.short_str(v); }
-        if let Some(v) = &self.cluster_id { e.short_str(v); }
+        if let Some(v) = &self.content_type {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.content_encoding {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.headers {
+            v.encode(e);
+        }
+        if let Some(v) = &self.delivery_mode {
+            e.u8(*v);
+        }
+        if let Some(v) = &self.priority {
+            e.u8(*v);
+        }
+        if let Some(v) = &self.correlation_id {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.reply_to {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.expiration {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.message_id {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.timestamp {
+            e.u64(*v);
+        }
+        if let Some(v) = &self.message_type {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.user_id {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.app_id {
+            e.short_str(v);
+        }
+        if let Some(v) = &self.cluster_id {
+            e.short_str(v);
+        }
     }
 
     /// Decode property flags + list from a content-header payload whose
@@ -165,20 +195,48 @@ impl BasicProperties {
 
         let mut it = flag_bits.into_iter();
         let mut next_flag = || Ok(it.next().unwrap_or(false));
-        if next_flag()? { p.content_type = Some(d.short_str()?); }
-        if next_flag()? { p.content_encoding = Some(d.short_str()?); }
-        if next_flag()? { p.headers = Some(FieldTable::decode(d)?); }
-        if next_flag()? { p.delivery_mode = Some(d.u8()?); }
-        if next_flag()? { p.priority = Some(d.u8()?); }
-        if next_flag()? { p.correlation_id = Some(d.short_str()?); }
-        if next_flag()? { p.reply_to = Some(d.short_str()?); }
-        if next_flag()? { p.expiration = Some(d.short_str()?); }
-        if next_flag()? { p.message_id = Some(d.short_str()?); }
-        if next_flag()? { p.timestamp = Some(d.u64()?); }
-        if next_flag()? { p.message_type = Some(d.short_str()?); }
-        if next_flag()? { p.user_id = Some(d.short_str()?); }
-        if next_flag()? { p.app_id = Some(d.short_str()?); }
-        if next_flag()? { p.cluster_id = Some(d.short_str()?); }
+        if next_flag()? {
+            p.content_type = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.content_encoding = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.headers = Some(FieldTable::decode(d)?);
+        }
+        if next_flag()? {
+            p.delivery_mode = Some(d.u8()?);
+        }
+        if next_flag()? {
+            p.priority = Some(d.u8()?);
+        }
+        if next_flag()? {
+            p.correlation_id = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.reply_to = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.expiration = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.message_id = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.timestamp = Some(d.u64()?);
+        }
+        if next_flag()? {
+            p.message_type = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.user_id = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.app_id = Some(d.short_str()?);
+        }
+        if next_flag()? {
+            p.cluster_id = Some(d.short_str()?);
+        }
         Ok(p)
     }
 }
@@ -199,7 +257,12 @@ pub struct ContentHeader {
 
 impl ContentHeader {
     pub fn new(body_size: u64, properties: BasicProperties) -> Self {
-        ContentHeader { class_id: BASIC_CLASS_ID, weight: 0, body_size, properties }
+        ContentHeader {
+            class_id: BASIC_CLASS_ID,
+            weight: 0,
+            body_size,
+            properties,
+        }
     }
 
     pub fn encode(&self, e: &mut Encoder) {
@@ -213,7 +276,10 @@ impl ContentHeader {
     pub fn decode(expected_class: u16, d: &mut Decoder<'_>) -> Result<Self, CodecError> {
         let class_id = d.u16()?;
         if class_id != expected_class {
-            return Err(CodecError::ContentClassMismatch { actual: class_id, expected: expected_class });
+            return Err(CodecError::ContentClassMismatch {
+                actual: class_id,
+                expected: expected_class,
+            });
         }
         let weight = d.u16()?;
         if weight != 0 {
@@ -221,7 +287,12 @@ impl ContentHeader {
         }
         let body_size = d.u64()?;
         let properties = BasicProperties::decode(d)?;
-        Ok(ContentHeader { class_id, weight, body_size, properties })
+        Ok(ContentHeader {
+            class_id,
+            weight,
+            body_size,
+            properties,
+        })
     }
 }
 
@@ -257,7 +328,10 @@ mod tests {
 
     #[test]
     fn first_property_sets_bit_15() {
-        let p = BasicProperties { content_type: Some("text/plain".into()), ..Default::default() };
+        let p = BasicProperties {
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
         let mut e = Encoder::new();
         p.encode(&mut e);
         let buf = e.finish();
@@ -269,7 +343,10 @@ mod tests {
 
     #[test]
     fn last_property_sets_final_bit() {
-        let p = BasicProperties { cluster_id: Some("c".into()), ..Default::default() };
+        let p = BasicProperties {
+            cluster_id: Some("c".into()),
+            ..Default::default()
+        };
         let mut e = Encoder::new();
         p.encode(&mut e);
         let buf = e.finish();
@@ -338,7 +415,10 @@ mod tests {
         let mut d = Decoder::new(&buf);
         assert!(matches!(
             ContentHeader::decode(99, &mut d),
-            Err(CodecError::ContentClassMismatch { actual: 60, expected: 99 })
+            Err(CodecError::ContentClassMismatch {
+                actual: 60,
+                expected: 99
+            })
         ));
 
         // nonzero weight -> rejected

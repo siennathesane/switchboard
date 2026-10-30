@@ -19,11 +19,15 @@
 
 use std::ffi::c_void;
 
-use switchboard_embedded::{Broker, EmbeddedChannel, EmbeddedConnection};
-use tokio::runtime::{Handle, Runtime};
+use switchboard_embedded::Broker;
+use switchboard_embedded::EmbeddedChannel;
+use switchboard_embedded::EmbeddedConnection;
+use tokio::runtime::Handle;
+use tokio::runtime::Runtime;
 
 use crate::status::SbStatus;
-use crate::table::{self, Kind};
+use crate::table::Kind;
+use crate::table::{self};
 
 /// Builder for one broker: `sb_config_create` + `sb_config_set_*` fns.
 pub struct SbConfig {

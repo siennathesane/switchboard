@@ -9,7 +9,8 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Env var marking a self-exec restart child and its phase (embedded

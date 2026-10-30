@@ -11,11 +11,7 @@ fn state() -> MetaState {
 
 impl MetaState {
     fn set_test_groups(&mut self) {
-        self.groups = BTreeMap::from([
-            (1, vec![1, 2, 3]),
-            (2, vec![2, 3, 4]),
-            (3, vec![3, 4, 5]),
-        ]);
+        self.groups = BTreeMap::from([(1, vec![1, 2, 3]), (2, vec![2, 3, 4]), (3, vec![3, 4, 5])]);
     }
 }
 
@@ -29,7 +25,10 @@ fn declare_q(state: &mut MetaState, name: &str, durable: bool) -> MetaReply {
             vhost: "/".into(),
             name: name.into(),
             passive: false,
-            options: QueueOptions { durable, ..Default::default() },
+            options: QueueOptions {
+                durable,
+                ..Default::default()
+            },
             owner: owner(),
         })
         .unwrap();
@@ -72,7 +71,12 @@ fn bootstrap_has_default_vhost_exchanges_and_user() {
 fn queue_declare_create_assign_delete() {
     let mut s = state();
     let r = declare_q(&mut s, "jobs", true);
-    let MetaReply::QueueDeclared { name, shard, created } = r else {
+    let MetaReply::QueueDeclared {
+        name,
+        shard,
+        created,
+    } = r
+    else {
         panic!("wrong reply");
     };
     assert_eq!(name, "jobs");
@@ -82,29 +86,36 @@ fn queue_declare_create_assign_delete() {
 
     // Equivalent re-declare: not created.
     let r = declare_q(&mut s, "jobs", true);
-    let MetaReply::QueueDeclared { created, .. } = r else { panic!() };
+    let MetaReply::QueueDeclared { created, .. } = r else {
+        panic!()
+    };
     assert!(!created);
 
     // Different durability: 406.
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "jobs".into(),
-        passive: false,
-        options: QueueOptions { durable: false, ..Default::default() },
-        owner: owner(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "jobs".into(),
+            passive: false,
+            options: QueueOptions {
+                durable: false,
+                ..Default::default()
+            },
+            owner: owner(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 406);
 
     // Passive of missing: 404.
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "nope".into(),
-        passive: true,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "nope".into(),
+            passive: true,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 404);
 
     // Delete: cascades shard effect.
@@ -121,21 +132,25 @@ fn queue_declare_create_assign_delete() {
     assert_eq!(reply, MetaReply::QueueDeleted { message_count: 5 });
     assert_eq!(
         effects,
-        vec![MetaEffect::QueueDeleted { queue: "jobs".into(), shard: jobs_shard }]
+        vec![MetaEffect::QueueDeleted {
+            queue: "jobs".into(),
+            shard: jobs_shard
+        }]
     );
 }
 
 #[test]
 fn queue_declare_reserved_names_and_server_naming() {
     let mut s = state();
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "amq.rogue".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "amq.rogue".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 403);
 
     // Server-named queues: the caller resolves the name (deterministic
@@ -143,54 +158,65 @@ fn queue_declare_reserved_names_and_server_naming() {
     let generated = crate::model::generate_queue_name();
     assert!(generated.starts_with("amq.gen-"));
     assert_eq!(generated.len(), "amq.gen-".len() + 22);
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: generated,
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { created, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: generated,
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { created, .. } = r else {
+        panic!()
+    };
     assert!(created);
 
     // ...and an empty name is an internal invariant violation (506).
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: String::new(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: String::new(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 506);
 }
 
 #[test]
 fn exclusive_queue_ownership() {
     let mut s = state();
-    let opts = QueueOptions { exclusive: true, ..Default::default() };
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "priv".into(),
-        passive: false,
-        options: opts.clone(),
-        owner: owner(),
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { name, .. } = r else { panic!() };
+    let opts = QueueOptions {
+        exclusive: true,
+        ..Default::default()
+    };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "priv".into(),
+            passive: false,
+            options: opts.clone(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name, .. } = r else {
+        panic!()
+    };
     assert_eq!(s.vhost("/").unwrap().queues[&name].owner, Some(owner()));
 
     // Another connection: 405 RESOURCE_LOCKED.
     let other = crate::model::ConnectionId { node: 2, conn: 9 };
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "priv".into(),
-        passive: false,
-        options: opts,
-        owner: other,
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "priv".into(),
+            passive: false,
+            options: opts,
+            owner: other,
+        })
+        .unwrap_err();
     assert_eq!(e.code, 405);
     assert_eq!(e.level, Level::Channel);
 }
@@ -200,17 +226,18 @@ fn exchange_lifecycle_rules() {
     let mut s = state();
 
     // Reserved prefix, not a bootstrap name: 403.
-    let e = s.apply(&MetaCmd::DeclareExchange {
-        vhost: "/".into(),
-        name: "amq.mine".into(),
-        kind: ExchangeKind::Direct,
-        passive: false,
-        durable: false,
-        auto_delete: false,
-        internal: false,
-        arguments: FieldTable::new(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareExchange {
+            vhost: "/".into(),
+            name: "amq.mine".into(),
+            kind: ExchangeKind::Direct,
+            passive: false,
+            durable: false,
+            auto_delete: false,
+            internal: false,
+            arguments: FieldTable::new(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 403);
 
     // Create + equivalent redeclare + 406 on mismatch.
@@ -232,44 +259,46 @@ fn exchange_lifecycle_rules() {
     assert_eq!(e.code, 406);
 
     // Unknown standard-spelled type: 503; unknown x- type: 540.
-    assert!(matches!(
-        ExchangeKind::from_str("xy"),
-        None
-    ));
+    assert!(matches!(ExchangeKind::from_str("xy"), None));
 
     // Passive declare of existing works, of missing 404.
-    let (r, _) = s.apply(&MetaCmd::DeclareExchange {
-        vhost: "/".into(),
-        name: "work".into(),
-        kind: ExchangeKind::Topic,
-        passive: true,
-        durable: true,
-        auto_delete: false,
-        internal: false,
-        arguments: FieldTable::new(),
-    })
-    .unwrap();
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareExchange {
+            vhost: "/".into(),
+            name: "work".into(),
+            kind: ExchangeKind::Topic,
+            passive: true,
+            durable: true,
+            auto_delete: false,
+            internal: false,
+            arguments: FieldTable::new(),
+        })
+        .unwrap();
     assert_eq!(r, MetaReply::ExchangeDeclared { existed: true });
 
     // Default exchange cannot be deleted.
-    let e = s.apply(&MetaCmd::DeleteExchange {
-        vhost: "/".into(),
-        name: "".into(),
-        if_unused: false,
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeleteExchange {
+            vhost: "/".into(),
+            name: "".into(),
+            if_unused: false,
+        })
+        .unwrap_err();
     assert_eq!(e.code, 403);
 
     // Delete removes bindings too.
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "bq".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { name: bq, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "bq".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name: bq, .. } = r else {
+        panic!()
+    };
     s.apply(&MetaCmd::Bind {
         vhost: "/".into(),
         exchange: "work".into(),
@@ -292,36 +321,41 @@ fn exchange_lifecycle_rules() {
 #[test]
 fn bind_unbind_rules() {
     let mut s = state();
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "q".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { name: q, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "q".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name: q, .. } = r else {
+        panic!()
+    };
 
     // Bind to default exchange: 403.
-    let e = s.apply(&MetaCmd::Bind {
-        vhost: "/".into(),
-        exchange: "".into(),
-        queue: q.clone(),
-        routing_key: "k".into(),
-        arguments: FieldTable::new(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Bind {
+            vhost: "/".into(),
+            exchange: "".into(),
+            queue: q.clone(),
+            routing_key: "k".into(),
+            arguments: FieldTable::new(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 403);
 
     // Bind to missing exchange: 404; missing queue: 404.
-    let e = s.apply(&MetaCmd::Bind {
-        vhost: "/".into(),
-        exchange: "amq.direct".into(),
-        queue: "ghost".into(),
-        routing_key: "k".into(),
-        arguments: FieldTable::new(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Bind {
+            vhost: "/".into(),
+            exchange: "amq.direct".into(),
+            queue: "ghost".into(),
+            routing_key: "k".into(),
+            arguments: FieldTable::new(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 404);
 
     let bind = |args| MetaCmd::Bind {
@@ -362,15 +396,18 @@ fn auto_delete_exchange_dies_with_last_unbind() {
         arguments: FieldTable::new(),
     })
     .unwrap();
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "q".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { name: q, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "q".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name: q, .. } = r else {
+        panic!()
+    };
     s.apply(&MetaCmd::Bind {
         vhost: "/".into(),
         exchange: "flash".into(),
@@ -431,20 +468,26 @@ fn forget_node_cascades_its_exclusive_queues() {
         vhost: "/".into(),
         name: crate::model::generate_queue_name(),
         passive: false,
-        options: QueueOptions { exclusive: true, ..Default::default() },
+        options: QueueOptions {
+            exclusive: true,
+            ..Default::default()
+        },
         owner: dead_owner,
     })
     .unwrap();
     assert_eq!(s.vhost("/").unwrap().queues.len(), 1);
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "/".into(),
-        name: "keeper".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: dead_owner,
-    })
-    .unwrap();
-    let MetaReply::QueueDeclared { name: keeper, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "/".into(),
+            name: "keeper".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: dead_owner,
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name: keeper, .. } = r else {
+        panic!()
+    };
 
     let (_, effects) = s.apply(&MetaCmd::ForgetNode { node: 7 }).unwrap();
     let v = s.vhost("/").unwrap();
@@ -477,27 +520,34 @@ fn routing_view_over_vhost() {
 #[test]
 fn vhost_isolation() {
     let mut s = state();
-    s.apply(&MetaCmd::DeclareVhost { name: "staging".into() }).unwrap();
-    let (r, _) = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "staging".into(),
-        name: "q".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
+    s.apply(&MetaCmd::DeclareVhost {
+        name: "staging".into(),
     })
     .unwrap();
-    let MetaReply::QueueDeclared { name, .. } = r else { panic!() };
+    let (r, _) = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "staging".into(),
+            name: "q".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap();
+    let MetaReply::QueueDeclared { name, .. } = r else {
+        panic!()
+    };
     assert!(!s.vhost("/").unwrap().queues.contains_key(&name));
     assert!(s.vhost("staging").unwrap().queues.contains_key(&name));
     // Unknown vhost: 402 INVALID_PATH (connection level).
-    let e = s.apply(&MetaCmd::DeclareQueue {
-        vhost: "nope".into(),
-        name: "q".into(),
-        passive: false,
-        options: QueueOptions::default(),
-        owner: owner(),
-    })
-    .unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeclareQueue {
+            vhost: "nope".into(),
+            name: "q".into(),
+            passive: false,
+            options: QueueOptions::default(),
+            owner: owner(),
+        })
+        .unwrap_err();
     assert_eq!(e.code, 402);
 }
 
@@ -524,7 +574,10 @@ fn set_retained_stores_and_clears() {
         .unwrap();
     assert_eq!(r, MetaReply::Ok);
     assert!(fx.is_empty());
-    assert_eq!(s.retained[&("/".to_string(), "state/last".to_string())].body, b"state");
+    assert_eq!(
+        s.retained[&("/".to_string(), "state/last".to_string())].body,
+        b"state"
+    );
 
     // Clearing removes the entry.
     s.apply(&MetaCmd::SetRetained {
@@ -533,7 +586,10 @@ fn set_retained_stores_and_clears() {
         message: None,
     })
     .unwrap();
-    assert!(!s.retained.contains_key(&("/".to_string(), "state/last".to_string())));
+    assert!(
+        !s.retained
+            .contains_key(&("/".to_string(), "state/last".to_string()))
+    );
 }
 
 #[test]
@@ -544,7 +600,10 @@ fn register_and_forget_nodes_roundtrip() {
         internal_addr: "127.0.0.1:2".into(),
     };
     let (r, _) = s
-        .apply(&MetaCmd::RegisterNode { node: 42, info: info.clone() })
+        .apply(&MetaCmd::RegisterNode {
+            node: 42,
+            info: info.clone(),
+        })
         .unwrap();
     assert_eq!(r, MetaReply::Ok);
     assert_eq!(s.nodes[&42], info);
@@ -718,50 +777,60 @@ fn declare_queue_without_shard_layout_is_rejected() {
 fn unknown_vhost_is_rejected_for_every_lifecycle_command() {
     let mut s = state();
 
-    let e = s.apply(&MetaCmd::DeleteQueue {
-        vhost: "ghost".into(),
-        name: "q".into(),
-        if_unused: false,
-        if_empty: false,
-        depth: 0,
-        consumers: 0,
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeleteQueue {
+            vhost: "ghost".into(),
+            name: "q".into(),
+            if_unused: false,
+            if_empty: false,
+            depth: 0,
+            consumers: 0,
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no vhost"), "{e:?}");
 
-    let e = s.apply(&MetaCmd::DeleteExchange {
-        vhost: "ghost".into(),
-        name: "ex".into(),
-        if_unused: false,
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeleteExchange {
+            vhost: "ghost".into(),
+            name: "ex".into(),
+            if_unused: false,
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no vhost"), "{e:?}");
 
-    let e = s.apply(&MetaCmd::Bind {
-        vhost: "ghost".into(),
-        exchange: "amq.direct".into(),
-        queue: "q".into(),
-        routing_key: "rk".into(),
-        arguments: Default::default(),
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Bind {
+            vhost: "ghost".into(),
+            exchange: "amq.direct".into(),
+            queue: "q".into(),
+            routing_key: "rk".into(),
+            arguments: Default::default(),
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no vhost"), "{e:?}");
 
-    let e = s.apply(&MetaCmd::Unbind {
-        vhost: "ghost".into(),
-        exchange: "amq.direct".into(),
-        queue: "q".into(),
-        routing_key: "rk".into(),
-        arguments: Default::default(),
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Unbind {
+            vhost: "ghost".into(),
+            exchange: "amq.direct".into(),
+            queue: "q".into(),
+            routing_key: "rk".into(),
+            arguments: Default::default(),
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no vhost"), "{e:?}");
 }
 
 #[test]
 fn delete_missing_exchange_is_not_found() {
     let mut s = state();
-    let e = s.apply(&MetaCmd::DeleteExchange {
-        vhost: "/".into(),
-        name: "never".into(),
-        if_unused: false,
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeleteExchange {
+            vhost: "/".into(),
+            name: "never".into(),
+            if_unused: false,
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no exchange"), "{e:?}");
 }
 
@@ -770,20 +839,24 @@ fn delete_exchange_in_use_is_precondition_failed() {
     let mut s = state();
     // amq.direct with a live binding is "in use" when if_unused is set.
     declare_q(&mut s, "bound-q", true);
-    let (r, _) = s.apply(&MetaCmd::Bind {
-        vhost: "/".into(),
-        exchange: "amq.direct".into(),
-        queue: "bound-q".into(),
-        routing_key: "rk".into(),
-        arguments: Default::default(),
-    }).unwrap();
+    let (r, _) = s
+        .apply(&MetaCmd::Bind {
+            vhost: "/".into(),
+            exchange: "amq.direct".into(),
+            queue: "bound-q".into(),
+            routing_key: "rk".into(),
+            arguments: Default::default(),
+        })
+        .unwrap();
     assert!(matches!(r, MetaReply::Bound { .. }), "{r:?}");
 
-    let e = s.apply(&MetaCmd::DeleteExchange {
-        vhost: "/".into(),
-        name: "amq.direct".into(),
-        if_unused: true,
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::DeleteExchange {
+            vhost: "/".into(),
+            name: "amq.direct".into(),
+            if_unused: true,
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("in use"), "{e:?}");
 
     // Without if_unused the delete succeeds despite bindings.
@@ -791,20 +864,23 @@ fn delete_exchange_in_use_is_precondition_failed() {
         vhost: "/".into(),
         name: "amq.direct".into(),
         if_unused: false,
-    }).unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn bind_to_missing_exchange_is_not_found() {
     let mut s = state();
     declare_q(&mut s, "orphan-q", true);
-    let e = s.apply(&MetaCmd::Bind {
-        vhost: "/".into(),
-        exchange: "ghost-ex".into(),
-        queue: "orphan-q".into(),
-        routing_key: "rk".into(),
-        arguments: Default::default(),
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Bind {
+            vhost: "/".into(),
+            exchange: "ghost-ex".into(),
+            queue: "orphan-q".into(),
+            routing_key: "rk".into(),
+            arguments: Default::default(),
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no exchange"), "{e:?}");
 }
 
@@ -812,26 +888,30 @@ fn bind_to_missing_exchange_is_not_found() {
 fn unbind_from_default_exchange_is_access_refused() {
     let mut s = state();
     declare_q(&mut s, "dq", true);
-    let e = s.apply(&MetaCmd::Unbind {
-        vhost: "/".into(),
-        exchange: "".into(),
-        queue: "dq".into(),
-        routing_key: "dq".into(),
-        arguments: Default::default(),
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Unbind {
+            vhost: "/".into(),
+            exchange: "".into(),
+            queue: "dq".into(),
+            routing_key: "dq".into(),
+            arguments: Default::default(),
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("default exchange"), "{e:?}");
 }
 
 #[test]
 fn unbind_to_missing_destination_is_not_found() {
     let mut s = state();
-    let e = s.apply(&MetaCmd::Unbind {
-        vhost: "/".into(),
-        exchange: "amq.direct".into(),
-        queue: "never-declared".into(),
-        routing_key: "rk".into(),
-        arguments: Default::default(),
-    }).unwrap_err();
+    let e = s
+        .apply(&MetaCmd::Unbind {
+            vhost: "/".into(),
+            exchange: "amq.direct".into(),
+            queue: "never-declared".into(),
+            routing_key: "rk".into(),
+            arguments: Default::default(),
+        })
+        .unwrap_err();
     assert!(format!("{e:?}").contains("no binding"), "{e:?}");
 }
 
@@ -839,19 +919,20 @@ fn unbind_to_missing_destination_is_not_found() {
 fn fanout_done_moves_the_id_to_recent_and_out_of_pending() {
     let mut s = state();
     let id = uuid::Uuid::new_v4();
-    let (r, _) = s.apply(&MetaCmd::FanoutBegin {
-        id,
-        vhost: "/".into(),
-        message: crate::model::StoredMessage {
-            properties: Default::default(),
-            body: b"m".to_vec(),
-            exchange: "amq.direct".into(),
-            routing_key: "rk".into(),
-            persistent: false,
-        },
-        queues: vec!["q1".into(), "q2".into()],
-    })
-    .unwrap();
+    let (r, _) = s
+        .apply(&MetaCmd::FanoutBegin {
+            id,
+            vhost: "/".into(),
+            message: crate::model::StoredMessage {
+                properties: Default::default(),
+                body: b"m".to_vec(),
+                exchange: "amq.direct".into(),
+                routing_key: "rk".into(),
+                persistent: false,
+            },
+            queues: vec!["q1".into(), "q2".into()],
+        })
+        .unwrap();
     assert!(matches!(r, MetaReply::FanoutBegun), "{r:?}");
     assert_eq!(s.pending_fanouts.len(), 1);
     assert!(!s.recent_fanouts.contains(&id));
@@ -863,6 +944,9 @@ fn fanout_done_moves_the_id_to_recent_and_out_of_pending() {
     // is what lets a publisher distinguish "done" from "not yet locally
     // visible" when waiting for its confirm.
     assert!(s.recent_fanouts.contains(&id));
-    assert_eq!(s.apply(&MetaCmd::FanoutDone { id }).unwrap().0, MetaReply::FanoutDone);
+    assert_eq!(
+        s.apply(&MetaCmd::FanoutDone { id }).unwrap().0,
+        MetaReply::FanoutDone
+    );
     assert!(s.recent_fanouts.contains(&id));
 }

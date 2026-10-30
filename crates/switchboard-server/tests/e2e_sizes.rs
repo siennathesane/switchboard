@@ -12,10 +12,13 @@ use std::collections::BTreeSet;
 
 use switchboard_wire::BasicProperties;
 
-use support::{
-    basic_get, connect_and_open, declare_queue_everywhere, publish, start_cluster,
-    teardown_cluster, TestClient,
-};
+use support::TestClient;
+use support::basic_get;
+use support::connect_and_open;
+use support::declare_queue_everywhere;
+use support::publish;
+use support::start_cluster;
+use support::teardown_cluster;
 
 /// Serializes the nine size scenarios (see module docs).
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -78,9 +81,14 @@ async fn size_scenario(n: u64) {
             "n={n}: duplicate deliveries: {seen:?}"
         );
     }
-    let expected: BTreeSet<Vec<u8>> = (0..n as u64).map(|i| format!("n{i}").into_bytes()).collect();
+    let expected: BTreeSet<Vec<u8>> = (0..n as u64)
+        .map(|i| format!("n{i}").into_bytes())
+        .collect();
     let got: BTreeSet<Vec<u8>> = seen.into_iter().collect();
-    assert_eq!(got, expected, "n={n}: exactly the per-node writes must land");
+    assert_eq!(
+        got, expected,
+        "n={n}: exactly the per-node writes must land"
+    );
 
     teardown_cluster(&nodes, listeners).await;
 }

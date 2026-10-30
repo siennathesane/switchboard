@@ -8,7 +8,8 @@
 //! * `AMQPLAIN`: the client's response is a field table (without its
 //!   length prefix) containing `LOGIN` and `PASSWORD`.
 
-use switchboard_wire::field::{FieldValue, FieldTable};
+use switchboard_wire::field::FieldTable;
+use switchboard_wire::field::FieldValue;
 use switchboard_wire::wireio::Decoder;
 
 use crate::error::BrokerError;
@@ -93,7 +94,9 @@ mod tests {
 
     #[test]
     fn plain_roundtrip() {
-        let response = [0, b'g', b'u', b'e', b's', b't', 0, b'g', b'u', b'e', b's', b't'];
+        let response = [
+            0, b'g', b'u', b'e', b's', b't', 0, b'g', b'u', b'e', b's', b't',
+        ];
         assert_eq!(authenticate("PLAIN", &response, check).unwrap(), "guest");
     }
 
@@ -117,8 +120,14 @@ mod tests {
     #[test]
     fn amqplain_roundtrip() {
         let mut t = FieldTable::new();
-        t.insert("LOGIN", switchboard_wire::FieldValue::ShortString("guest".into()));
-        t.insert("PASSWORD", switchboard_wire::FieldValue::ShortString("guest".into()));
+        t.insert(
+            "LOGIN",
+            switchboard_wire::FieldValue::ShortString("guest".into()),
+        );
+        t.insert(
+            "PASSWORD",
+            switchboard_wire::FieldValue::ShortString("guest".into()),
+        );
         let mut e = switchboard_wire::wireio::Encoder::new();
         t.encode(&mut e);
         // AMQPLAIN response is the table WITHOUT its length prefix.
@@ -136,7 +145,10 @@ mod tests {
     #[test]
     fn amqplain_missing_fields() {
         let mut t = FieldTable::new();
-        t.insert("LOGIN", switchboard_wire::FieldValue::ShortString("guest".into()));
+        t.insert(
+            "LOGIN",
+            switchboard_wire::FieldValue::ShortString("guest".into()),
+        );
         let mut e = switchboard_wire::wireio::Encoder::new();
         t.encode(&mut e);
         let response = &e.finish()[4..];
@@ -161,7 +173,10 @@ fn hash_memo() -> &'static std::sync::Mutex<Option<(String, String)>> {
 /// embedded in its PHC string, so tuning only affects new hashes.
 fn argon2_params() -> argon2::Params {
     fn num(key: &str, default: u32) -> u32 {
-        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
     let m_kib = num("SWITCHBOARD_ARGON2_M_KIB", 19_456);
     let t = num("SWITCHBOARD_ARGON2_T", 2);
@@ -170,7 +185,11 @@ fn argon2_params() -> argon2::Params {
 }
 
 fn argon2_instance() -> argon2::Argon2<'static> {
-    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2_params())
+    argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2_params(),
+    )
 }
 
 /// Hash a password for at-rest storage: argon2id. The PHC string carries
@@ -187,7 +206,8 @@ pub fn hash_password(password: &str) -> String {
             return hash.clone();
         }
     }
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::PasswordHasher;
+    use argon2::password_hash::SaltString;
     use rand::RngCore;
     let mut salt_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut salt_bytes);
@@ -219,7 +239,9 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
                     argon2::Version::V0x13,
                     params,
                 );
-                instance.verify_password(password.as_bytes(), &parsed).is_ok()
+                instance
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
             }
             Err(_) => false,
         }

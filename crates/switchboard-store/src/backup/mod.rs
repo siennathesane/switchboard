@@ -165,10 +165,7 @@ pub struct BackupHeader {
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
     #[error("not a switchboard backup archive (bad magic {found:?}; expected {expected:?})")]
-    NotABackup {
-        found: [u8; 4],
-        expected: [u8; 4],
-    },
+    NotABackup { found: [u8; 4], expected: [u8; 4] },
     #[error(
         "backup format version {found} is newer than this build supports (supported up to v{supported}); \
          refusing to restore — use a switchboard build that understands format v{found}"
@@ -220,10 +217,7 @@ pub enum BackupError {
 pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, BackupError> {
     // The output's parent must exist before the checkpoint lands (RocksDB
     // stages the checkpoint as a sibling `<dest>.tmp` directory).
-    if let Some(parent) = out_file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+    if let Some(parent) = out_file.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(BackupError::Io)?;
     }
     // Refuse a directory that was never a store: opening it with
@@ -247,10 +241,11 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
     if staging.exists() {
         std::fs::remove_dir_all(&staging).map_err(BackupError::Io)?;
     }
-    kv.create_checkpoint(&staging).map_err(|e| BackupError::Checkpoint {
-        path: data_dir.to_path_buf(),
-        cause: e.to_string(),
-    })?;
+    kv.create_checkpoint(&staging)
+        .map_err(|e| BackupError::Checkpoint {
+            path: data_dir.to_path_buf(),
+            cause: e.to_string(),
+        })?;
     // The checkpoint dir is now self-contained; release the store lock
     // before the (potentially long) archive copy.
     drop(kv);
@@ -274,7 +269,8 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
             .collect(),
     };
 
-    let header_json = serde_json::to_vec(&header).map_err(|e| BackupError::Corrupt(format!("header serialize: {e}")))?;
+    let header_json = serde_json::to_vec(&header)
+        .map_err(|e| BackupError::Corrupt(format!("header serialize: {e}")))?;
     let header_len = header_json.len() as u64;
     if header_len > MAX_HEADER_LEN {
         return Err(BackupError::Corrupt(format!(
@@ -510,7 +506,8 @@ fn write_archive(
         w.write_all(&(bytes.len() as u32).to_le_bytes())
             .map_err(BackupError::Io)?;
         w.write_all(bytes).map_err(BackupError::Io)?;
-        w.write_all(&file.len.to_le_bytes()).map_err(BackupError::Io)?;
+        w.write_all(&file.len.to_le_bytes())
+            .map_err(BackupError::Io)?;
         let mut src = std::fs::File::open(staging.join(&file.rel)).map_err(BackupError::Io)?;
         let mut chunk = vec![0u8; CHUNK];
         loop {
@@ -522,7 +519,9 @@ fn write_archive(
         }
     }
     w.flush().map_err(BackupError::Io)?;
-    let f = w.into_inner().map_err(|e| BackupError::Io(e.into_error()))?;
+    let f = w
+        .into_inner()
+        .map_err(|e| BackupError::Io(e.into_error()))?;
     f.sync_all().map_err(BackupError::Io)?;
     Ok(())
 }
@@ -599,7 +598,10 @@ fn hex(bytes: &[u8]) -> String {
 /// `<output>.staging-<pid>` next to the archive: same filesystem as the
 /// output, unique per process so concurrent backups do not collide.
 fn staging_dir_for(out_file: &Path) -> PathBuf {
-    let mut name = out_file.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = out_file
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(format!(".staging-{}", std::process::id()));
     out_file.with_file_name(name)
 }
@@ -607,7 +609,10 @@ fn staging_dir_for(out_file: &Path) -> PathBuf {
 /// `<output>.tmp-<pid>`: the archive is fully written here and renamed
 /// into place, so the requested path only ever holds a complete file.
 fn tmp_sibling(out_file: &Path) -> PathBuf {
-    let mut name = out_file.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = out_file
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(format!(".tmp-{}", std::process::id()));
     out_file.with_file_name(name)
 }
@@ -644,8 +649,10 @@ mod tests {
     fn seed_node_like_store(data_dir: &Path) -> crate::kv::RocksKv {
         let kv = crate::kv::RocksKv::open(data_dir).expect("open store");
         kv.put(b"g0:sm", b"{\"meta\":\"topology-blob\"}").unwrap();
-        kv.put(b"g0:log/00000000000000000000", b"bootstrap-entry").unwrap();
-        kv.put(b"g0:vote", b"\x01\x00\x00\x00\x00\x00\x00\x00\x01").unwrap();
+        kv.put(b"g0:log/00000000000000000000", b"bootstrap-entry")
+            .unwrap();
+        kv.put(b"g0:vote", b"\x01\x00\x00\x00\x00\x00\x00\x00\x01")
+            .unwrap();
         // g1:m/<u16 len="q">/<seq:020> — the sm module's message-journal
         // key shape.
         let mut mk = b"g1:m/".to_vec();
@@ -669,7 +676,11 @@ mod tests {
             .map(|p| {
                 (
                     p.to_string(),
-                    kv.prefix_pairs(p.as_bytes()).unwrap().into_iter().map(|(_, v)| v).collect(),
+                    kv.prefix_pairs(p.as_bytes())
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect(),
                 )
             })
             .collect();
@@ -682,7 +693,11 @@ mod tests {
         let archive = tmp_dir("rt-arch").join("node.swbk");
         let header = backup_store(&data_dir, &archive).expect("backup");
         assert_eq!(header.format_version, BACKUP_FORMAT_VERSION);
-        assert!(header.files.len() >= 5, "checkpoint carries its file set, got {:?}", header.files);
+        assert!(
+            header.files.len() >= 5,
+            "checkpoint carries its file set, got {:?}",
+            header.files
+        );
 
         let target = tmp_dir("rt-dst");
         let restored = restore_store(&archive, &target).expect("restore");
@@ -690,9 +705,16 @@ mod tests {
 
         let back = crate::kv::RocksKv::open(&target).expect("open restored store");
         for (prefix, values) in &before {
-            let got: Vec<Vec<u8>> =
-                back.prefix_pairs(prefix.as_bytes()).unwrap().into_iter().map(|(_, v)| v).collect();
-            assert_eq!(&got, values, "prefix {prefix} must round-trip byte-for-byte");
+            let got: Vec<Vec<u8>> = back
+                .prefix_pairs(prefix.as_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(
+                &got, values,
+                "prefix {prefix} must round-trip byte-for-byte"
+            );
         }
     }
 
@@ -716,7 +738,10 @@ mod tests {
             let target = tmp_dir("gate-dst");
             let err = restore_store(&doctored, &target).expect_err("newer version must be refused");
             let msg = err.to_string();
-            assert!(msg.contains("newer"), "error must say the version is newer: {msg}");
+            assert!(
+                msg.contains("newer"),
+                "error must say the version is newer: {msg}"
+            );
             assert!(msg.contains("refusing"), "error must be a refusal: {msg}");
             assert!(
                 !target.exists(),
@@ -742,7 +767,10 @@ mod tests {
             let target = tmp_dir("gateu-dst");
             let err = restore_store(&doctored, &target).expect_err("unknown version refused");
             let msg = err.to_string();
-            assert!(msg.contains("unknown"), "error must say the version is unknown: {msg}");
+            assert!(
+                msg.contains("unknown"),
+                "error must say the version is unknown: {msg}"
+            );
             assert!(!target.exists(), "gate runs before touching the target");
         }
     }
@@ -755,7 +783,10 @@ mod tests {
         let err = backup_store(&empty, &archive).expect_err("non-store dir refused");
         let msg = err.to_string();
         assert!(msg.contains("CURRENT"), "error must name the marker: {msg}");
-        assert!(!archive.exists(), "no archive may be written for a non-store");
+        assert!(
+            !archive.exists(),
+            "no archive may be written for a non-store"
+        );
 
         // A completely absent path is refused the same way.
         let missing = tmp_dir("missing-store");
@@ -788,8 +819,7 @@ mod tests {
         let header = read_backup_header(&archive).unwrap();
         let json = serde_json::to_vec(&header).unwrap();
         let first = &header.files[0];
-        let payload_start =
-            PREFIX_LEN + json.len() as u64 + 4 + first.path.len() as u64 + 8;
+        let payload_start = PREFIX_LEN + json.len() as u64 + 4 + first.path.len() as u64 + 8;
         let mut bytes = std::fs::read(&archive).unwrap();
         let idx = payload_start as usize;
         assert!(idx < bytes.len());
@@ -836,6 +866,10 @@ mod tests {
         let read = read_backup_header(&archive).expect("read header");
         assert_eq!(wrote, read);
         assert_eq!(read.format_version, BACKUP_FORMAT_VERSION);
-        assert!(read.files.iter().any(|f| f.path.ends_with(".sst") || f.path.ends_with("CURRENT")));
+        assert!(
+            read.files
+                .iter()
+                .any(|f| f.path.ends_with(".sst") || f.path.ends_with("CURRENT"))
+        );
     }
 }

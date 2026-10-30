@@ -1,0 +1,5 @@
+# Last-mile imports: one item per use statement, at its deepest path.
+# Nightly-only option — stable `cargo fmt` warns and ignores it; run
+# `cargo +nightly fmt` to enforce. Test modules keep `use super::*;`
+# (idiomatic; see the #[cfg(test)] convention).
+imports_granularity = "Item"

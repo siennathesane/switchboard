@@ -101,12 +101,22 @@ pub struct FifoStream {
 
 impl FifoStream {
     pub fn new() -> Self {
-        FifoStream { next: 0, window: Default::default(), window_max: 0, repeats: 0 }
+        FifoStream {
+            next: 0,
+            window: Default::default(),
+            window_max: 0,
+            repeats: 0,
+        }
     }
 
     /// Enable out-of-order tolerance (chaos mode) with a bounded window.
     pub fn with_window(max: u64) -> Self {
-        FifoStream { next: 0, window: Default::default(), window_max: max, repeats: 0 }
+        FifoStream {
+            next: 0,
+            window: Default::default(),
+            window_max: max,
+            repeats: 0,
+        }
     }
 
     pub fn observe(&mut self, seq: u64, redelivered: bool) -> Delivery {
@@ -128,7 +138,11 @@ impl FifoStream {
             }
             if !self.window.insert(seq) {
                 self.repeats += 1;
-                return if redelivered { Delivery::Repeat } else { Delivery::RepeatUnflagged };
+                return if redelivered {
+                    Delivery::Repeat
+                } else {
+                    Delivery::RepeatUnflagged
+                };
             }
             if self.window.len() as u64 > self.window_max {
                 return Delivery::Gap(self.window.len() as u64);
@@ -174,7 +188,10 @@ mod tests {
         let mut bad = body.clone();
         bad[100] ^= 0xff;
         assert!(matches!(decode_body(&bad), Err(BodyError::Corrupt { .. })));
-        assert!(matches!(decode_body(&body[..10]), Err(BodyError::TooSmall(10))));
+        assert!(matches!(
+            decode_body(&body[..10]),
+            Err(BodyError::TooSmall(10))
+        ));
     }
 
     #[test]

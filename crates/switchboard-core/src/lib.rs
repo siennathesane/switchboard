@@ -23,6 +23,6 @@ pub mod error;
 pub mod model;
 pub mod routing;
 pub mod shard;
-pub mod topic;
 pub mod tempo;
+pub mod topic;
 pub mod topology;

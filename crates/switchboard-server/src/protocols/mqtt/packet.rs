@@ -121,7 +121,9 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Packet, usize)>, String> {
     let mut remaining = 0usize;
     let mut i = 1;
     loop {
-        let Some(&b) = buf.get(i) else { return Ok(None) };
+        let Some(&b) = buf.get(i) else {
+            return Ok(None);
+        };
         remaining += ((b & 0x7F) as usize) * multiplier;
         multiplier *= 128;
         i += 1;
@@ -170,15 +172,31 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Packet, usize)>, String> {
                 let n = c.u16().map_err(str::to_string)? as usize;
                 password = Some(c.bytes(n).map_err(str::to_string)?.to_vec());
             }
-            Packet::Connect { clean_session: clean, keep_alive, client_id, username, password }
+            Packet::Connect {
+                clean_session: clean,
+                keep_alive,
+                client_id,
+                username,
+                password,
+            }
         }
         (PUBLISH, f) => {
             let qos = (f >> 1) & 0x03;
             let retain = f & 0x01 != 0;
             let topic = c.utf8().map_err(str::to_string)?;
-            let packet_id = if qos > 0 { Some(c.u16().map_err(str::to_string)?) } else { None };
+            let packet_id = if qos > 0 {
+                Some(c.u16().map_err(str::to_string)?)
+            } else {
+                None
+            };
             let payload = body[c.pos..].to_vec();
-            Packet::Publish { qos, retain, topic, packet_id, payload }
+            Packet::Publish {
+                qos,
+                retain,
+                topic,
+                packet_id,
+                payload,
+            }
         }
         (PUBACK, _) => {
             let packet_id = c.u16().map_err(str::to_string)?;
@@ -276,7 +294,8 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
     let mut full = vec![head[0]];
     full.extend_from_slice(&varint);
     full.extend_from_slice(&body);
-    let parsed = parse(&full).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let parsed =
+        parse(&full).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     match parsed {
         None => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -291,24 +310,57 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
 
 /// Encode a broker→client packet.
 pub enum Out {
-    ConnAck { session_present: bool, code: u8 },
-    PubRec { packet_id: u16 },
-    PubRel { packet_id: u16 },
-    PubComp { packet_id: u16 },
-    Publish { qos: u8, retain: bool, topic: String, packet_id: Option<u16>, payload: Vec<u8> },
-    PubAck { packet_id: u16 },
-    SubAck { packet_id: u16, codes: Vec<u8> },
-    UnsubAck { packet_id: u16 },
+    ConnAck {
+        session_present: bool,
+        code: u8,
+    },
+    PubRec {
+        packet_id: u16,
+    },
+    PubRel {
+        packet_id: u16,
+    },
+    PubComp {
+        packet_id: u16,
+    },
+    Publish {
+        qos: u8,
+        retain: bool,
+        topic: String,
+        packet_id: Option<u16>,
+        payload: Vec<u8>,
+    },
+    PubAck {
+        packet_id: u16,
+    },
+    SubAck {
+        packet_id: u16,
+        codes: Vec<u8>,
+    },
+    UnsubAck {
+        packet_id: u16,
+    },
     PingResp,
 }
 
 impl Out {
     pub fn encode(&self) -> Vec<u8> {
         let (ptype, flags, body): (u8, u8, Vec<u8>) = match self {
-            Out::ConnAck { session_present, code } => {
-                (CONNACK, 0, vec![if *session_present { 1 } else { 0 }, *code])
-            }
-            Out::Publish { qos, retain, topic, packet_id, payload } => {
+            Out::ConnAck {
+                session_present,
+                code,
+            } => (
+                CONNACK,
+                0,
+                vec![if *session_present { 1 } else { 0 }, *code],
+            ),
+            Out::Publish {
+                qos,
+                retain,
+                topic,
+                packet_id,
+                payload,
+            } => {
                 let mut b = Vec::new();
                 let tn = topic.len() as u16;
                 b.extend_from_slice(&tn.to_be_bytes());
@@ -355,14 +407,18 @@ mod tests {
     #[test]
     fn publish_qos1_parses() {
         // PUBLISH qos1, topic a/b, pid 7, payload "hi".
-        let raw = [
-            0x32, 9, 0, 3, b'a', b'/', b'b', 0, 7, b'h', b'i',
-        ];
+        let raw = [0x32, 9, 0, 3, b'a', b'/', b'b', 0, 7, b'h', b'i'];
         let _ = 0;
         let (p, used) = parse(&raw).unwrap().unwrap();
         assert_eq!(used, raw.len());
         match p {
-            Packet::Publish { qos, retain, topic, packet_id, payload } => {
+            Packet::Publish {
+                qos,
+                retain,
+                topic,
+                packet_id,
+                payload,
+            } => {
                 assert_eq!((qos, retain), (1, false));
                 assert_eq!(topic, "a/b");
                 assert_eq!(packet_id, Some(7));
@@ -374,7 +430,10 @@ mod tests {
 
     #[test]
     fn out_connack_encodes() {
-        let out = Out::ConnAck { session_present: false, code: 0 };
+        let out = Out::ConnAck {
+            session_present: false,
+            code: 0,
+        };
         assert_eq!(out.encode(), vec![0x20, 0x02, 0x00, 0x00]);
     }
 }
@@ -453,9 +512,18 @@ mod error_path_tests {
 
     #[test]
     fn qos2_out_packets_encode() {
-        assert_eq!(Out::PubRec { packet_id: 5 }.encode(), vec![0x50, 0x02, 0, 5]);
-        assert_eq!(Out::PubRel { packet_id: 5 }.encode(), vec![0x62, 0x02, 0, 5]);
-        assert_eq!(Out::PubComp { packet_id: 5 }.encode(), vec![0x70, 0x02, 0, 5]);
+        assert_eq!(
+            Out::PubRec { packet_id: 5 }.encode(),
+            vec![0x50, 0x02, 0, 5]
+        );
+        assert_eq!(
+            Out::PubRel { packet_id: 5 }.encode(),
+            vec![0x62, 0x02, 0, 5]
+        );
+        assert_eq!(
+            Out::PubComp { packet_id: 5 }.encode(),
+            vec![0x70, 0x02, 0, 5]
+        );
     }
 
     #[test]
@@ -483,7 +551,12 @@ mod error_path_tests {
         encode_remaining_length(body.len(), &mut raw);
         raw.extend_from_slice(&body);
         match parse(&raw).unwrap().unwrap().0 {
-            Packet::Connect { clean_session, username, password, .. } => {
+            Packet::Connect {
+                clean_session,
+                username,
+                password,
+                ..
+            } => {
                 assert!(clean_session);
                 assert_eq!(username.as_deref(), Some("user"));
                 assert_eq!(password.as_deref(), Some(b"hush".as_slice()));
@@ -645,7 +718,10 @@ mod edge_tests {
         // needs (topic length beyond the packet).
         let mut r: &[u8] = &[0x30, 0x02, 0x00, 0x05];
         let err = read_packet(&mut r).await.unwrap_err();
-        assert!(err.to_string().contains("short packet") || err.to_string().contains("truncated"), "{err}");
+        assert!(
+            err.to_string().contains("short packet") || err.to_string().contains("truncated"),
+            "{err}"
+        );
     }
 }
 

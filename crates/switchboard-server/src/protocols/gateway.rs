@@ -16,10 +16,10 @@ use crate::channel::ConnectionLimits;
 use crate::session;
 
 use super::amqp10;
-use super::detect::classify;
 use super::detect::Classify;
 use super::detect::Detected;
 use super::detect::SNIFF_LEN;
+use super::detect::classify;
 use super::http;
 use super::mqtt;
 use super::shared::ProtocolConfig;
@@ -36,7 +36,10 @@ pub struct Prefixed<S> {
 
 impl<S> Prefixed<S> {
     pub fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Prefixed { prefix: std::io::Cursor::new(prefix), inner }
+        Prefixed {
+            prefix: std::io::Cursor::new(prefix),
+            inner,
+        }
     }
 
     /// Bytes not yet replayed (should be empty once drained).
