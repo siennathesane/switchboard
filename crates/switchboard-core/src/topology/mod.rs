@@ -53,9 +53,9 @@ pub struct Vhost {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetaState {
     pub vhosts: BTreeMap<String, Vhost>,
-    /// User name → stored credential: an argon2 PHC hash, or legacy
-    /// plaintext from snapshots written before hashing existed (verified
-    /// as-is; re-set the password to upgrade it).
+    /// User name → stored credential: an argon2 PHC string. Plaintext
+    /// never reaches this map — credential commands carry PHC strings
+    /// only (hashed at propose, code-scanning alert #15).
     pub users: BTreeMap<String, String>,
     /// Per-user, per-vhost permissions (RabbitMQ-shaped: regexes matched
     /// against resource names for the configure/write/read operations).
@@ -281,13 +281,25 @@ impl MetaState {
                 }
                 Ok((MetaReply::Ok, vec![]))
             }
-            MetaCmd::CreateUser { name, password } => {
-                // At-rest credentials are hashed; the plaintext exists
-                // only in this command (and thus the raft log — rotate
-                // users rather than in-place password changes when that
-                // matters).
-                self.users
-                    .insert(name.clone(), crate::auth::hash_password(password));
+            MetaCmd::CreateUser {
+                name,
+                password_hash,
+            } => {
+                // Credential commands replicate PHC strings ONLY
+                // (code-scanning alert #15): the proposing node runs the
+                // memory-hard argon2 hash BEFORE submitting — outside
+                // raft — so neither the replicated log nor the at-rest
+                // map ever carries a plaintext password. Apply never
+                // hashes: it validates the PHC shape (cheap parse) and
+                // stores the string verbatim, keeping memory-hard work
+                // out of the apply path. A plaintext arm does not exist;
+                // a command carrying one is refused.
+                if !crate::auth::is_phc(password_hash) {
+                    return Err(BrokerError::access_refused(
+                        "CreateUser requires an argon2 PHC string; hash the password at propose",
+                    ));
+                }
+                self.users.insert(name.clone(), password_hash.clone());
                 Ok((MetaReply::Ok, vec![]))
             }
             MetaCmd::SetGroups { groups } => {
@@ -738,9 +750,14 @@ pub enum MetaCmd {
     DeclareVhost {
         name: String,
     },
+    /// Create a user or replace their credential (the password-rotate
+    /// path). `password_hash` is an argon2 PHC string computed by the
+    /// PROPOSING node before submission (code-scanning alert #15): the
+    /// replicated log never carries plaintext, and apply refuses
+    /// anything that is not a parseable PHC string.
     CreateUser {
         name: String,
-        password: String,
+        password_hash: String,
     },
     /// Install the shard group map (membership controller output).
     SetGroups {

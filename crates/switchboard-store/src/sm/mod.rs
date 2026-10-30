@@ -767,7 +767,9 @@ mod tests {
                     BrokerCommand::Bootstrap {
                         vhost: "/".into(),
                         user: "guest".into(),
-                        password: "guest".into(),
+                        // Propose-side hash (alert #15): the replicated
+                        // command carries a PHC string only.
+                        password_hash: switchboard_core::auth::hash_password("guest"),
                     },
                     0,
                 ),
@@ -889,7 +891,7 @@ mod tests {
                 BrokerCommand::Bootstrap {
                     vhost: "/".into(),
                     user: "guest".into(),
-                    password: "guest".into(),
+                    password_hash: switchboard_core::auth::hash_password("guest"),
                 },
                 0,
             ),

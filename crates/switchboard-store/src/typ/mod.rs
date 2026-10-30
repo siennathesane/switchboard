@@ -52,10 +52,13 @@ pub enum BrokerCommand {
     /// Lay down the bootstrap entities (default vhost, exchanges, user).
     /// Emitted once when the meta group is created; safe to re-apply
     /// because the underlying commands are idempotent.
+    /// `password_hash` is an argon2 PHC string computed by the proposing
+    /// node BEFORE submission (code-scanning alert #15): the replicated
+    /// log never carries a plaintext password.
     Bootstrap {
         vhost: String,
         user: String,
-        password: String,
+        password_hash: String,
     },
     /// A control-plane (topology) mutation.
     Meta(MetaCmd),
@@ -171,14 +174,14 @@ impl BrokerState {
             BrokerCommand::Bootstrap {
                 vhost,
                 user,
-                password,
+                password_hash,
             } => {
                 let (r1, _r1_effects) = self.meta.apply(&MetaCmd::DeclareVhost {
                     name: vhost.clone(),
                 })?;
                 let (r2, _r2_effects) = self.meta.apply(&MetaCmd::CreateUser {
                     name: user.clone(),
-                    password: password.clone(),
+                    password_hash: password_hash.clone(),
                 })?;
                 // The formation user is admin-flagged from the start
                 // (code-scanning alert #19): someone must hold the flag
@@ -237,7 +240,9 @@ mod tests {
             .apply(&BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "guest".into(),
-                password: "guest".into(),
+                // Propose-side contract (alert #15): the command is built
+                // with the PHC string, never the plaintext password.
+                password_hash: switchboard_core::auth::hash_password("guest"),
             })
             .unwrap();
         assert_eq!(r, BrokerReply::Bootstrapped);
@@ -249,7 +254,7 @@ mod tests {
             .apply(&BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "guest".into(),
-                password: "guest".into(),
+                password_hash: switchboard_core::auth::hash_password("guest"),
             })
             .unwrap();
         assert_eq!(r2, BrokerReply::Bootstrapped);
@@ -261,7 +266,7 @@ mod tests {
         st.apply(&BrokerCommand::Bootstrap {
             vhost: "/".into(),
             user: "guest".into(),
-            password: "guest".into(),
+            password_hash: switchboard_core::auth::hash_password("guest"),
         })
         .unwrap();
         let (BrokerReply::Meta(MetaReply::ExchangeDeclared { existed }), _) = st
@@ -313,7 +318,7 @@ mod tests {
             BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "u".into(),
-                password: "p".into(),
+                password_hash: switchboard_core::auth::hash_password("p"),
             },
             BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "vh".into() }),
             BrokerCommand::Shard(ShardCmd::ExpirePrepared {}),
@@ -323,6 +328,43 @@ mod tests {
             let back: BrokerCommand = bincode::deserialize(&bytes).unwrap();
             assert_eq!(back, c);
         }
+    }
+
+    #[test]
+    fn credential_commands_never_carry_plaintext_into_the_log() {
+        // Code-scanning alert #15: the raft log stores serialized
+        // BrokerCommands. Built the way every proposer builds them (hash
+        // at propose, outside raft), a captured Bootstrap entry and a
+        // captured CreateUser entry carry an `$argon2` PHC string — and
+        // never the plaintext password.
+        let bootstrap = bincode::serialize(&BrokerCommand::Bootstrap {
+            vhost: "/".into(),
+            user: "alice".into(),
+            password_hash: switchboard_core::auth::hash_password("hunter2-propose-side"),
+        })
+        .unwrap();
+        assert!(
+            bootstrap.windows(7).any(|w| w == b"$argon2"),
+            "the serialized Bootstrap entry must carry a PHC string"
+        );
+        assert!(
+            !bootstrap.windows(20).any(|w| w == b"hunter2-propose-side"),
+            "the serialized Bootstrap entry must not carry the plaintext"
+        );
+
+        let create = bincode::serialize(&BrokerCommand::Meta(MetaCmd::CreateUser {
+            name: "bob".into(),
+            password_hash: switchboard_core::auth::hash_password("hunter2-propose-side"),
+        }))
+        .unwrap();
+        assert!(
+            create.windows(7).any(|w| w == b"$argon2"),
+            "the serialized CreateUser entry must carry a PHC string"
+        );
+        assert!(
+            !create.windows(20).any(|w| w == b"hunter2-propose-side"),
+            "the serialized CreateUser entry must not carry the plaintext"
+        );
     }
 
     #[test]

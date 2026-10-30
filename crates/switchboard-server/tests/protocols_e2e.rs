@@ -3042,7 +3042,9 @@ async fn put_user(
     for cmd in [
         MetaCmd::CreateUser {
             name: user.to_string(),
-            password: pass.to_string(),
+            // Propose-side hash (alert #15): the replicated command
+            // carries the PHC string, never the plaintext password.
+            password_hash: switchboard_core::auth::hash_password(pass),
         },
         MetaCmd::SetPermissions {
             user: user.to_string(),

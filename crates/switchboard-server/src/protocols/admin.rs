@@ -602,13 +602,16 @@ async fn put_user(node: &Arc<ClusterNode>, name: &str, body: &[u8]) -> Result<St
         .as_str()
         .ok_or_else(|| ApiError::BadRequest("body must carry {\"password\": \"...\"}".into()))?
         .to_string();
-    // CreateUser inserts or replaces the stored (hashed) credential: the
-    // meta SM's create path is the password-rotate path too.
+    // CreateUser inserts or replaces the stored credential: the meta
+    // SM's create path is the password-rotate path too. The argon2 hash
+    // runs HERE, at propose (code-scanning alert #15): the replicated
+    // command carries the PHC string only — the raft log never sees the
+    // plaintext password from the request body.
     meta_write_then_refresh(
         node,
         MetaCmd::CreateUser {
             name: name.into(),
-            password,
+            password_hash: switchboard_core::auth::hash_password(&password),
         },
     )
     .await?;

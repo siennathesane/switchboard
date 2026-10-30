@@ -461,6 +461,36 @@ fn auth_checks() {
     assert_eq!(e.level, Level::Connection);
 }
 
+/// Alert #15: apply accepts PHC strings only. A CreateUser carrying a
+/// plaintext password (a proposer that skipped the hash) is refused, and
+/// a PHC-string command stores verbatim — the memory-hard hash runs at
+/// propose, never inside apply.
+#[test]
+fn create_user_stores_phc_only() {
+    let mut s = state();
+    // Plaintext arm: refused, nothing stored.
+    let e = s
+        .apply(&MetaCmd::CreateUser {
+            name: "ghost".into(),
+            password_hash: "hunter2".into(),
+        })
+        .unwrap_err();
+    assert_eq!(e.code, 403);
+    assert!(!s.users.contains_key("ghost"));
+
+    // PHC arm: stored verbatim, byte-identical to what apply received.
+    let phc = crate::auth::hash_password("hunter2");
+    s.apply(&MetaCmd::CreateUser {
+        name: "ghost".into(),
+        password_hash: phc.clone(),
+    })
+    .unwrap();
+    assert_eq!(s.users.get("ghost"), Some(&phc));
+    // And the stored credential authenticates its owner end-to-end.
+    s.check_credentials("ghost", "hunter2").unwrap();
+    assert!(s.check_credentials("ghost", "wrong").is_err());
+}
+
 /// Alert #20: permission patterns are FULL matches over the resource
 /// name (mirroring RabbitMQ), never substring hits.
 #[test]
@@ -1009,7 +1039,7 @@ fn admin_flag_grant_revoke_and_cascade() {
     );
     s.apply(&MetaCmd::CreateUser {
         name: "boss".into(),
-        password: "pw".into(),
+        password_hash: crate::auth::hash_password("pw"),
     })
     .unwrap();
 

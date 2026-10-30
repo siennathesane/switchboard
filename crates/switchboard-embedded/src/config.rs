@@ -155,7 +155,9 @@ impl BrokerConfig {
     /// (embedded design §5.1). If `node.topology().users` (a pub field,
     /// topology/mod.rs:54) already contains the name, NOTHING is written —
     /// rotated passwords are preserved. Otherwise the broker issues
-    /// `BrokerCommand::Bootstrap { vhost: "/", user, password }` itself on
+    /// `BrokerCommand::Bootstrap { vhost: "/", user, password_hash }`
+    /// itself (the argon2 hash runs at propose, so the replicated log
+    /// carries a PHC string only — code-scanning alert #15) on
     /// the replicated meta group: `DeclareVhost "/"` is an idempotent
     /// upsert on the always-present default vhost (topology/mod.rs:210-213)
     /// and `CreateUser` adds the user without touching any existing one

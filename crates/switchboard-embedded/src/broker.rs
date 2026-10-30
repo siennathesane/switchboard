@@ -172,7 +172,10 @@ impl Broker {
                         BrokerCommand::Bootstrap {
                             vhost: switchboard_wire::constants::DEFAULT_VHOST.into(),
                             user: user.clone(),
-                            password: password.clone(),
+                            // Hash at propose, outside raft (code-scanning
+                            // alert #15): the replicated log carries the
+                            // PHC string, never the plaintext password.
+                            password_hash: switchboard_core::auth::hash_password(password),
                         },
                     )
                     .await;
@@ -474,11 +477,12 @@ impl Broker {
     /// Create a user or REPLACE the existing user's password (upsert —
     /// `CreateUser` writes unconditionally, topology/mod.rs:240-246).
     /// This is the explicit set/rotate path for any user, `guest`
-    /// included.
+    /// included. The argon2 hash runs HERE, at propose (code-scanning
+    /// alert #15): the replicated command carries the PHC string only.
     pub async fn create_user(&self, user: &str, password: &str) -> Result<(), AdminError> {
         self.admin_write(BrokerCommand::Meta(MetaCmd::CreateUser {
             name: user.to_string(),
-            password: password.to_string(),
+            password_hash: switchboard_core::auth::hash_password(password),
         }))
         .await
     }

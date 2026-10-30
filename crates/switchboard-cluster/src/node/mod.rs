@@ -667,7 +667,12 @@ impl ClusterNode {
                 // #16): the CLI's --user/--password flow through NodeConfig
                 // so deployments are not pinned to the public dev default.
                 user: self.cfg.bootstrap_user.clone(),
-                password: self.cfg.bootstrap_password.clone(),
+                // Hash at PROPOSE, outside raft (code-scanning alert
+                // #15): the memory-hard argon2 runs here on the
+                // proposing node, so the replicated log and the at-rest
+                // user map only ever carry the PHC string — and apply
+                // never hashes.
+                password_hash: switchboard_core::auth::hash_password(&self.cfg.bootstrap_password),
             },
         )
         .await?;

@@ -257,7 +257,7 @@ mod tests {
             command: BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "u".into(),
-                password: "p".into(),
+                password_hash: switchboard_core::auth::hash_password("p"),
             },
         });
         let bytes = bincode::serialize(&msg).unwrap();

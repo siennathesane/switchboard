@@ -220,7 +220,20 @@ pub fn hash_password(password: &str) -> String {
     hash
 }
 
-/// Verify a password against a stored credential. Normal credentials are
+/// Does `stored` carry a parseable argon2 PHC string (`$argon2…`)?
+///
+/// Credential-bearing commands replicate PHC strings ONLY: the
+/// proposing node hashes the password BEFORE submitting the command, so
+/// the raft log and the at-rest user map never carry plaintext
+/// (code-scanning alert #15). State-machine applies use this to refuse
+/// a plaintext arm outright — there is no legacy plaintext form. Parsing
+/// a PHC string is cheap (no memory-hard work), so it is safe inside
+/// apply; the hashing itself stays at propose.
+pub fn is_phc(stored: &str) -> bool {
+    stored.starts_with("$argon2") && argon2::password_hash::PasswordHash::new(stored).is_ok()
+}
+
+/// Verify a password against a stored credential. Stored credentials are
 /// argon2 PHC strings — verified with the parameters embedded in the PHC
 /// string, so old hashes keep working after the deployment retunes —
 /// while plaintext survives from snapshots written before hashing
