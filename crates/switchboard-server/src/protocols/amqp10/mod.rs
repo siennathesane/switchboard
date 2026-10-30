@@ -220,6 +220,19 @@ where
         }
         sasl_done = true;
         frame = read_frame(&mut reader).await?;
+    } else if frame.is_some() {
+        // The client skipped SASL and opened directly. Keep the
+        // documented ANONYMOUS-as-guest semantics, but route the
+        // session through the credential gate (guest-loopback rule
+        // included) instead of falling through fully unauthenticated
+        // (code-scanning alert #7).
+        if shared::authorize(&node, "guest", "guest", limits.peer_ip, limits.allow_remote_guest)
+            .await
+            .is_err()
+        {
+            tracing::info!("amqp10: SASL skipped and anonymous access refused");
+            return Ok(());
+        }
     }
     let _ = sasl_done;
 

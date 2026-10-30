@@ -593,3 +593,57 @@ async fn amqp10_preauth_oversized_frame_size_closes_the_connection() {
         .await
         .expect("server must close the connection");
 }
+
+// ---------------------------------------------------------------------
+// SASL-skip authorization (code-scanning alert #7)
+// ---------------------------------------------------------------------
+
+/// Skip SASL entirely: protocol header then straight to OPEN. A
+/// loopback peer keeps the documented anonymous-as-guest behavior — the
+/// session proceeds (an open reply arrives).
+#[tokio::test(flavor = "multi_thread")]
+async fn amqp10_sasl_skip_from_loopback_still_opens_as_guest() {
+    let (addr, _n) = gw().await;
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
+    let mut buf = [0u8; 2048];
+    let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms
+    // No SASL frame at all — OPEN directly.
+    sock.write_all(&frames::open("no-sasl")).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
+        .await
+        .expect("server must answer (or close) promptly");
+    assert!(!reply.is_empty(), "loopback anonymous guest must still get an open reply");
+}
+
+/// The same skip from a non-loopback peer: `guest` is loopback-only, so
+/// the connection must be refused before the session loop answers OPEN.
+#[tokio::test(flavor = "multi_thread")]
+async fn amqp10_sasl_skip_from_non_loopback_peer_is_refused() {
+    let (_gw_addr, guard) = gw().await;
+    let node = guard.0.clone();
+    // Serve amqp10 directly with a forged non-loopback peer IP (the
+    // gateway stamps the real one; the rule under test is identical).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { continue };
+            let node = node.clone();
+            tokio::spawn(async move {
+                let mut limits = switchboard_server::ConnectionLimits::default();
+                limits.peer_ip = Some("203.0.113.7".parse().unwrap()); // TEST-NET-3
+                let _ = switchboard_server::protocols::amqp10::serve(sock, node, limits).await;
+            });
+        }
+    });
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
+    let mut buf = [0u8; 2048];
+    let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms still offered
+    sock.write_all(&frames::open("sneaky")).await.unwrap();
+    // No open reply may come back: the server must close the connection.
+    let n = with_timeout(sock.read(&mut buf), 15).await.unwrap();
+    assert_eq!(n, 0, "remote anonymous guest must be refused without a session");
+    accept.abort();
+}
