@@ -48,6 +48,12 @@ done
 for i in $(seq 1 "$N"); do
   docker exec "sb$i" sh -c "grep -q ALLOW_REMOTE /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_ALLOW_REMOTE_GUEST=1\n' >> /var/run/sb-env"
 done
+# Same lab-only story for /stats and /metrics (alert #21): off loopback
+# they now require admin basic auth, and the bench soak driver scrapes
+# them from other containers unauthenticated.
+for i in $(seq 1 "$N"); do
+  docker exec "sb$i" sh -c "grep -q STATS_UNAUTHED /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_STATS_UNAUTHED=1\n' >> /var/run/sb-env"
+done
 
 docker build -f "$JEPSEN_DIR/docker/Dockerfile.control" \
   -t switchboard-jepsen-control:latest "$JEPSEN_DIR"

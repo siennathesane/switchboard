@@ -43,11 +43,16 @@ case "$CMD" in
     done
     # Start brokers directly (there is no jepsen control node here). The
     # container watchdog re-arms from the persisted args if a broker dies.
+    # sb-env: the soak monitor (running in ANOTHER container) scrapes
+    # /stats off loopback unauthenticated — the lab-only opt-out keeps
+    # that working now that /stats//metrics require admin auth off
+    # loopback (alert #21).
     for i in $(seq 1 "$N"); do
       extra="--seeds sb1:5673"
       if [ "$i" = 1 ]; then extra="--bootstrap"; fi
       docker exec "sb$i" sh -c "
         printf '%s\n' $i sb$i $N $extra > /var/run/sb-args
+        grep -q STATS_UNAUTHED /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_STATS_UNAUTHED=1\n' >> /var/run/sb-env
         touch /var/run/sb-enabled
         sb-start $i sb$i $N $extra" >/dev/null
     done

@@ -25,6 +25,12 @@ POD_NAME="${POD_NAME:?POD_NAME must be set}"
 POD_IP="${POD_IP:?POD_IP must be set}"
 SVC="${SB_SERVICE_DNS:-switchboard-hs.soak.svc.cluster.local}"
 
+# /stats and /metrics require admin basic auth off loopback (alert #21).
+# The soak driver runs in ANOTHER pod and scrapes every broker's /stats
+# unauthenticated (monitor + scaler voter mapping), so the lab opts out:
+# lab-only, never for production deployments.
+export SWITCHBOARD_STATS_UNAUTHED=1
+
 NODE_ID=$(( $(echo -n "$POD_NAME" | cksum | cut -d' ' -f1) % 4000000000 + 1000 ))
 
 members() {

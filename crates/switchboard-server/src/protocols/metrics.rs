@@ -9,7 +9,8 @@
 //!
 //! Serving lives in [`super::http::serve`], next to `/stats`; the endpoint
 //! rides the same `http` protocol flag as the rest of the health surface
-//! and needs no authentication, like `/stats`.
+//! and the same access gate as `/stats` — loopback unauthenticated, admin
+//! basic credentials from any other peer (code-scanning alert #21).
 
 use std::sync::Arc;
 

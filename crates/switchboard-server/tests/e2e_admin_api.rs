@@ -1021,3 +1021,73 @@ async fn admin_api_strict_mode_makes_the_flag_the_only_path() {
     // Cleanup via the API under test.
     let _ = api_delete("/api/users/strict-legacy", &admin).await;
 }
+
+// ---------------------------------------------------------------------
+// 5) /stats + /metrics access gate (code-scanning alert #21)
+// ---------------------------------------------------------------------
+
+/// The gateway test harness connects from loopback and stamps the peer
+/// address, so this exercises the loopback arm of the gate end-to-end
+/// (unauthenticated → 200) plus both credential arms, which apply from
+/// ANY peer: admin credentials → 200, bad credentials → 401,
+/// authenticated non-admin → 403. The non-loopback 401 arm is covered
+/// deterministically by the unit test on the decision function
+/// (`unauthenticated_stats_scrape_decision`).
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_and_metrics_access_gate() {
+    let _guard = lock().await;
+    light_hashing();
+    support::init_tracing();
+    let _ = gateway_support::shared_gateway().await;
+
+    let admin = basic_auth_header("guest", "guest");
+
+    // Loopback tooling: no credentials needed on either endpoint.
+    let (code, text) = http_request("GET", "/stats", &[], None).await;
+    assert_eq!(code, 200, "loopback unauthenticated /stats: {text}");
+    let (code, text) = http_request("GET", "/metrics", &[], None).await;
+    assert_eq!(code, 200, "loopback unauthenticated /metrics: {text}");
+
+    // Admin basic auth passes from any peer (loopback included).
+    let (code, text) = http_request("GET", "/stats", &[admin.clone()], None).await;
+    assert_eq!(code, 200, "admin credentials /stats: {text}");
+    let (code, text) = http_request("GET", "/metrics", &[admin.clone()], None).await;
+    assert_eq!(code, 200, "admin credentials /metrics: {text}");
+
+    // Bad credentials: 401 with a Basic challenge, on both endpoints.
+    let bad = basic_auth_header("guest", "not-the-password");
+    let (code, text) = http_request("GET", "/stats", &[bad.clone()], None).await;
+    assert_eq!(code, 401, "bad credentials must 401: {text}");
+    assert!(
+        header_of(&text, "WWW-Authenticate").is_some(),
+        "401 must carry a Basic challenge"
+    );
+    let (code, text) = http_request("GET", "/metrics", &[bad], None).await;
+    assert_eq!(
+        code, 401,
+        "bad credentials must 401 on /metrics too: {text}"
+    );
+
+    // A real authenticated NON-admin user: 403 on both endpoints.
+    let (code, text) = api_put(
+        "/api/users/svc-stats",
+        &admin,
+        r#"{"password":"svc-stats-pw"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "create svc-stats failed: {text}");
+    let svc = basic_auth_header("svc-stats", "svc-stats-pw");
+    let (code, text) = http_request("GET", "/stats", &[svc.clone()], None).await;
+    assert_eq!(
+        code, 403,
+        "non-admin credentials must 403 on /stats: {text}"
+    );
+    let (code, text) = http_request("GET", "/metrics", &[svc], None).await;
+    assert_eq!(
+        code, 403,
+        "non-admin credentials must 403 on /metrics: {text}"
+    );
+
+    // Cleanup via the API under test.
+    let _ = api_delete("/api/users/svc-stats", &admin).await;
+}

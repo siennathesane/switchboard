@@ -224,18 +224,10 @@ async fn dispatch(
     // without the full-power entry is simply not an admin.
     {
         let topo = node.topology();
-        let strict = admin_strict_mode();
-        let flagged = topo.admins.contains(&user);
-        let grandfathered = !strict
-            && (user == switchboard_wire::constants::DEFAULT_USER
-                || topo
-                    .permissions
-                    .get(&user)
-                    .is_some_and(|per_vhost| per_vhost.values().any(|p| p.configure == ".*")));
-        if !flagged && !grandfathered {
+        if !is_admin_user(&topo, &user) {
             return Err(ApiError::Forbidden(format!(
                 "user {user:?} is not an admin; the admin API is limited to admin-flagged users{}",
-                if strict {
+                if admin_strict_mode() {
                     " (SWITCHBOARD_ADMIN_STRICT is on: the flag is the only path)"
                 } else {
                     " (grant it with PUT /api/users/{name}/admin)"
@@ -291,8 +283,29 @@ fn admin_strict_mode() -> bool {
     }
 }
 
+/// Is `user` an admin for gating purposes (code-scanning alert #19)?
+/// The replicated [`MetaState::admins`] flag, plus — unless
+/// `SWITCHBOARD_ADMIN_STRICT` is on — the grandfathered full-power
+/// shapes (the default user, or any `configure: ".*"` permissions
+/// entry). Shared by the `/api` dispatch gate above and the
+/// `/stats` + `/metrics` access gate in [`super::http`]
+/// (code-scanning alert #21).
+pub(super) fn is_admin_user(topo: &switchboard_core::topology::MetaState, user: &str) -> bool {
+    let strict = admin_strict_mode();
+    let flagged = topo.admins.contains(user);
+    let grandfathered = !strict
+        && (user == switchboard_wire::constants::DEFAULT_USER
+            || topo
+                .permissions
+                .get(user)
+                .is_some_and(|per_vhost| per_vhost.values().any(|p| p.configure == ".*")));
+    flagged || grandfathered
+}
+
 /// `Authorization: Basic base64(user:password)` → `(user, password)`.
-fn parse_basic_auth(header: Option<&str>) -> Option<(String, String)> {
+/// Also used by the `/stats` + `/metrics` access gate
+/// (code-scanning alert #21).
+pub(super) fn parse_basic_auth(header: Option<&str>) -> Option<(String, String)> {
     let header = header?.trim();
     let (scheme, encoded) = header.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
@@ -316,7 +329,9 @@ fn find_head_terminator(head: &[u8]) -> Option<usize> {
     head.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn header_value(head: &[u8], name: &str) -> Option<String> {
+/// Case-insensitive header lookup within the request head proper. Also
+/// used by the `/stats` + `/metrics` access gate (alert #21).
+pub(super) fn header_value(head: &[u8], name: &str) -> Option<String> {
     // Only the head proper carries headers; `head` may have body bytes
     // glued past the terminator, which must not be scanned.
     let end = find_head_terminator(head).unwrap_or(head.len());

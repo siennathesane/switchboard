@@ -1,6 +1,31 @@
 //! Minimal HTTP handling on the client port: a health probe endpoint for
 //! load balancers, plus WebSocket-upgrade detection (the upgrade itself
 //! lives in [`super::ws`]).
+//!
+//! # `/stats` and `/metrics` access (code-scanning alert #21)
+//!
+//! Both endpoints expose operational detail — queue names, message
+//! counters, process vitals — so they are access-gated:
+//!
+//! * Loopback peers need no credentials (the shape of the guest
+//!   loopback rule: localhost tooling like `curl 127.0.0.1:5672/stats`
+//!   keeps working).
+//! * Every other peer must present HTTP basic credentials that
+//!   authenticate against the replicated user table (the standard
+//!   [`super::shared::authorize`] path, guest-loopback rule included)
+//!   AND belong to an admin user — the same admin gate `/api` applies
+//!   ([`super::admin::is_admin_user`]). Missing/bad credentials → 401;
+//!   authenticated non-admin → 403.
+//! * `SWITCHBOARD_STATS_UNAUTHED=1` (any truthy value; **lab-only**)
+//!   lets unauthenticated peers scrape from anywhere. The docker/k8s
+//!   labs scrape these endpoints from other containers/pods (the soak
+//!   monitor and the k8s scaler map pods through `/stats`), and the lab
+//!   entrypoint scripts set this env for exactly that; production
+//!   deployments should leave it unset.
+//!
+//! The plain health probes (`/`, `/health`, `/healthz`) stay
+//! unauthenticated from any peer: they carry no information beyond
+//! "the process is serving".
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -57,11 +82,43 @@ where
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     let ok = method == "GET" && matches!(path, "/" | "/health" | "/healthz");
+
+    // /stats and /metrics are access-gated (code-scanning alert #21;
+    // see the module docs): loopback may scrape unauthenticated, any
+    // other peer needs admin basic credentials unless the lab-only
+    // SWITCHBOARD_STATS_UNAUTHED opt-out is set.
+    if method == "GET" && matches!(path, "/stats" | "/metrics") {
+        if let Err(denial) = stats_access(&node, &limits, &head).await {
+            let (status, extra, body): (&str, Option<&str>, &str) = match denial {
+                StatsDenial::Unauthorized => (
+                    "401 Unauthorized",
+                    Some("WWW-Authenticate: Basic realm=\"switchboard-stats\""),
+                    "{\"error\":\"authentication required\"}",
+                ),
+                StatsDenial::Forbidden => (
+                    "403 Forbidden",
+                    None,
+                    "{\"error\":\"stats require admin credentials\"}",
+                ),
+            };
+            let extra_line = extra.map(|h| format!("{h}\r\n")).unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_line}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            use tokio::io::AsyncWriteExt;
+            io.write_all(response.as_bytes()).await?;
+            io.flush().await?;
+            let _ = io.shutdown().await;
+            return Ok(());
+        }
+    }
+
     let (status, content_type, body) = if path == "/stats" && method == "GET" {
         ("200 OK", "application/json", stats_json(&node))
     } else if path == "/metrics" && method == "GET" {
         // Prometheus text exposition (v0.0.4), hand-rolled in
-        // [`super::metrics`]; unauthenticated like /stats.
+        // [`super::metrics`]; behind the shared /stats access gate.
         (
             "200 OK",
             "text/plain; version=0.0.4",
@@ -90,6 +147,79 @@ where
     // Connection: close — the gateway drops the socket on return.
     let _ = io.shutdown().await;
     Ok(())
+}
+
+/// Why a `/stats` or `/metrics` request was refused
+/// (code-scanning alert #21).
+enum StatsDenial {
+    /// Credentials missing, malformed, or failed to authenticate → 401.
+    Unauthorized,
+    /// Credentials authenticated but the user is not an admin → 403.
+    Forbidden,
+}
+
+/// `SWITCHBOARD_STATS_UNAUTHED` (default off; **lab-only**): any truthy
+/// value — everything except the empty string, "0", and "false"
+/// (case-insensitive) — allows unauthenticated `/stats` and `/metrics`
+/// scrapes from ANY peer. Exists because the docker/k8s labs scrape
+/// these endpoints from other containers/pods; see the module docs.
+fn stats_unauthed_opt_out() -> bool {
+    match std::env::var("SWITCHBOARD_STATS_UNAUTHED") {
+        Ok(v) => !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// May an unauthenticated `/stats`/`/metrics` request from `peer_ip`
+/// through? Loopback always — mirroring the shape of the guest
+/// loopback rule (a peer whose address is unknown is not refused, the
+/// same way `shared::authorize` treats it) so localhost tooling keeps
+/// working — and any peer under the lab opt-out. A provably
+/// non-loopback peer must authenticate.
+fn unauthenticated_stats_allowed(peer_ip: Option<std::net::IpAddr>, lab_opt_out: bool) -> bool {
+    if lab_opt_out {
+        return true;
+    }
+    !peer_ip.map_or(false, |ip| !ip.is_loopback())
+}
+
+/// Access gate for `/stats` and `/metrics` (code-scanning alert #21).
+/// With credentials: they must authenticate through the standard
+/// [`super::shared::authorize`] path (guest-loopback rule included) and
+/// belong to an admin user — from any peer. Without credentials:
+/// loopback or the lab opt-out passes, everything else is a 401.
+async fn stats_access(
+    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
+    limits: &crate::channel::ConnectionLimits,
+    head: &[u8],
+) -> Result<(), StatsDenial> {
+    let auth_header = super::admin::header_value(head, "authorization");
+    match super::admin::parse_basic_auth(auth_header.as_deref()) {
+        Some((user, pass)) => {
+            super::shared::authorize(
+                node,
+                &user,
+                &pass,
+                limits.peer_ip,
+                limits.allow_remote_guest,
+            )
+            .await
+            .map_err(|_| StatsDenial::Unauthorized)?;
+            let topo = node.topology();
+            if super::admin::is_admin_user(&topo, &user) {
+                Ok(())
+            } else {
+                Err(StatsDenial::Forbidden)
+            }
+        }
+        None => {
+            if unauthenticated_stats_allowed(limits.peer_ip, stats_unauthed_opt_out()) {
+                Ok(())
+            } else {
+                Err(StatsDenial::Unauthorized)
+            }
+        }
+    }
 }
 
 /// One-line JSON resource snapshot for ops/soak monitoring:
@@ -186,5 +316,31 @@ mod tests {
         assert!(wants_upgrade(req));
         let plain = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(!wants_upgrade(plain));
+    }
+
+    /// Alert #21: the unauthenticated-scrape decision. Loopback passes,
+    /// a non-loopback peer is refused, the lab opt-out lets any peer
+    /// through, and an unknown peer address mirrors the guest rule
+    /// (never the refusal).
+    #[test]
+    fn unauthenticated_stats_scrape_decision() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        assert!(
+            unauthenticated_stats_allowed(Some(loopback), false),
+            "loopback tooling scrapes without credentials"
+        );
+        assert!(
+            !unauthenticated_stats_allowed(Some(remote), false),
+            "non-loopback unauthenticated scrape is a 401"
+        );
+        assert!(
+            unauthenticated_stats_allowed(Some(remote), true),
+            "the lab opt-out admits any peer"
+        );
+        assert!(
+            unauthenticated_stats_allowed(None, false),
+            "unknown peer mirrors the guest-rule shape (no refusal)"
+        );
     }
 }
