@@ -530,7 +530,16 @@ impl ClusterNode {
                 *total.entry(k.to_string()).or_default() += n;
             }
             for (name, ready, held) in h.sm.account_queues() {
-                let e = queues.entry(name).or_default();
+                // Shard-data keys are vhost-qualified (alert #14); stats
+                // surface the client-facing queue name (everything before
+                // the separator). Same-named queues in different vhosts
+                // merge into one display row — stats are a triage view,
+                // not an isolation boundary.
+                let display = name
+                    .split(switchboard_core::shard::SHARD_KEY_SEP)
+                    .next()
+                    .unwrap_or(&name);
+                let e = queues.entry(display.to_string()).or_default();
                 e.0 += ready;
                 e.1 += held;
             }
@@ -1175,7 +1184,8 @@ impl ClusterNode {
                 .write(
                     shard,
                     BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
-                        queue: q,
+                        // Vhost-qualified shard-data key (alert #14).
+                        queue: switchboard_core::shard::shard_key(vhost, &q),
                         message: message.clone(),
                         at_ms: now_ms(),
                     }),
@@ -1334,7 +1344,10 @@ impl ClusterNode {
                     let group = vhost
                         .as_ref()
                         .and_then(|vh| vh.queues.get(q).map(|qi| qi.shard));
-                    let q = q.clone();
+                    // Vhost-qualified shard-data key (alert #14): the
+                    // fanout's destinations are bare meta names; the
+                    // enqueue addresses the vhost's own shard entry.
+                    let key = switchboard_core::shard::shard_key(&pending.vhost, q);
                     let message = pending.message.clone();
                     let leg_id = Self::fanout_leg_id(pending.id, leg);
                     async move {
@@ -1347,7 +1360,7 @@ impl ClusterNode {
                         self.write_idempotent(
                             group,
                             BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
-                                queue: q,
+                                queue: key,
                                 message,
                                 at_ms: now_ms(),
                             }),

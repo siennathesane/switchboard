@@ -49,6 +49,34 @@ pub const GET_HOLDER_NODE: u64 = u64::MAX;
 /// its own window arithmetic and only needs "small" credits anyway.
 const MAX_CREDIT: u32 = 1_000_000;
 
+/// Separator between the queue name and the vhost in a vhost-qualified
+/// shard-data key (code-scanning alert #14).
+///
+/// The separator is NUL: it cannot appear in any client-reachable queue
+/// name in practice (AMQP shortstr bytes theoretically may contain it,
+/// but no client sends one; MQTT/STOMP-derived names cannot), which
+/// keeps qualified keys unambiguous.
+pub const SHARD_KEY_SEP: char = '\u{0}';
+
+/// The vhost-qualified shard-data key for `queue` in `vhost`
+/// (code-scanning alert #14).
+///
+/// Shard data used to be keyed by the bare queue name, so the same
+/// queue name declared in two vhosts shared one `QueueData` — messages
+/// published in one vhost were consumed from the other (a
+/// tenant-isolation break). Every shard command now carries this
+/// qualified key (`"<queue>\u{0}<vhost>"`), which makes cross-vhost
+/// collisions impossible. Shard *placement* is unchanged —
+/// `assign_shard` still hashes the bare queue name — so all of a
+/// cluster's qualified keys still distribute over the same groups.
+pub fn shard_key(vhost: &str, queue: &str) -> String {
+    let mut key = String::with_capacity(queue.len() + vhost.len() + 1);
+    key.push_str(queue);
+    key.push(SHARD_KEY_SEP);
+    key.push_str(vhost);
+    key
+}
+
 /// One queue's replicated message storage. Messages are ordered by a
 /// per-queue sequence number allocated at apply time, so enqueue order is
 /// the total order of the raft log — the "content processing path" order
@@ -343,6 +371,9 @@ impl ShardState {
 
     /// Apply a shard command: mutate state, reply, emit effects. Pure —
     /// identical on every replica of the group.
+    ///
+    /// Queue references arrive vhost-qualified (see [`shard_key`],
+    /// code-scanning alert #14) and are used verbatim as `queues` keys.
     pub fn apply(&mut self, cmd: &ShardCmd) -> Result<(ShardReply, Vec<ShardEffect>), BrokerError> {
         self.now += 1;
         match cmd {

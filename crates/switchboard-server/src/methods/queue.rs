@@ -90,7 +90,7 @@ impl Channel {
         let reply = meta_call(
             node,
             MetaCmd::DeclareQueue {
-                vhost: vhost_name,
+                vhost: vhost_name.clone(),
                 name: name.to_string(),
                 passive,
                 options,
@@ -111,7 +111,10 @@ impl Channel {
                 node,
                 shard,
                 ShardCmd::CreateQueueData {
-                    queue: final_name.clone(),
+                    // Vhost-qualified shard-data key (alert #14): the
+                    // same queue name in two vhosts must never share
+                    // data.
+                    queue: switchboard_core::shard::shard_key(&vhost_name, &final_name),
                     policy,
                 },
             )
@@ -119,7 +122,8 @@ impl Channel {
             Ok((final_name, 0, 0))
         } else {
             // Live counts come from the owning shard (linearizable read).
-            match Self::stats_lenient(node, shard, &final_name).await {
+            let data_key = switchboard_core::shard::shard_key(&vhost_name, &final_name);
+            match Self::stats_lenient(node, shard, &data_key).await {
                 Ok(ShardReply::Stats {
                     depth,
                     consumer_count,
@@ -148,7 +152,7 @@ impl Channel {
                         node,
                         shard,
                         ShardCmd::CreateQueueData {
-                            queue: final_name.clone(),
+                            queue: switchboard_core::shard::shard_key(&vhost_name, &final_name),
                             policy,
                         },
                     )
@@ -173,7 +177,8 @@ impl Channel {
             node,
             shard,
             ShardCmd::Purge {
-                queue: queue.to_string(),
+                // Vhost-qualified shard-data key (alert #14).
+                queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
             },
         )
         .await?
@@ -205,7 +210,13 @@ impl Channel {
         // (a subscription registration requires queue data), so the
         // assertions are vacuously satisfied and the delete must proceed —
         // otherwise the queue could never be deleted by anyone.
-        let (depth, consumers) = match Self::stats_lenient(node, shard, queue).await {
+        let (depth, consumers) = match Self::stats_lenient(
+            node,
+            shard,
+            &switchboard_core::shard::shard_key(&inner_vhost(self), queue),
+        )
+        .await
+        {
             Ok(ShardReply::Stats {
                 depth,
                 consumer_count,
@@ -234,7 +245,8 @@ impl Channel {
             node,
             shard,
             ShardCmd::DeleteQueueData {
-                queue: queue.to_string(),
+                // Vhost-qualified shard-data key (alert #14).
+                queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
             },
         )
         .await;

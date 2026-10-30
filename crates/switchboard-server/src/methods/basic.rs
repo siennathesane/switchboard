@@ -41,11 +41,16 @@ impl Channel {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         authorize_ch(self, node, Perm::Read, queue)?;
+        // Vhost-qualified shard-data key (alert #14); the same key must
+        // back the unacked record so a later Ack round-trips to the
+        // queue the message actually came from.
+        let data_key =
+            switchboard_core::shard::shard_key(&crate::methods::inner_vhost(self), queue);
         let reply = shard_call_lenient(
             node,
             shard,
             ShardCmd::Get {
-                queue: queue.to_string(),
+                queue: data_key.clone(),
                 no_ack,
                 get_id,
             },
@@ -66,7 +71,7 @@ impl Channel {
                     inner.unacked.insert(
                         tag,
                         Unacked {
-                            queue: queue.to_string(),
+                            queue: data_key.clone(),
                             shard,
                             seq,
                             sub: Some(SubscriptionId {

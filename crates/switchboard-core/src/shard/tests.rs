@@ -1152,3 +1152,89 @@ fn expire_prepared_janitor_drops_stale_transactions() {
     s.apply(&ShardCmd::CommitTx { tx: (9, 1) }).unwrap();
     assert_eq!(stats_of(&mut s, "q"), 0);
 }
+
+// ---------------------------------------------------------------------
+// Vhost-qualified shard-data keys (code-scanning alert #14): the same
+// queue name in two vhosts must never share QueueData.
+// ---------------------------------------------------------------------
+
+/// Depth via a qualified key — errors panic.
+fn depth_at(s: &mut ShardState, key: &str) -> u32 {
+    let (
+        ShardReply::Stats {
+            depth,
+            consumer_count: _,
+        },
+        _,
+    ) = s.apply(&ShardCmd::Stats { queue: key.into() }).unwrap()
+    else {
+        panic!("expected Stats for {key:?}")
+    };
+    depth
+}
+
+#[test]
+fn qualified_shard_keys_are_vhost_distinct() {
+    let a = shard_key("/", "orders");
+    let b = shard_key("/tenant2", "orders");
+    assert_ne!(a, b, "same queue name in two vhosts must key differently");
+    // Distinct vhosts AND distinct names never collide pairwise.
+    assert_ne!(shard_key("/a", "x"), shard_key("/", "a\u{0}x"));
+}
+
+#[test]
+fn same_queue_name_in_two_vhosts_does_not_share_data() {
+    let mut s = ShardState::default();
+    let ka = shard_key("/", "shared");
+    let kb = shard_key("/tenant2", "shared");
+    for k in [&ka, &kb] {
+        s.apply(&ShardCmd::CreateQueueData {
+            queue: k.clone(),
+            policy: Default::default(),
+        })
+        .unwrap();
+    }
+    // Two messages in vhost A, one in vhost B.
+    for body in [b"a1", b"a2"] {
+        s.apply(&ShardCmd::Enqueue {
+            queue: ka.clone(),
+            message: msg(body),
+            at_ms: 100,
+        })
+        .unwrap();
+    }
+    s.apply(&ShardCmd::Enqueue {
+        queue: kb.clone(),
+        message: msg(b"b1"),
+        at_ms: 100,
+    })
+    .unwrap();
+
+    assert_eq!(
+        depth_at(&mut s, &ka),
+        2,
+        "vhost A sees only its own messages"
+    );
+    assert_eq!(
+        depth_at(&mut s, &kb),
+        1,
+        "vhost B sees only its own messages"
+    );
+    assert_eq!(s.queues.len(), 2, "two distinct QueueData entries");
+
+    // Consuming across the boundary: vhost B drains its own message and
+    // can never reach vhost A's.
+    let (reply, _) = s
+        .apply(&ShardCmd::Get {
+            queue: kb.clone(),
+            no_ack: true,
+            get_id: 1,
+        })
+        .unwrap();
+    let ShardReply::Got { message, .. } = reply else {
+        panic!("expected Got");
+    };
+    assert_eq!(message.body, b"b1");
+    assert_eq!(depth_at(&mut s, &ka), 2);
+    assert_eq!(depth_at(&mut s, &kb), 0);
+}

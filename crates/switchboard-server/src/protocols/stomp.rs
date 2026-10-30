@@ -606,6 +606,10 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
         Destination::Topic { rk, .. } => format!("/topic/{rk}"),
         Destination::Queue(q) => format!("/queue/{q}"),
     };
+    // The message-id must carry the client-facing queue name: shard-data
+    // keys are vhost-qualified with a NUL separator (alert #14), and a
+    // raw NUL would truncate the STOMP frame.
+    let msg_queue = queue.clone();
     let task_consumer = consumer.clone();
     tokio::spawn(async move {
         let consumer = task_consumer;
@@ -615,7 +619,7 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
                 ("subscription".to_string(), sub_id.clone()),
                 (
                     "message-id".to_string(),
-                    format!("sb-{}-{}", d.seq, d.queue),
+                    format!("sb-{}-{}", d.seq, msg_queue),
                 ),
                 ("destination".to_string(), destination.clone()),
                 (
@@ -675,7 +679,8 @@ async fn commit_transaction(
                     message.routing_key = rk.clone();
                     per_shard.entry(shard).or_default().push(
                         switchboard_core::shard::TxOp::Enqueue {
-                            queue,
+                            // Vhost-qualified shard-data key (alert #14).
+                            queue: switchboard_core::shard::shard_key(&ctx.vhost, &queue),
                             message: message.clone(),
                         },
                     );
@@ -706,7 +711,8 @@ async fn commit_transaction(
                     .entry(shard)
                     .or_default()
                     .push(switchboard_core::shard::TxOp::Enqueue {
-                        queue: q.clone(),
+                        // Vhost-qualified shard-data key (alert #14).
+                        queue: switchboard_core::shard::shard_key(&ctx.vhost, q),
                         message: message.clone(),
                     });
             }

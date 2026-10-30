@@ -252,7 +252,8 @@ pub async fn declare_queue(
                     &ctx.node,
                     shard,
                     ShardCmd::CreateQueueData {
-                        queue: name.to_string(),
+                        // Vhost-qualified shard-data key (alert #14).
+                        queue: switchboard_core::shard::shard_key(&ctx.vhost, name),
                         policy,
                     },
                 )
@@ -314,7 +315,8 @@ pub async fn delete_queue(ctx: &BridgeContext, name: &str) {
         &ctx.node,
         shard,
         ShardCmd::DeleteQueueData {
-            queue: name.to_string(),
+            // Vhost-qualified shard-data key (alert #14).
+            queue: switchboard_core::shard::shard_key(&ctx.vhost, name),
         },
     )
     .await;
@@ -405,7 +407,9 @@ pub async fn publish(
             node,
             shard,
             ShardCmd::Enqueue {
-                queue: q.clone(),
+                // Vhost-qualified shard-data key (alert #14): the same
+                // queue name in another vhost must never receive this.
+                queue: switchboard_core::shard::shard_key(&ctx.vhost, &q),
                 message: message.clone(),
                 at_ms: switchboard_cluster::now_ms(),
             },
@@ -419,7 +423,14 @@ pub async fn publish(
 /// receiver is returned separately by [`BridgeConsumer::start`] so the
 /// caller can move it into its own pump task.
 pub struct BridgeConsumer {
+    /// The client-facing queue name (the meta-visible name; teardown
+    /// paths use it for topology lookups and deletion).
     pub queue: String,
+    /// The vhost-qualified shard-data key (alert #14) acks/releases
+    /// address the queue by — it must be the same form the registration
+    /// used, so the shard resolves it to the exact entry the deliveries
+    /// came from.
+    pub shard_data_key: String,
     pub shard: GroupId,
     pub sub: switchboard_core::model::SubscriptionId,
 }
@@ -448,12 +459,16 @@ impl BridgeConsumer {
             cancelled: ctx_tx,
         };
         node.attach_consumer(sub, sink.clone()).await;
+        // Vhost-qualified shard-data key (alert #14): the consumer
+        // attaches to its own vhost's entry, and acks/releases address
+        // the same key the deliveries came from.
+        let shard_data_key = switchboard_core::shard::shard_key(&ctx.vhost, queue);
         shard_call(
             node,
             shard,
             ShardCmd::RegisterSubscription {
                 sub,
-                queue: queue.to_string(),
+                queue: shard_data_key.clone(),
                 node: node.id,
                 consumer_tag: tag.to_string(),
                 no_ack,
@@ -473,6 +488,7 @@ impl BridgeConsumer {
         Ok((
             Arc::new(BridgeConsumer {
                 queue: queue.to_string(),
+                shard_data_key,
                 shard,
                 sub,
             }),
@@ -488,7 +504,7 @@ impl BridgeConsumer {
             node,
             self.shard,
             ShardCmd::Ack {
-                queue: self.queue.clone(),
+                queue: self.shard_data_key.clone(),
                 seqs,
             },
         )
@@ -505,7 +521,7 @@ impl BridgeConsumer {
             node,
             self.shard,
             ShardCmd::Release {
-                queue: self.queue.clone(),
+                queue: self.shard_data_key.clone(),
                 sub: Some(self.sub),
                 seqs,
                 dead: false,

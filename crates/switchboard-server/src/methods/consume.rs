@@ -111,7 +111,10 @@ impl Channel {
             shard,
             ShardCmd::RegisterSubscription {
                 sub,
-                queue: queue.to_string(),
+                // Vhost-qualified shard-data key (alert #14): consumers
+                // attach to their own vhost's entry; deliveries carry
+                // the same key back out for ack round-trips.
+                queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
                 node: node_id,
                 consumer_tag: tag.clone(),
                 no_ack,

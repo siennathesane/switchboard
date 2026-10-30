@@ -141,7 +141,8 @@ impl Channel {
                 node,
                 first.shard,
                 ShardCmd::Stats {
-                    queue: destinations[0].clone(),
+                    // Vhost-qualified shard-data key (alert #14).
+                    queue: switchboard_core::shard::shard_key(&inner_vhost(self), &destinations[0]),
                 },
             )
             .await?;
@@ -167,6 +168,9 @@ impl Channel {
         // confirms fire at commit.
         let in_tx = self.inner.lock().unwrap().tx.is_some();
         if in_tx {
+            // Vhost for the qualified shard-data key (alert #14), taken
+            // BEFORE the buffer lock: `inner_vhost` locks the same mutex.
+            let vhost_name = inner_vhost(self);
             let mut inner = self.inner.lock().unwrap();
             let Some(tx) = inner.tx.as_mut() else {
                 return Ok(());
@@ -176,7 +180,9 @@ impl Channel {
                     continue;
                 };
                 tx.ops.push(ChannelTxOp::Publish {
-                    queue: q.clone(),
+                    // The buffered enqueue must land on the same
+                    // qualified entry the direct path uses.
+                    queue: switchboard_core::shard::shard_key(&vhost_name, q),
                     shard,
                     message: message.clone(),
                     confirm_seq: (confirm_seq != 0).then_some(confirm_seq),
@@ -221,7 +227,8 @@ impl Channel {
                 node,
                 shard,
                 ShardCmd::Enqueue {
-                    queue: q.clone(),
+                    // Vhost-qualified shard-data key (alert #14).
+                    queue: switchboard_core::shard::shard_key(&inner_vhost(self), q),
                     message: message.clone(),
                     at_ms: switchboard_cluster::now_ms(),
                 },
