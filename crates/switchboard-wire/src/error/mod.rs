@@ -29,6 +29,8 @@ pub enum CodecError {
     FieldType(u8),
     #[error("field name {0:?} is invalid (must start with a letter, '$' or '#', max 128 chars)")]
     FieldName(String),
+    #[error("field-table nesting exceeds the maximum depth {0}")]
+    NestingTooDeep(u32),
     #[error("decimal scale {0} exceeds 255 digits of precision")]
     #[allow(dead_code)]
     DecimalScale(u8),

@@ -26,6 +26,53 @@ use serde::{Deserialize, Serialize};
 use crate::error::CodecError;
 use crate::wireio::{Decoder, Encoder};
 
+/// Maximum nesting depth accepted while decoding field tables and arrays
+/// (code-scanning alert #18).
+///
+/// Decoding is mutually recursive — `FieldTable::decode` decodes each
+/// value via `FieldValue::decode`, whose `'F'` (table) and `'A'` (array)
+/// tags recurse back into table/array decoding — and nesting depth is
+/// entirely peer-controlled. Each `'F'` level costs only ~7 wire bytes,
+/// so a modest hand-crafted frame can demand hundreds of thousands of
+/// stack frames and abort the process with a stack overflow (uncatchable
+/// in Rust); attacker input reaches this pre-authentication through the
+/// handshake's `client_properties` table. The guard turns that into an
+/// ordinary [`CodecError::NestingTooDeep`] decode error.
+///
+/// Implementation choice: the `decode` signatures stay unchanged (they
+/// are public API used directly by both the server and the auth
+/// plugin's amqplain credential decoding), so the depth is carried in a
+/// thread-local counter with an RAII guard — every early `?` return
+/// still decrements it. Decoding never awaits, so the counter is
+/// race-free within a task; the bound is intentionally generous (real
+/// client tables nest two or three levels at most).
+const MAX_FIELD_NESTING: u32 = 64;
+
+thread_local! {
+    static FIELD_NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that increments [`FIELD_NESTING_DEPTH`] on entry and
+/// decrements it on every exit path (see [`MAX_FIELD_NESTING`]).
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<Self, CodecError> {
+        let depth = FIELD_NESTING_DEPTH.with(|c| c.get()) + 1;
+        if depth > MAX_FIELD_NESTING {
+            return Err(CodecError::NestingTooDeep(MAX_FIELD_NESTING));
+        }
+        FIELD_NESTING_DEPTH.with(|c| c.set(depth));
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        FIELD_NESTING_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 /// A typed field-table value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
@@ -136,6 +183,7 @@ impl FieldTable {
 
     /// Decode a table including its 32-bit length prefix.
     pub fn decode(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        let _depth = DepthGuard::enter()?;
         let len = d.u32()? as usize;
         if len > d.remaining() {
             return Err(CodecError::Eof { needed: len, had: d.remaining() });
@@ -246,6 +294,7 @@ impl FieldValue {
 
     /// Decode a value from its type octet.
     pub fn decode(d: &mut Decoder<'_>) -> Result<Self, CodecError> {
+        let _depth = DepthGuard::enter()?;
         let tag = d.u8()?;
         let v = match tag {
             b't' => FieldValue::Boolean(d.u8()? != 0),
@@ -478,5 +527,99 @@ mod access_tests {
             FieldValue::Array(vec![FieldValue::FieldTable(inner)]),
         );
         assert!(t.validate().is_err(), "nested bad name must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// Wire bytes of a table nested `n` levels deep: every level holds a
+    /// single field "a" whose value is an 'F' table, except the innermost,
+    /// which holds a void value.
+    fn nested_tables(n: usize) -> Vec<u8> {
+        // Innermost: one field "a" = void (3 body bytes: name len, 'a', 'V').
+        let mut current = vec![0u8, 0, 0, 3, 1, b'a', b'V'];
+        for _ in 0..n {
+            let mut body = Vec::new();
+            body.push(1); // short-str name length
+            body.push(b'a');
+            body.push(b'F'); // nested-table tag; the value IS a full table
+            body.extend_from_slice(&current); // (own 32-bit length prefix)
+            let mut outer = Vec::new();
+            outer.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            outer.extend_from_slice(&body);
+            current = outer;
+        }
+        current
+    }
+
+    /// Wire bytes of an array nested `n` levels deep ('A' inside 'A',
+    /// innermost item void).
+    fn nested_arrays(n: usize) -> Vec<u8> {
+        let mut current = vec![b'V'];
+        for _ in 0..n {
+            let mut item = Vec::new();
+            item.push(b'A');
+            item.extend_from_slice(&(current.len() as u32).to_be_bytes());
+            item.extend_from_slice(&current);
+            current = item;
+        }
+        current
+    }
+
+    #[test]
+    fn deep_table_nesting_is_a_decode_error_not_a_crash() {
+        // Without the depth guard this recursion would overflow the stack
+        // and abort the process before any test assertion could fire.
+        let bytes = nested_tables(100_000);
+        let mut d = Decoder::new(&bytes);
+        assert!(
+            matches!(FieldTable::decode(&mut d), Err(CodecError::NestingTooDeep(_))),
+            "deeply nested tables must decode-error, not recurse unboundedly"
+        );
+    }
+
+    #[test]
+    fn deep_array_nesting_is_a_decode_error_not_a_crash() {
+        let bytes = nested_arrays(100_000);
+        let mut d = Decoder::new(&bytes);
+        assert!(
+            matches!(FieldValue::decode(&mut d), Err(CodecError::NestingTooDeep(_))),
+            "deeply nested arrays must decode-error, not recurse unboundedly"
+        );
+    }
+
+    #[test]
+    fn reasonable_nesting_still_decodes() {
+        // Well under the cap: ordinary client tables nest a handful of
+        // levels at most; 10 must round-trip untouched.
+        let bytes = nested_tables(10);
+        let mut d = Decoder::new(&bytes);
+        let table = FieldTable::decode(&mut d).unwrap();
+        d.finish().unwrap();
+        // Walk to the innermost void and assert the structure survived.
+        let mut node = &table;
+        for _ in 0..10 {
+            let Some(FieldValue::FieldTable(inner)) = node.get("a") else {
+                panic!("nesting truncated at the wrong depth");
+            };
+            node = inner;
+        }
+        assert_eq!(node.get("a"), Some(&FieldValue::Void));
+    }
+
+    #[test]
+    fn depth_guard_resets_after_a_rejected_decode() {
+        // The RAII guard must unwind even through the `?` early returns
+        // inside the recursion, or one rejected frame would poison the
+        // thread for the rest of the connection.
+        let deep = nested_tables(100_000);
+        let mut d = Decoder::new(&deep);
+        assert!(FieldTable::decode(&mut d).is_err());
+        assert_eq!(FIELD_NESTING_DEPTH.with(|c| c.get()), 0);
+        let shallow = nested_tables(2);
+        let mut d2 = Decoder::new(&shallow);
+        assert!(FieldTable::decode(&mut d2).is_ok());
     }
 }
