@@ -27,9 +27,6 @@ use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
 use switchboard_core::topology::VhostView;
 use switchboard_wire::field::FieldTable;
-use switchboard_wire::properties::BasicProperties;
-
-use crate::channel::ConnectionLimits;
 
 /// Which client protocols the gateway accepts. AMQP 0-9-1 is always on
 /// (it is the broker's native protocol); everything else is optional.

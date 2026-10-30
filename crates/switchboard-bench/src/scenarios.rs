@@ -16,7 +16,6 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::bail;
 use lapin::BasicProperties;
-use lapin::Channel;
 use lapin::Connection;
 use lapin::ConnectionProperties;
 use lapin::message::Delivery;
@@ -106,6 +105,7 @@ struct TaskCounters {
     /// Counted when the broker acks a publish (confirm scenarios).
     acks: Option<Arc<Counter>>,
     /// Counted when a consumer receives a message.
+    #[allow(dead_code)] // receiver-side counter, surfaced once receive-side reporting lands
     received: Option<Arc<Counter>>,
     /// Counted at publish-call time (send attempts).
     sent: Option<Arc<Counter>>,
@@ -189,7 +189,6 @@ async fn publisher_task(
                     }
                     if wait_for_ack {
                         let counters = counters.clone();
-                        let sem = sem.clone();
                         tokio::spawn(async move {
                             match tokio::time::timeout(Duration::from_secs(5), pc).await {
                                 Ok(Ok(Confirmation::Ack(_))) => {

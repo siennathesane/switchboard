@@ -12,6 +12,7 @@ use switchboard_server::protocols::ProtocolConfig;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+#[allow(dead_code)] // port helper kept for listener-bearing ws arm tests
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

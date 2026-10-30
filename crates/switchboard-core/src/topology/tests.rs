@@ -35,6 +35,7 @@ fn declare_q(state: &mut MetaState, name: &str, durable: bool) -> MetaReply {
     r
 }
 
+#[allow(dead_code)] // full-declare variant kept for queue-option tests
 fn declare_q_full(
     state: &mut MetaState,
     name: &str,
@@ -746,7 +747,7 @@ fn unbind_is_idempotent_and_bind_requires_vhost() {
 
 #[test]
 fn assign_shard_is_stable_and_full_range() {
-    let mut s = state(); // groups 1..3
+    let s = state(); // groups 1..3
     let a = s.assign_shard("steady-queue").unwrap();
     let b = s.assign_shard("steady-queue").unwrap();
     assert_eq!(a, b);

@@ -32,10 +32,8 @@ pub mod workload;
 pub mod workload_idle;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use ledger::Ledger;
@@ -484,7 +482,7 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     for t in proto_tasks {
         t.abort();
     }
-    let mut rep = SoakReport {
+    let rep = SoakReport {
         elapsed: started.elapsed(),
         reconcile,
         resource: monitor::trends_snapshot(),

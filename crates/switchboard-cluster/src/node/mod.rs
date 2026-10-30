@@ -2162,7 +2162,6 @@ impl ClusterNode {
     async fn janitor_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut tick =
             tokio::time::interval(switchboard_core::tempo::scale(self.cfg.timeouts.janitor_interval));
-        let mut janitor_tick = 0u64;
         loop {
             tokio::select! {
                 _ = tick.tick() => {}

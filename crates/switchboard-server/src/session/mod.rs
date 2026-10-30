@@ -13,7 +13,6 @@
 //! interval"; two silent intervals close the connection).
 
 use std::collections::HashMap;
-use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -22,7 +21,6 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use switchboard_cluster::ClusterNode;
-use switchboard_cluster::META_GROUP;
 use switchboard_core::auth;
 use switchboard_core::error::BrokerError;
 use switchboard_core::error::Level;
@@ -44,8 +42,6 @@ use crate::channel::ConnectionLimits;
 use crate::channel::close_for;
 use crate::channel::unexpected_content;
 use crate::outbound::OutboundFrame;
-use switchboard_cluster::BrokerCommand;
-use switchboard_core::topology::MetaCmd;
 
 /// Serve one accepted plain-TCP client connection.
 pub async fn serve(
@@ -275,7 +271,7 @@ where
     else {
         return Err(HandshakeError::Rejected); // §2.2.4: close without data
     };
-    let Some((mut user, pass)) = auth::credentials(&mechanism, &response) else {
+    let Some((user, pass)) = auth::credentials(&mechanism, &response) else {
         return Err(HandshakeError::Rejected); // §2.2.4: close without data
     };
     // The well-known `guest` user is loopback-only unless explicitly
@@ -293,7 +289,7 @@ where
     // joiner) gets one refreshed look before the refusal. Verification
     // never touches the meta raft critical section: a memory-hard hash
     // per handshake stalled every declare on the node.
-    let mut authed_user = String::new();
+    let authed_user;
     let authed = match node.topology().check_credentials(&user, &pass) {
         Ok(()) => true,
         Err(_) => {
@@ -463,7 +459,6 @@ impl Session {
             let mut read_buf = ReadBuf::new(&mut chunk);
             let sleep = tokio::time::sleep_until(deadline);
             tokio::pin!(sleep);
-            let mut got_octets = false;
             let read_result = std::future::poll_fn(|cx| {
                 loop {
                     // Client octets win whenever they are ready.
@@ -497,12 +492,10 @@ impl Session {
                         // iteration's deadline check closes us.
                         break;
                     }
-                    got_octets = true;
                     last_octets = Instant::now();
                     fr.feed(filled);
                 }
             }
-            let _ = got_octets;
         }
 
         // Channel teardown: cancel consumers, release unacked (§4.5).

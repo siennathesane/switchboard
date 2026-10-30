@@ -19,7 +19,6 @@ use switchboard_wire::properties::ContentHeader;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_util::sync::CancellationToken;
 
 use crate::soak::Ctx;
 use crate::soak::check;

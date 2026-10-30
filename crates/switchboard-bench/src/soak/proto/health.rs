@@ -12,7 +12,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::soak::Ctx;
-use crate::soak::client;
 
 pub async fn run(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(ctx.cfg.health_every);

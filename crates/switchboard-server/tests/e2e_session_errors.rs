@@ -264,7 +264,6 @@ async fn corrupt_frame_end_yields_501() {
 async fn unsupported_version_gets_header_reply() {
     let (_node, addr) = start_broker("ver911").await;
     let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     // AMQP version 1.0.0 header (a valid AMQP version, but we speak 0-9-1).
     c.write_all(b"AMQP\0\x01\0\0").await.unwrap();

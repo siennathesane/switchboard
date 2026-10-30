@@ -24,7 +24,6 @@ use super::http;
 use super::mqtt;
 use super::shared::ProtocolConfig;
 use super::stomp;
-use super::ws;
 
 /// A stream with bytes that were already consumed during sniffing
 /// replayed in front of it. Reads drain the prefix first; writes pass
@@ -137,7 +136,7 @@ where
     }
 
     let io_prefix = prefix.clone();
-    let mut io = Prefixed::new(prefix, socket);
+    let io = Prefixed::new(prefix, socket);
     // Per-protocol connection accounting for /metrics: the gauge slot is
     // held for the connection's whole life and released on return.
     let _conn_guard = super::connstats::ConnGuard::enter(detected);

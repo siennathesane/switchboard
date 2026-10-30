@@ -85,6 +85,7 @@ pub fn session_queue_name(client_id: &str) -> String {
 /// One live subscription.
 struct SubEntry {
     /// Bridge-local id feeding the merged delivery channel.
+    #[allow(dead_code)] // kept for delivery-path diagnostics and future sub accounting
     local: shared::SubscriptionId2,
     filter: String,
     qos: u8,
@@ -200,7 +201,7 @@ where
         .await?;
     writer.flush().await?;
 
-    let mut next_pid = AtomicU16::new(1);
+    let next_pid = AtomicU16::new(1);
     let mut subs: HashMap<u64, SubEntry> = HashMap::new();
     // QoS 2 in-flight state, both directions (§4.4 QoS 2 flow).
     // Inbound: packet ids published, awaiting PUBREL (dedupe window).

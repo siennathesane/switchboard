@@ -67,7 +67,6 @@ pub(crate) fn authorize_ch(
     perm: switchboard_core::topology::Perm,
     resource: &str,
 ) -> ChannelResult<()> {
-    use switchboard_core::topology::Perm;
     let inner = ch.inner.lock().unwrap();
     if node
         .topology()

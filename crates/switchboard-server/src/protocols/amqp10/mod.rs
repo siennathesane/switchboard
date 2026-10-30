@@ -72,6 +72,7 @@ fn resolve_address(addr: &str) -> Dest {
 
 /// One attached link.
 struct Link {
+    #[allow(dead_code)] // the AMQP 1.0 attach handle, kept for settlement debugging
     handle: u32,
     /// true = the client is the receiver (we deliver to it).
     client_is_receiver: bool,
@@ -284,7 +285,7 @@ where
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let delivery_counter = Arc::new(AtomicU32::new(1));
     let mut session_begun = false;
-    let mut next_outgoing_id: u32 = 1;
+    let next_outgoing_id: u32 = 1;
 
     loop {
         let Some(f) = frame.take() else { break };

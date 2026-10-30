@@ -119,6 +119,7 @@ async fn wait_meta_ready(node: &std::sync::Arc<ClusterNode>) {
 /// Await a future with a deadline (replaces the old sync busy-poll,
 /// which parked forever on a noop waker whenever the future returned
 /// Pending).
+#[allow(dead_code)] // deadline-bounded await helper kept for tests that need it
 async fn within<F: std::future::Future>(secs: u64, f: F) -> F::Output {
     match tokio::time::timeout(std::time::Duration::from_secs(secs), f).await {
         Ok(v) => v,

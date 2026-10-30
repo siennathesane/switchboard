@@ -18,15 +18,12 @@ async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
 use gateway_support::mqtt_connect;
 use gateway_support::mqtt_publish;
 use gateway_support::mqtt_read;
-use gateway_support::mqtt_remaining;
 use gateway_support::mqtt_subscribe;
 use gateway_support::read_stomp_frame;
 use gateway_support::read_stomp_frame_full;
 use gateway_support::start_gateway;
 use gateway_support::with_timeout;
 use gateway_support::ws_connect;
-use switchboard_server::protocols::ProtocolConfig;
-use switchboard_server::protocols::amqp10::frames;
 use switchboard_server::protocols::amqp10::types;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::method::Method;
@@ -806,7 +803,6 @@ async fn mqtt_qos2_full_handshake() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
     let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sub.write_all(&gateway_support::mqtt_connect("q2sub"))
         .await
@@ -1078,7 +1074,7 @@ async fn mqtt_retained_message_served_to_late_subscriber() {
     sub.write_all(&gateway_support::mqtt_subscribe(1, "state/+", 0))
         .await
         .unwrap();
-    let (t, body) = with_timeout(mqtt_read(&mut sub), 60)
+    let (t, _body) = with_timeout(mqtt_read(&mut sub), 60)
         .await
         .unwrap()
         .unwrap();

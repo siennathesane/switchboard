@@ -8,7 +8,6 @@
 //! differs): a real multicast round-trip assembles two zero-configuration
 //! nodes through `_switchboard._tcp.local.`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use switchboard_cluster::discovery::{self, DiscoveryConfig};

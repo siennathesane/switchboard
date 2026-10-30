@@ -202,7 +202,7 @@ fn ack_removes_and_release_redelivers() {
     })
     .unwrap();
     enqueue(&mut s, b"m1");
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(1),
         count: 1,
     });
@@ -237,7 +237,7 @@ fn ack_removes_and_release_redelivers() {
     assert!(*redelivered);
 
     // Ack removes it for good.
-    s.apply(&ShardCmd::Ack {
+    let _ = s.apply(&ShardCmd::Ack {
         queue: "q".into(),
         seqs: [0].into(),
     });
@@ -259,7 +259,7 @@ fn release_by_explicit_seqs() {
     })
     .unwrap();
     enqueue(&mut s, b"m");
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(1),
         count: 1,
     });
@@ -296,11 +296,11 @@ fn cancel_releases_that_consumers_holds_only() {
     }
     enqueue(&mut s, b"a"); // -> sub 1 (lowest id wins first)
     enqueue(&mut s, b"b"); // -> sub 2
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(1),
         count: 1,
     });
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(2),
         count: 1,
     });
@@ -337,7 +337,7 @@ fn round_robin_falls_to_next_consumer_when_one_is_full() {
         .unwrap();
     }
     // Only sub 2 has credit.
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(2),
         count: 3,
     });
@@ -411,11 +411,11 @@ fn flow_pauses_and_resumes() {
         byte_limit: 0,
     })
     .unwrap();
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(1),
         count: 3,
     });
-    s.apply(&ShardCmd::Flow {
+    let _ = s.apply(&ShardCmd::Flow {
         sub: sub(1),
         active: false,
     });
@@ -477,7 +477,7 @@ fn get_semantics() {
 
     // Depth counts both: the held message is still queued.
     // Ack removes it.
-    s.apply(&ShardCmd::Ack {
+    let _ = s.apply(&ShardCmd::Ack {
         queue: "q".into(),
         seqs: [0].into(),
     });
@@ -523,7 +523,7 @@ fn purge_keeps_unacked() {
     })
     .unwrap();
     enqueue(&mut s, b"held");
-    s.apply(&ShardCmd::Credit {
+    let _ = s.apply(&ShardCmd::Credit {
         sub: sub(1),
         count: 1,
     });
@@ -907,7 +907,7 @@ fn byte_window_gates_delivery_until_ack() {
     assert_eq!(delivered_bodies(&effects), vec![b"12345678".to_vec()]);
 
     // Ack reopens the window: the next message flows.
-    let (ShardReply::Ok, effects) = s
+    let (ShardReply::Ok, _effects) = s
         .apply(&ShardCmd::Ack {
             queue: "q".into(),
             seqs: [0u64].into_iter().collect(),

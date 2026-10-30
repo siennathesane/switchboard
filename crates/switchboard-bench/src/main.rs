@@ -10,7 +10,6 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use serde_json::json;
-use switchboard_bench::stats;
 
 #[derive(Parser, Debug)]
 #[command(name = "switchboard-bench")]

@@ -184,7 +184,7 @@ mod tests {
         register(other_client, Kind::Client, 0x_b0_0002);
         mark_owner_dependents_dead(broker);
         {
-            let mut guard = TABLE.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = TABLE.lock().unwrap_or_else(|p| p.into_inner());
             let m = guard.as_ref().unwrap();
             assert!(!m[&client].alive);
             assert!(

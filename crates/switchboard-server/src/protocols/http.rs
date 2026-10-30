@@ -38,7 +38,7 @@ where
 /// → 200, otherwise 404).
 pub async fn serve<S>(
     mut io: super::gateway::Prefixed<S>,
-    pre: &[u8],
+    _pre: &[u8],
     node: std::sync::Arc<switchboard_cluster::ClusterNode>,
     protocols: super::shared::ProtocolConfig,
     limits: crate::channel::ConnectionLimits,

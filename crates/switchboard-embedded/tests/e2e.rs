@@ -13,7 +13,6 @@ use switchboard_embedded::BrokerConfig;
 use switchboard_embedded::ConfirmOutcome;
 use switchboard_embedded::ConnectError;
 use switchboard_embedded::ConsumeOptions;
-use switchboard_embedded::EmbeddedChannel;
 use switchboard_embedded::MessageProperties;
 use switchboard_embedded::OpError;
 use switchboard_embedded::QueueDeleteOptions;

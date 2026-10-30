@@ -239,6 +239,7 @@ fn parse_destination(dest: &str) -> Result<Destination, BrokerError> {
 }
 
 /// A live subscription (bridge-side bookkeeping).
+#[allow(dead_code)] // reserved subscription bookkeeping surface (id/ack/dest per consumer)
 struct Subscription {
     id: String,
     ack: String,
@@ -575,7 +576,6 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
     pending_acks: &Arc<tokio::sync::Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>>,
 ) -> Result<Arc<BridgeConsumer>, BrokerError> {
     let no_ack = ack == "auto";
-    let ack_mode = ack.to_string();
     let (queue, shard, exchange, rk) = match dest {
         Destination::Topic { exchange, rk } => {
             shared::ensure_exchange(ctx, exchange).await?;

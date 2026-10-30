@@ -425,7 +425,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            Pin::new(&mut this.inner).poll_flush(cx)?;
+            let _ = Pin::new(&mut this.inner).poll_flush(cx)?;
         }
         match Pin::new(&mut *this).poll_flush(cx) {
             Poll::Ready(Ok(())) => {}
@@ -545,7 +545,6 @@ mod tests {
 #[cfg(test)]
 mod frame_tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use tokio::io::duplex;
 
     /// In-memory duplex satisfying the WsStream bounds.
@@ -778,6 +777,7 @@ mod stream_tests {
     use super::*;
     use tokio::io::duplex;
 
+    #[allow(dead_code)] // frame-construction helper kept for further ws conformance tests
     fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![0x80 | opcode, 0x80 | payload.len() as u8, 1, 2, 3, 4];
         for (i, b) in payload.iter().enumerate() {

@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use gateway_support::start_gateway;
 use gateway_support::with_timeout;
-use support::TestClient;
 use switchboard_server::protocols::amqp10::frames;
 use switchboard_server::protocols::amqp10::types;
 use switchboard_wire::method::Method;

@@ -21,12 +21,10 @@ use std::time::Duration;
 
 use futures_lite::StreamExt;
 use lapin::Channel;
-use lapin::Connection;
 use lapin::options::QueueBindOptions;
 use lapin::options::QueueDeclareOptions;
 use lapin::options::QueueDeleteOptions;
 use lapin::types::FieldTable;
-use tokio_util::sync::CancellationToken;
 
 use crate::soak::Ctx;
 use crate::soak::check;
@@ -708,7 +706,7 @@ enum Saw {
 
 pub async fn run_tx(ctx: Arc<Ctx>) {
     let window = Arc::new(TxWindow::default());
-    let (publisher_state, consumer_state) = (window.clone(), window.clone());
+    let (publisher_state, _consumer_state) = (window.clone(), window.clone());
     let msgs_per_tx = 2usize;
     ctx.add_reconciler(Arc::new(move || {
         let w = &publisher_state;
@@ -1311,7 +1309,7 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
     // Reconcilers may need a beat for the last acks to land; poll until
     // everything passes or the drain timeout expires.
     let deadline = tokio::time::Instant::now() + ctx.cfg.drain_timeout;
-    let mut last = Vec::new();
+    let mut last;
     loop {
         last = ctx.run_reconcilers().await;
         if last.iter().all(|c| c.ok) {

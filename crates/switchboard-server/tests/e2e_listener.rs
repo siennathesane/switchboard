@@ -156,7 +156,6 @@ async fn listener_run_serves_amqp_over_tls() {
         .expect("tls handshake");
 
     // AMQP handshake over TLS: protocol header + read Connection.Start.
-    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     tls_stream
         .write_all(&switchboard_wire::PROTOCOL_HEADER)

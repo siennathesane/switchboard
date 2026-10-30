@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -147,7 +146,7 @@ pub async fn start_gateway_tagged(
     tokio::spawn(async move {
         let node = node2;
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
+            let Ok((sock, _)) = listener.accept().await else {
                 continue;
             };
             let node2 = node.clone();
@@ -374,7 +373,6 @@ impl WsClient {
 
     /// Read one unmasked data frame's payload.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        let r = &mut self.reader;
         // Drain leftover first.
         let mut raw = std::mem::take(&mut self.leftover);
         loop {
