@@ -36,6 +36,57 @@ cargo run --release -- --bootstrap --node-id 1 --listen 0.0.0.0:5672 --internal 
 Any standard AMQP 0-9-1 client (default `guest`/`guest`, vhost `/`) can
 then publish and consume **through any of the nodes**.
 
+## Embedded library
+
+The broker is also a library. `switchboard-embedded` runs a full
+raft-replicated node in-process and connects a typed AMQP 0-9-1 client to
+it over an in-memory duplex — no sockets on the client path, same
+handshake/auth/semantics as wire clients:
+
+```toml
+[dependencies]
+switchboard-embedded = "1.0.0-rc.1"
+```
+
+```rust
+use switchboard_embedded::{Broker, BrokerConfig, QueueOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let broker = Broker::start(BrokerConfig::new("./data")).await?;
+    let conn = broker.connect("guest", "guest").await?;
+    let channel = conn.open_channel().await?;
+    channel.queue_declare("tasks", &QueueOptions::new().durable(true)).await?;
+    channel.publish_confirmed("", "tasks", Default::default(), b"hello".to_vec()).await?;
+    let delivery = channel.get("tasks", true).await?.expect("message");
+    assert_eq!(delivery.body, b"hello");
+    conn.close().await;
+    broker.stop(std::time::Duration::from_secs(5)).await?;
+    Ok(())
+}
+```
+
+Restart is a new process on the same `data_dir` (durable queues and their
+messages reappear); see `docs/architecture.md` ("Embedded library") for
+the full runtime contract.
+
+## Operations surface
+
+* **Prometheus metrics** — `GET /metrics` on the HTTP protocol port:
+  message-lifecycle counters, per-queue depth, per-protocol connection
+  gauges, node vitals (text exposition 0.0.4, no auth, like `/health`
+  and `/stats`).
+* **Admin API** — JSON over HTTP basic auth under `/api/…` (same argon2
+  check as every protocol gateway): users/vhosts/permissions CRUD plus
+  queue/exchange listings; restricted users are refused, mirroring
+  RabbitMQ's administrator-only management API.
+* **Backup/restore** — `switchboard backup --data <dir> --to <file>`
+  writes a consistent single-file archive of a *stopped* broker's entire
+  store (raft logs + state machines + message journal, via RocksDB
+  checkpoints); `switchboard restore <archive> --data <new-dir>`
+  validates the storage-format version gate, then materializes it into a
+  fresh directory.
+
 ## Protocols
 
 One client port carries every supported protocol, selected by sniffing
@@ -89,9 +140,10 @@ Crates:
 ```
 switchboard-wire      AMQP codec (frames, methods, field tables)
 switchboard-core      AMQ model state machines (topology, queues, routing)
-switchboard-store     RocksDB + OpenRaft storage
+switchboard-store     RocksDB + OpenRaft storage (+ backup/restore tools)
 switchboard-cluster   multi-raft node, internal RPC, forwarding, membership
-switchboard-server    client connections, channels, TLS
+switchboard-server    client connections, channels, TLS, gateway, admin/metrics
+switchboard-embedded  in-process broker + typed AMQP client library
 switchboard           the broker binary
 ```
 
