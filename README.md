@@ -70,6 +70,24 @@ Restart is a new process on the same `data_dir` (durable queues and their
 messages reappear); see `docs/architecture.md` ("Embedded library") for
 the full runtime contract.
 
+## C ABI (embed from any language)
+
+`switchboard-capi` exposes the same embedded broker over a stable C ABI
+(`sb_`-prefixed symbols, header at
+[`crates/switchboard-capi/include/switchboard.h`](crates/switchboard-capi/include/switchboard.h)):
+synchronous calls, frozen status codes, panic containment, polling-only
+consumption, and a handle table that turns double-free/use-after-free
+into errors instead of undefined behavior. A standard-library-only
+ctypes demo drives the whole lifecycle:
+
+```bash
+cargo build -p switchboard-capi
+python3 examples/python/embedded_demo.py
+```
+
+See `docs/architecture.md` ("C ABI over the embedded library") for the
+full ABI contract.
+
 ## Operations surface
 
 * **Prometheus metrics** — `GET /metrics` on the HTTP protocol port:
@@ -144,6 +162,7 @@ switchboard-store     RocksDB + OpenRaft storage (+ backup/restore tools)
 switchboard-cluster   multi-raft node, internal RPC, forwarding, membership
 switchboard-server    client connections, channels, TLS, gateway, admin/metrics
 switchboard-embedded  in-process broker + typed AMQP client library
+switchboard-capi      stable C ABI over the embedded library
 switchboard           the broker binary
 ```
 

@@ -44,6 +44,14 @@ Prometheus metrics, an admin HTTP API, and versioned backup/restore.
   on the client path. Includes `Broker` lifecycle (`start`/`stop`),
   typed channel operations, `Consumer` streams, and broker-side
   user/vhost/permission administration.
+- **C ABI** (`switchboard-capi`). A stable C ABI over the embedded
+  library (`sb_`-prefixed symbols, header at
+  `crates/switchboard-capi/include/switchboard.h`): synchronous calls
+  with frozen status codes, thread-local last-error messages, panic
+  containment, polling-only consumption, and a handle table that turns
+  double-free / use-after-free into detected errors. Ships with a
+  standard-library-only Python ctypes demo
+  (`examples/python/embedded_demo.py`) driving the full lifecycle.
 - **Prometheus metrics.** `GET /metrics` serves text exposition 0.0.4:
   message-lifecycle counters, per-queue depth gauges, per-protocol
   connection gauges, and node vitals.
