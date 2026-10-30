@@ -806,8 +806,14 @@ async fn exclusive_queue_use_is_locked_to_its_owner_connection() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        owner.expect(1).await.unwrap(),
-        Method::QueueDeleteOk { .. }
-    ));
+    // Deleting a queue with a live consumer cancels it; the BasicCancel
+    // notification races the QueueDeleteOk reply on the same channel, so
+    // accept either wire order.
+    loop {
+        match owner.expect(1).await.unwrap() {
+            Method::BasicCancel { .. } => continue,
+            Method::QueueDeleteOk { .. } => break,
+            other => panic!("unexpected {other:?} waiting for QueueDeleteOk"),
+        }
+    }
 }
