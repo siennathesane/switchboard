@@ -545,6 +545,25 @@ impl Session {
                 };
                 match frame.content_header(expected) {
                     Ok(h) => {
+                        // Enforce the connection's message-size cap at
+                        // header reception time (311): `pending_body`
+                        // would otherwise grow to whatever `body_size`
+                        // the client announced, streamed across however
+                        // many body frames it takes (code-scanning
+                        // alert #25).
+                        if self.limits.max_message_size != 0
+                            && h.body_size > self.limits.max_message_size
+                        {
+                            return self
+                                .channel_exception(
+                                    frame.channel,
+                                    BrokerError::content_too_large(format!(
+                                        "body_size {} exceeds max_message_size {}",
+                                        h.body_size, self.limits.max_message_size
+                                    )),
+                                )
+                                .await;
+                        }
                         ch.inner.lock().unwrap().pending_header = Some(h);
                         Flow::Continue
                     }

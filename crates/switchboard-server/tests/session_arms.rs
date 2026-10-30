@@ -395,3 +395,43 @@ async fn oversized_handshake_frame_is_rejected_before_auth() {
     c.writer.flush().await.unwrap();
     expect_closed(&mut c).await;
 }
+
+/// A content header announcing a body_size beyond max_message_size (the
+/// 128 MiB default) must be rejected with a 311 channel close right at
+/// header reception — the body must never be assembled frame by frame
+/// (code-scanning alert #25).
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_content_header_is_rejected_with_311() {
+    let (_node, addr) = start_broker("sa-body-size").await;
+    let mut c = support::connect_and_open(&addr, "/").await.expect("open");
+    c.send_method(
+        1,
+        &Method::BasicPublish {
+            ticket: 0,
+            exchange: "".into(),
+            routing_key: "sizetest".into(),
+            mandatory: false,
+            immediate: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Hand-built header declaring a 200 MiB body (the header frame
+    // itself is tiny — only the announced size is hostile).
+    let huge =
+        switchboard_wire::properties::ContentHeader::new(200 * 1024 * 1024, BasicProperties::new());
+    c.writer.write_all(&Frame::header(1, &huge).to_bytes()).await.unwrap();
+    c.writer.flush().await.unwrap();
+    match c.expect(1).await.unwrap() {
+        Method::ChannelClose { reply_code, .. } => {
+            assert_eq!(reply_code, 311, "expected CONTENT_TOO_LARGE, got {reply_code}");
+        }
+        other => panic!("expected ChannelClose 311, got {}", other.name()),
+    }
+    // A channel-level exception: the connection itself must survive and
+    // accept a fresh channel.
+    c.send_method(1, &Method::ChannelOpen { out_of_band: String::new() })
+        .await
+        .unwrap();
+    assert!(matches!(c.expect(1).await.unwrap(), Method::ChannelOpenOk { .. }));
+}

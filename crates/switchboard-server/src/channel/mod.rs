@@ -45,6 +45,12 @@ pub struct ConnectionLimits {
     pub channel_max: u16,
     pub frame_max: u32,
     pub heartbeat: u16,
+    /// Largest single message body (octets) a client may publish on this
+    /// connection, enforced at content-header reception time (reply 311,
+    /// RabbitMQ-parity default of 128 MiB). Without it, per-channel
+    /// `pending_body` grows to whatever `body_size` the client announced.
+    /// 0 disables the cap (mirroring `frame_max` semantics).
+    pub max_message_size: u64,
     /// The client's IP, stamped per connection by the listener; None for
     /// transports that cannot see one. Drives the guest-loopback rule.
     pub peer_ip: Option<std::net::IpAddr>,
@@ -58,6 +64,7 @@ impl Default for ConnectionLimits {
             channel_max: 2047,
             frame_max: 131_072,
             heartbeat: 60,
+            max_message_size: 128 * 1024 * 1024,
             peer_ip: None,
             allow_remote_guest: false,
         }

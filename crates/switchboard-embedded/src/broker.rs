@@ -244,6 +244,9 @@ impl Broker {
             channel_max: self.limits.channel_max,
             frame_max: self.limits.frame_max,
             heartbeat: self.limits.heartbeat,
+            // Server default cap (ConnectionLimits::default); embedded
+            // configs carry no separate message-size knob.
+            max_message_size: 128 * 1024 * 1024,
             peer_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
             allow_remote_guest: false,
         };

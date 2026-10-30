@@ -34,6 +34,7 @@ async fn heartbeat_timeout_disconnects_silent_client() {
                     allow_remote_guest: true,
                         channel_max: 2047,
                         frame_max: 131_072,
+                        max_message_size: 128 * 1024 * 1024,
                         heartbeat: 3,
                     },
                 )
@@ -83,6 +84,7 @@ async fn server_sends_heartbeats_when_idle() {
                     allow_remote_guest: true,
                         channel_max: 2047,
                         frame_max: 131_072,
+                        max_message_size: 128 * 1024 * 1024,
                         // A wide margin between the server's heartbeat
                         // send (1x) and its silence close (2x): at test
                         // tempo these are tens of milliseconds, and a
