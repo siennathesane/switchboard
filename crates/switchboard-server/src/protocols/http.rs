@@ -57,15 +57,23 @@ where
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     let ok = method == "GET" && matches!(path, "/" | "/health" | "/healthz");
-    let (status, body) = if path == "/stats" && method == "GET" {
-        ("200 OK", stats_json(&node))
+    let (status, content_type, body) = if path == "/stats" && method == "GET" {
+        ("200 OK", "application/json", stats_json(&node))
+    } else if path == "/metrics" && method == "GET" {
+        // Prometheus text exposition (v0.0.4), hand-rolled in
+        // [`super::metrics`]; unauthenticated like /stats.
+        ("200 OK", "text/plain; version=0.0.4", super::metrics::render(&node))
+    } else if path == "/api" || path.starts_with("/api/") {
+        // Admin API (JSON, basic auth): dispatches with its own reader and
+        // writer; the head has already been consumed here.
+        return super::admin::serve(io, &head, node, limits).await;
     } else {
         let body = if ok { "{\"status\":\"ok\"}".to_string() } else { "{\"status\":\"not found\"}".to_string() };
         let status = if ok { "200 OK" } else { "404 Not Found" };
-        (status, body)
+        (status, "application/json", body)
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     use tokio::io::AsyncWriteExt;
@@ -113,8 +121,9 @@ fn stats_json(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> String
     )
 }
 
+/// Process vitals shared by `/stats` and `/metrics`.
 #[cfg(target_os = "linux")]
-fn proc_self_stats() -> (u64, u64) {
+pub(crate) fn proc_self_stats() -> (u64, u64) {
     let rss_kb = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -130,7 +139,7 @@ fn proc_self_stats() -> (u64, u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn proc_self_stats() -> (u64, u64) {
+pub(crate) fn proc_self_stats() -> (u64, u64) {
     (0, 0)
 }
 

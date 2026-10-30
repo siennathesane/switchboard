@@ -17,9 +17,12 @@
 //! available with and without TLS.
 
 pub mod amqp10;
+pub mod admin;
+pub mod connstats;
 pub mod detect;
 mod gateway;
 pub mod http;
+pub mod metrics;
 pub mod mqtt;
 pub mod shared;
 pub mod stomp;

@@ -51,6 +51,23 @@ impl Channel {
             }
         };
 
+        // Authorization (RabbitMQ-shaped, §access-control): publishing
+        // requires `write` on the exchange resource; a topic exchange
+        // additionally checks the routing key so per-topic write
+        // restrictions are expressible. Checked before any routing work —
+        // a refused publish must not enqueue anywhere.
+        authorize_ch(self, node, Perm::Write, &exchange)?;
+        let topic_exchange = node
+            .topology()
+            .vhosts
+            .get(&inner_vhost(self))
+            .and_then(|v| v.exchanges.get(&exchange))
+            .map(|e| e.kind == switchboard_core::model::ExchangeKind::Topic)
+            .unwrap_or(false);
+        if topic_exchange {
+            authorize_ch(self, node, Perm::Write, &routing_key)?;
+        }
+
         let confirm_seq = take_confirm_seq(self)?;
         let topo = node.topology();
         let Some(mut vhost) = topo.vhosts.get(&inner_vhost(self)).cloned() else {

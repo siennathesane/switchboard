@@ -160,6 +160,8 @@ routes accordingly:
 | `STOMP\n` / `CONNECT\n` | STOMP 1.0–1.2 | `/topic/`, `/queue/`, `/exchange/`, `/amq/queue/` destinations; `ack:auto|client|client-individual`; **server-side transactions via shard 2PC** (`BEGIN`/`COMMIT`/`ABORT`); heart-beats |
 | `GET …` + upgrade | WebSocket (RFC 6455) | inner protocol by `Sec-WebSocket-Protocol` (`mqtt`/`stomp`/`amqp`), by path (`/mqtt`, `/stomp`, `/amqp10`), or by sniffing the first frame |
 | `GET /health` | HTTP | tiny JSON health probe for load balancers; other paths get 404 |
+| `GET /stats` · `GET /metrics` | HTTP | one-line JSON resource snapshot (the soak monitor's feed); Prometheus text exposition (`text/plain; version=0.0.4`, hand-rolled): message-lifecycle counters, per-queue depth, per-protocol connection gauges, node vitals |
+| `/api/…` | HTTP | admin API, JSON over HTTP basic auth (same argon2 credential check as every protocol gateway): users/vhosts/permissions CRUD mapped onto meta state-machine commands, plus queue/exchange listings; restricted users (any permissions-table entry) are refused — the control plane belongs to unrestricted users, mirroring RabbitMQ's administrator-only management API |
 
 Every protocol rides the same broker core (topology, shard groups,
 forwarding), so an MQTT publish and an AMQP publish to the same topic

@@ -135,6 +135,9 @@ where
 
     let io_prefix = prefix.clone();
     let mut io = Prefixed::new(prefix, socket);
+    // Per-protocol connection accounting for /metrics: the gauge slot is
+    // held for the connection's whole life and released on return.
+    let _conn_guard = super::connstats::ConnGuard::enter(detected);
     match detected {
         Detected::Amqp091 => {
             let (r, w) = tokio::io::split(io);
