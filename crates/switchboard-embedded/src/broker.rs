@@ -136,6 +136,9 @@ impl Broker {
             // post-readiness), which layers on top without clobbering.
             bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
             bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+            // In-process embedded brokers have no external internal-port
+            // exposure; the shared-secret gate stays off.
+            internal_auth_secret: None,
             timeouts: config.timeouts,
         };
         let node = ClusterNode::start(cfg).await.map_err(|e| match e {

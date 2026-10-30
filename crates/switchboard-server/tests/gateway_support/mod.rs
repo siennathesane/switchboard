@@ -139,6 +139,7 @@ pub async fn start_gateway_tagged(
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node: Arc<switchboard_cluster::ClusterNode> =
         switchboard_cluster::ClusterNode::start(cfg).await.unwrap();

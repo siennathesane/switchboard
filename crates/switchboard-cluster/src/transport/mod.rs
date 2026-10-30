@@ -57,6 +57,12 @@ pub struct PeerChannel {
     pub server_name: String,
     /// One RPC's reply wait. Configurable via `Timeouts`.
     pub reply_budget: std::time::Duration,
+    /// Shared secret for the internal-transport handshake (code-scanning
+    /// alert #5). When set, every FRESH connection this channel dials
+    /// presents an auth proof frame first; pooled (already-authenticated)
+    /// connections are reused without re-proving. `None` keeps the
+    /// historical unauthenticated dial.
+    internal_auth_secret: Option<String>,
     idle: tokio::sync::Mutex<std::collections::HashMap<String, Vec<PeerConn>>>,
 }
 
@@ -81,6 +87,7 @@ impl PeerChannel {
             connector,
             server_name,
             reply_budget: REPLY_BUDGET,
+            internal_auth_secret: None,
             idle: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -97,18 +104,45 @@ impl PeerChannel {
         }
     }
 
+    /// `with_reply_budget`, additionally proving knowledge of `secret` on
+    /// every fresh dial (code-scanning alert #5). `None` = no proof sent
+    /// (the historical behavior). Nodes configured with
+    /// [`NodeConfig::internal_auth_secret`](crate::node::NodeConfig::internal_auth_secret)
+    /// must construct their channel through this constructor so every
+    /// outbound internal connection authenticates.
+    pub fn with_internal_auth(
+        connector: Option<TlsConnector>,
+        server_name: String,
+        reply_budget: std::time::Duration,
+        secret: Option<String>,
+    ) -> Self {
+        PeerChannel {
+            internal_auth_secret: secret,
+            ..Self::with_reply_budget(connector, server_name, reply_budget)
+        }
+    }
+
     pub async fn connect(&self, addr: &str) -> std::io::Result<PeerConn> {
         let tcp = TcpStream::connect(addr).await?;
         tcp.set_nodelay(true).ok();
-        match &self.connector {
+        let mut conn = match &self.connector {
             Some(c) => {
                 let name = rustls::pki_types::ServerName::try_from(self.server_name.clone())
                     .map_err(|e| std::io::Error::other(format!("bad server name: {e}")))?;
                 let tls = c.connect(name, tcp).await?;
-                Ok(PeerConn::Tls(tls))
+                PeerConn::Tls(tls)
             }
-            None => Ok(PeerConn::Plain(tcp)),
+            None => PeerConn::Plain(tcp),
+        };
+        // Present the auth proof before anything else: a peer running with
+        // the secret configured refuses every other first frame. A peer
+        // WITHOUT the gate silently consumes the frame, so a mismatched
+        // (secret-here, none-there) deployment still lines up requests
+        // with replies.
+        if let Some(secret) = &self.internal_auth_secret {
+            conn.send(&crate::internal_auth::auth_frame(secret)).await?;
         }
+        Ok(conn)
     }
 
     /// One request→reply round trip to `addr`, reusing a pooled
@@ -470,6 +504,49 @@ mod wire_tests {
         let mut conn = channel.connect(&addr).await.unwrap();
         let err = conn.recv().await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn secret_configured_dials_lead_with_an_auth_proof_frame() {
+        // A secret-configured channel must present the proof as the FIRST
+        // frame on every fresh connection (alert #5): the peer sees the
+        // auth envelope before anything else, and the frame contains no
+        // cleartext secret.
+        use crate::proto::InternalMessage;
+        use crate::proto::InternalRequest;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let secret = "transport-test-secret".to_string();
+        let want_secret = secret.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut accepted = accept(sock, None).await.unwrap();
+            let frame = accepted.read_frame_full().await.unwrap();
+            let env: crate::proto::Envelope = bincode::deserialize(&frame).unwrap();
+            let InternalMessage::Request(InternalRequest::Auth { nonce, proof }) = env.message
+            else {
+                panic!("first frame must be the auth request");
+            };
+            assert!(
+                crate::internal_auth::verify(&want_secret, &nonce, &proof),
+                "proof must verify against the shared secret"
+            );
+            assert!(
+                !frame
+                    .windows(want_secret.len())
+                    .any(|w| w == want_secret.as_bytes()),
+                "cleartext secret must never cross the wire"
+            );
+        });
+        let channel = PeerChannel::with_internal_auth(
+            None,
+            "localhost".into(),
+            std::time::Duration::from_secs(5),
+            Some(secret),
+        );
+        let mut conn = channel.connect(&addr).await.unwrap();
+        conn.send(b"next-frame").await.unwrap();
         server.await.unwrap();
     }
 

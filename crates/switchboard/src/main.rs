@@ -86,6 +86,18 @@ pub struct Cli {
     #[arg(long, env = "SWITCHBOARD_PASSWORD", default_value = "guest")]
     pub password: String,
 
+    /// Shared secret for the internal cluster transport (raft +
+    /// forwarding). When set (non-empty), every internal connection must
+    /// prove knowledge of this secret before any cluster command is
+    /// accepted, and this node presents the same proof when dialing
+    /// peers — all cluster members must share the value. UNSET/EMPTY
+    /// KEEPS THE HISTORICAL UNAUTHENTICATED INTERNAL TRANSPORT: an
+    /// insecure default retained for compatibility, so anyone who can
+    /// reach the internal port can drive the cluster; set this (and/or
+    /// firewall the port) in production.
+    #[arg(long, env = "SWITCHBOARD_INTERNAL_AUTH_SECRET")]
+    pub internal_auth_secret: Option<String>,
+
     /// Log filter (tracing env syntax).
     #[arg(long, env = "SWITCHBOARD_LOG", default_value = "info")]
     pub log: String,
@@ -279,6 +291,10 @@ async fn main() -> anyhow::Result<()> {
         // historical guest/guest formation byte-for-byte.
         bootstrap_user: cli.user.clone(),
         bootstrap_password: cli.password.clone(),
+        // Internal-transport shared secret (code-scanning alert #5):
+        // empty-string env values behave exactly like unset (the
+        // historical unauthenticated transport stays off the gate).
+        internal_auth_secret: cli.internal_auth_secret.clone().filter(|s| !s.is_empty()),
         timeouts,
     };
 

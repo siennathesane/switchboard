@@ -41,6 +41,7 @@ async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     ClusterNode::start(cfg).await.unwrap()
 }

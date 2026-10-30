@@ -55,6 +55,21 @@ pub struct Envelope {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum InternalRequest {
+    /// Proof of knowledge of the configured internal shared secret
+    /// (code-scanning alert #5). When a node is configured with
+    /// `--internal-auth-secret`, this must be the FIRST frame on every
+    /// fresh internal connection: `proof` is
+    /// [`crate::internal_auth::proof`](secret, nonce) — an HMAC — so the
+    /// secret itself never crosses the wire and never appears in logs.
+    /// The authing node consumes the frame without a reply of its own;
+    /// a missing or invalid proof closes the connection before any
+    /// Raft/Forward/Admin envelope is accepted.
+    Auth {
+        /// Per-connection random nonce (fresh on every dial).
+        nonce: Vec<u8>,
+        /// HMAC-SHA256 of the shared secret over `nonce`.
+        proof: Vec<u8>,
+    },
     /// openraft RPC between members of `group`.
     Raft {
         group: GroupId,
@@ -223,6 +238,18 @@ mod tests {
         assert!(matches!(
             back,
             InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping))
+        ));
+
+        // The auth proof frame (alert #5) survives the same framing.
+        let msg = InternalMessage::Request(InternalRequest::Auth {
+            nonce: vec![1, 2, 3],
+            proof: vec![4, 5, 6],
+        });
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: InternalMessage = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            InternalMessage::Request(InternalRequest::Auth { .. })
         ));
 
         let msg = InternalMessage::Request(InternalRequest::Forward {

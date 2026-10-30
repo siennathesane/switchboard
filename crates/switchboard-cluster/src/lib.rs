@@ -12,8 +12,11 @@
 //!   multi-master write path (local raft or one-hop forward), the join
 //!   protocol, cluster formation (sliding-window shard groups), effect
 //!   pumps, and the internal listener.
+//! * [`internal_auth`] — the optional shared-secret proof that gates the
+//!   internal listener (code-scanning alert #5).
 
 pub mod discovery;
+pub mod internal_auth;
 pub mod net;
 
 pub use node::now_ms;

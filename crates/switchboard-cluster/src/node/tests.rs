@@ -115,6 +115,7 @@ async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     ClusterNode::start(cfg).await.unwrap()
 }
@@ -359,6 +360,7 @@ async fn unjoined_write_reports_unreachable() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node = ClusterNode::start(cfg).await.unwrap();
     let cmd = BrokerCommand::Meta(MetaCmd::RegisterNode {
@@ -403,6 +405,7 @@ async fn deliver_and_cancel_cross_nodes() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || {
@@ -549,6 +552,7 @@ async fn pending_node_logs_and_write_times_out() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node = ClusterNode::start(cfg).await.unwrap();
 
@@ -741,6 +745,7 @@ async fn reconfigure_relay_maps_leader_reply_errors() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || {
@@ -844,6 +849,7 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || {
@@ -1006,6 +1012,7 @@ async fn follower_forwarded_write_is_transient() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || {
@@ -1058,6 +1065,7 @@ async fn reconfigure_relay_success_arm() {
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
     wait_for("node2 joins", 60, || {

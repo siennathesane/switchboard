@@ -414,6 +414,7 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
 
@@ -478,6 +479,7 @@ pub async fn start_broker_node(
         timeouts: Default::default(),
         bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
         bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
     };
     init_tracing();
     let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();

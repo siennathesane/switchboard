@@ -35,6 +35,7 @@ async fn bootstrap_credentials_flow_into_formation() {
         // `--user alice --password s3cret-pw`.
         bootstrap_user: "alice".into(),
         bootstrap_password: "s3cret-pw".into(),
+        internal_auth_secret: None,
         timeouts: Default::default(),
     };
     let node = Arc::new(ClusterNode::start(cfg).await.unwrap());

@@ -130,6 +130,16 @@ pub struct NodeConfig {
     pub bootstrap_user: String,
     /// Password half of [`NodeConfig::bootstrap_user`].
     pub bootstrap_password: String,
+    /// Shared secret gating the internal cluster transport
+    /// (code-scanning alert #5). When `Some`, the internal listener
+    /// refuses any connection whose first frame is not a valid proof of
+    /// knowledge of this secret (HMAC over a per-connection nonce — see
+    /// [`crate::internal_auth`]), and outbound internal dials present the
+    /// same proof. `None` (the default) keeps the historical
+    /// unauthenticated internal transport — an insecure default retained
+    /// for compatibility with existing deployments; the flag help says
+    /// so. The secret itself never crosses the wire and is never logged.
+    pub internal_auth_secret: Option<String>,
     /// Every wait the node can experience, in one place. This is a
     /// realtime distributed system: defaults keep any single operation's
     /// worst case at five seconds, and everything is configurable via CLI/env.
@@ -320,10 +330,11 @@ impl ClusterNode {
         let kv = switchboard_store::RocksKv::open(&cfg.data_dir)?;
         let dir = Arc::new(Directory::new());
         dir.update(cfg.id, cfg.internal_addr.clone());
-        let channel = Arc::new(crate::transport::PeerChannel::with_reply_budget(
+        let channel = Arc::new(crate::transport::PeerChannel::with_internal_auth(
             None,
             "switchboard-internal".into(),
             cfg.timeouts.rpc_reply_budget,
+            cfg.internal_auth_secret.clone(),
         ));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2500,17 +2511,75 @@ impl ClusterNode {
 
     async fn serve_conn(self: &Arc<Self>, tcp: tokio::net::TcpStream) -> std::io::Result<()> {
         let mut conn = crate::transport::accept(tcp, None).await?;
+        // Shared-secret gate (code-scanning alert #5): when configured,
+        // the connection must first prove knowledge of the secret before
+        // ANY Raft/Forward/Admin envelope is dispatched. The secret
+        // itself is never on the wire and never in logs — only the
+        // outcome and the peer's claimed node id are.
+        let required_secret = self.cfg.internal_auth_secret.clone();
+        let mut authenticated = required_secret.is_none();
         loop {
             let frame = conn.read_frame_full().await?;
             let env: Envelope = match bincode::deserialize(&frame) {
                 Ok(e) => e,
                 Err(e) => {
+                    if !authenticated {
+                        // Undecodable garbage from an unproven peer: close
+                        // rather than answer (the codec-error reply is a
+                        // post-auth courtesy).
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unauthenticated connection sent an undecodable frame",
+                        ));
+                    }
                     let resp = InternalMessage::Response(InternalResponse::Error(e.to_string()));
                     conn.write_frame(&bincode::serialize(&resp).unwrap())
                         .await?;
                     continue;
                 }
             };
+            if let InternalMessage::Request(InternalRequest::Auth { nonce, proof }) = &env.message {
+                match &required_secret {
+                    Some(secret) if crate::internal_auth::verify(secret, nonce, proof) => {
+                        debug!(from = env.from, "internal connection authenticated");
+                        authenticated = true;
+                        // No reply of its own: the peer pipelines its
+                        // first real request right behind the proof.
+                        continue;
+                    }
+                    Some(_) => {
+                        warn!(
+                            from = env.from,
+                            "internal auth proof rejected; closing connection"
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "internal auth failed",
+                        ));
+                    }
+                    None => {
+                        // We run without a secret but the peer presented a
+                        // proof (it is configured with one). Consume the
+                        // frame silently so the peer's next (real) frame
+                        // still lines up with its reply.
+                        debug!(
+                            from = env.from,
+                            "internal auth frame consumed (auth not configured here)"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if !authenticated {
+                warn!(
+                    from = env.from,
+                    "internal connection without a valid auth proof; closing"
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "internal auth required",
+                ));
+            }
             let resp = self.handle_request(env.message).await;
             let out = InternalMessage::Response(resp);
             conn.write_frame(&bincode::serialize(&out).unwrap()).await?;
@@ -2522,6 +2591,13 @@ impl ClusterNode {
             return InternalResponse::Error("expected request".into());
         };
         match req {
+            // Auth frames never reach here: `serve_conn` intercepts every
+            // one (verifying it as the connection's leading proof, or
+            // silently consuming it when no secret is configured). This
+            // arm is exhaustive-match defense in depth.
+            InternalRequest::Auth { .. } => {
+                InternalResponse::Error("internal auth frame not expected here".into())
+            }
             InternalRequest::Raft { group, payload } => self.handle_raft(group, payload).await,
             InternalRequest::Forward { group, command } => {
                 // One local attempt only (depth 1): the forwarder owns
