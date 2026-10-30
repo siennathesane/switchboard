@@ -1824,6 +1824,202 @@ async fn stomp_unsubscribe_stops_delivery() {
     assert_eq!(cmd, "RECEIPT");
 }
 
+/// Alert #17: two STOMP sessions on one `/queue/` destination — one
+/// UNSUBSCRIBEs and another DISCONNECTs; the shared queue (and its
+/// messages) must survive for the remaining session.
+#[tokio::test(flavor = "multi_thread")]
+async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
+    let _g = lock().await;
+    let (addr, guard) = start_gateway(Default::default()).await;
+    let node = guard.0.clone();
+
+    let mut a = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    a.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let _ = with_timeout(read_stomp_frame(&mut a), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    a.write_all(b"SUBSCRIBE\ndestination:/queue/shared17\nid:sa\nack:auto\nreceipt:r1\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut a), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+
+    let mut b = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    b.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let _ = with_timeout(read_stomp_frame(&mut b), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    b.write_all(b"SUBSCRIBE\ndestination:/queue/shared17\nid:sb\nack:auto\nreceipt:r1\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut b), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let _ = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    c.write_all(b"SUBSCRIBE\ndestination:/queue/shared17\nid:sc\nack:auto\nreceipt:r1\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+
+    // B unsubscribes (UNSUBSCRIBE delete path)…
+    b.write_all(b"UNSUBSCRIBE\nid:sb\nreceipt:rb\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut b), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+    // …and C disconnects (connection-teardown delete path).
+    c.write_all(b"DISCONNECT\nreceipt:rc\n\n\0").await.unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+    drop(c);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // The named queue survived both departures.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let alive = node
+            .topology()
+            .vhosts
+            .get("/")
+            .map(|v| v.queues.contains_key("shared17"))
+            .unwrap_or(false);
+        if alive {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shared /queue/ destination must survive other sessions leaving"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // And its messages still reach the remaining session.
+    let mut sender = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sender
+        .write_all(b"CONNECT\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let _ = with_timeout(read_stomp_frame(&mut sender), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    sender
+        .write_all(b"SEND\ndestination:/queue/shared17\n\nstill-here\0")
+        .await
+        .unwrap();
+    let (cmd, body) = with_timeout(read_stomp_frame(&mut a), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "MESSAGE");
+    assert_eq!(body, b"still-here");
+}
+
+/// Alert #17 counterpart: a `/topic/` subscription's bridge-private
+/// queue IS cleaned up when the session goes away.
+#[tokio::test(flavor = "multi_thread")]
+async fn stomp_topic_private_queue_is_cleaned_up_on_teardown() {
+    let _g = lock().await;
+    let (addr, guard) = start_gateway(Default::default()).await;
+    let node = guard.0.clone();
+
+    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
+        .await
+        .unwrap();
+    let _ = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    c.write_all(b"SUBSCRIBE\ndestination:/topic/cleanup17\nid:s1\nack:auto\nreceipt:r1\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+
+    // Wait until the bridge-private amq.gen-* queue exists.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if gen_queue_count(&node) >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "topic subscription must create its private queue"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    c.write_all(b"DISCONNECT\nreceipt:done\n\n\0")
+        .await
+        .unwrap();
+    let (cmd, _) = with_timeout(read_stomp_frame(&mut c), 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd, "RECEIPT");
+    drop(c);
+
+    // The private queue is deleted by the teardown.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if gen_queue_count(&node) == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "topic-derived private queue must be cleaned up on teardown"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Count bridge-private generated queues in the default vhost.
+fn gen_queue_count(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> usize {
+    node.topology()
+        .vhosts
+        .get("/")
+        .map(|v| {
+            v.queues
+                .keys()
+                .filter(|k| k.starts_with("amq.gen-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------
 // AMQP 1.0 error scenarios
 // ---------------------------------------------------------------------

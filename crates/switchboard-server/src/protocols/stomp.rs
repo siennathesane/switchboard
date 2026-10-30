@@ -247,6 +247,22 @@ struct Subscription {
     consumer: Arc<BridgeConsumer>,
 }
 
+/// One live STOMP subscription: its consumer plus whether the queue is
+/// BRIDGE-PRIVATE (code-scanning alert #17).
+///
+/// `/topic/` (and `/exchange/`) subscriptions consume a generated
+/// `amq.gen-…` queue the bridge created for this session alone —
+/// deleting it on UNSUBSCRIBE/teardown is correct. `/queue/<name>`
+/// subscriptions consume a NAMED shared queue other sessions use —
+/// unsubscribing (or disconnecting) must only cancel THIS session's
+/// consumer and leave the queue (and everyone's messages) alone.
+struct StompSub {
+    consumer: Arc<BridgeConsumer>,
+    /// True for topic-derived private queues; false for named `/queue/`
+    /// destinations.
+    bridge_private: bool,
+}
+
 type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
 
 async fn write_frame<W: AsyncWrite + Unpin>(w: &SharedWriter<W>, f: &Frame) -> std::io::Result<()> {
@@ -362,7 +378,7 @@ where
             });
         }
     }
-    let subscriptions: Arc<tokio::sync::Mutex<HashMap<String, Arc<BridgeConsumer>>>> =
+    let subscriptions: Arc<tokio::sync::Mutex<HashMap<String, StompSub>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // ack-id → (consumer, seq) for client/client-individual acks.
     let pending_acks: Arc<tokio::sync::Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>> =
@@ -450,16 +466,32 @@ where
                 };
                 match start_subscription(&ctx, &dest, &sub_id, &ack, &writer, &pending_acks).await {
                     Ok(consumer) => {
-                        subscriptions.lock().await.insert(sub_id, consumer);
+                        // Only bridge-private queues (topic/exchange
+                        // subscriptions) may be deleted on unsubscribe or
+                        // teardown; `/queue/` destinations are shared
+                        // (alert #17).
+                        let bridge_private = matches!(dest, Destination::Topic { .. });
+                        subscriptions.lock().await.insert(
+                            sub_id,
+                            StompSub {
+                                consumer,
+                                bridge_private,
+                            },
+                        );
                     }
                     Err(e) => send_error(&writer, &e.to_string()).await?,
                 }
             }
             "UNSUBSCRIBE" => {
                 let sub_id = frame.header("id").unwrap_or("").to_string();
-                if let Some(consumer) = subscriptions.lock().await.remove(&sub_id) {
-                    consumer.stop(&node).await;
-                    shared::delete_queue(&ctx, &consumer.queue).await;
+                if let Some(sub) = subscriptions.lock().await.remove(&sub_id) {
+                    sub.consumer.stop(&node).await;
+                    if sub.bridge_private {
+                        shared::delete_queue(&ctx, &sub.consumer.queue).await;
+                    }
+                    // A `/queue/` destination merely loses this consumer;
+                    // the named queue (and its messages) survive for the
+                    // other sessions using it.
                 }
             }
             "ACK" | "NACK" => {
@@ -527,10 +559,14 @@ where
         }
     }
 
-    // Teardown: stop every subscription, drop bridge queues.
-    for (_, consumer) in subscriptions.lock().await.drain() {
-        consumer.stop(&node).await;
-        shared::delete_queue(&ctx, &consumer.queue).await;
+    // Teardown: stop every subscription; drop only bridge-private queues
+    // (alert #17) — named `/queue/` destinations are shared and survive
+    // one session going away.
+    for (_, sub) in subscriptions.lock().await.drain() {
+        sub.consumer.stop(&node).await;
+        if sub.bridge_private {
+            shared::delete_queue(&ctx, &sub.consumer.queue).await;
+        }
     }
     Ok(())
 }
