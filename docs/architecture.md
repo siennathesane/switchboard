@@ -16,6 +16,7 @@ groups (never more than three voters each) built on
 | `switchboard-cluster` | Multi-raft node: raft lifecycle, internal RPC protocol (TCP + optional TLS via rustls/aws-lc-rs), write forwarding, join protocol, shard-map formation. |
 | `switchboard-server` | Client-facing AMQP: TCP/TLS listeners, connection handshake, per-channel state machines, heartbeats, transactions, publisher confirms. |
 | `switchboard-embedded` | The broker as a library: one in-process `ClusterNode` plus a typed AMQP 0-9-1 client over an in-memory duplex into the unmodified session core (see "Embedded library" below). |
+| `switchboard-capi` | A stable C ABI over `switchboard-embedded` (`sb_`-prefixed symbols, header at `crates/switchboard-capi/include/switchboard.h`), so non-Rust programs can embed the broker in-process (see "C ABI" below). |
 | `switchboard` | The binary + CLI (including the offline `backup` / `restore` store tools). |
 | `switchboard-bench` | Benchmark + soak library and drivers (not published). |
 
@@ -174,7 +175,71 @@ exclusive lock for its whole lifetime, so a second `Broker::start` on a
 live directory fails with `StartError::Storage`); `Broker::stop(grace)`
 closes every tracked connection, then leaves the cluster. Authorization
 parity with the wire path is inherited including its gaps — see "Known
-limitations" for the one publish/exchange-bind gate still open.
+limitations" for the exchange.bind/unbind gate still open.
+
+## C ABI over the embedded library
+
+`switchboard-capi` (crates/switchboard-capi) exposes a stable C ABI over
+`switchboard-embedded`, so non-Rust programs (Python via ctypes, Go via
+cgo, C/C++, …) embed the same broker in-process. The header lives at
+`crates/switchboard-capi/include/switchboard.h`; build the cdylib with
+`cargo build -p switchboard-capi`.
+
+Shape of the ABI (full contract in the crate docs,
+`crates/switchboard-capi/src/lib.rs`):
+
+* Every exported symbol starts `sb_`; every entry point returns an
+  `sb_status` whose numeric values are frozen for 1.0 (`SB_OK` = 0).
+* Failures leave a message on `sb_last_error()` — thread-local, valid
+  until the next `sb_*` call on that thread.
+* Every entry point runs under `catch_unwind`: no Rust panic crosses the
+  boundary; a caught panic surfaces as `SB_ERR_PANIC`.
+* Message bodies travel as explicit `(ptr, len)` pairs; names and
+  credentials are NUL-terminated UTF-8 strings. Returned strings and
+  messages are owned by the caller and released with `sb_string_free` /
+  `sb_message_free`; every handle has exactly one matching free.
+  Freed-then-used and alive-but-gone handles are detected errors
+  (`SB_ERR_INVALID_HANDLE` / `SB_ERR_HANDLE_DEAD`), never undefined
+  behavior — a global handle table backs every check.
+* Consumption is polling only (`sb_channel_get`, or
+  `sb_channel_consume` + `sb_consumer_next` with a timeout). There is
+  deliberately no callback-with-user-data flavor, so no reentrancy or
+  thread-affinity contract exists.
+* Every call is synchronous — it blocks the calling OS thread on the
+  broker's private multi-thread tokio runtime. Distinct handles may be
+  used from distinct threads; do not call `sb_*` from inside a running
+  async context.
+
+Lifecycle: `sb_config_create` → (`sb_config_set_*`) → `sb_broker_start`
+→ `sb_broker_connect` → `sb_client_open_channel` → ops →
+`sb_client_close` → `sb_broker_stop` → frees. As with the Rust library,
+one live broker per `data_dir` per process (the RocksDB lock); restart
+means a new process. The embedded caveats carry over verbatim — e.g.
+`sb_config_set_janitor_interval_ms` widens the janitor tick away from
+the prepared-transaction race documented under "Known limitations".
+
+`examples/python/embedded_demo.py` is a standard-library-only (ctypes)
+demo driving the whole lifecycle — start, connect, declare, publish,
+consume, a transaction commit and rollback, and a clean shutdown:
+
+```bash
+cargo build -p switchboard-capi
+python3 examples/python/embedded_demo.py
+```
+
+```python
+lib = ctypes.CDLL(find_cdylib())                 # target/{debug,release}
+config = ctypes.c_void_p()
+lib.sb_config_create(data_dir.encode(), ctypes.byref(config))
+lib.sb_config_set_janitor_interval_ms(config, 60_000)
+broker = ctypes.c_void_p()
+lib.sb_broker_start(config, ctypes.byref(broker))
+lib.sb_broker_wait_ready(broker, 10_000)
+client = ctypes.c_void_p()
+lib.sb_broker_connect(broker, b"guest", b"guest", ctypes.byref(client))
+# ... open a channel, declare/publish/get/ack, tx_select/commit ...
+lib.sb_broker_stop(broker, 10_000)
+```
 
 ## Admin HTTP API
 
@@ -363,13 +428,15 @@ membership controller extends the shard layout to cover them (see
   consults an active-consumer `Stats` probe on `destinations[0]` alone —
   if that queue has a consumer, the message is delivered even when other
   destination queues have none.
-* **`exchange.bind` is not authorization-gated.** Every other topology
-  operation checks `configure`/`write`/`read` permissions via
-  `authorize_ch` (declares, deletes, queue binds, purge, publish, get,
-  consume), but the `ExchangeBind` arm in
-  `crates/switchboard-server/src/methods/mod.rs` issues the meta bind
-  without a permission check. It is on the `fix(broker):` hardening
-  track; embedded clients inherit the gap with everything else.
+* **`exchange.bind` / `exchange.unbind` are not authorization-gated.**
+  Every other topology operation checks `configure`/`write`/`read`
+  permissions via `authorize_ch` (declares, deletes, queue binds and
+  unbinds, purge, publish, get, consume), but the `ExchangeBind` and
+  `ExchangeUnbind` arms in
+  `crates/switchboard-server/src/methods/mod.rs` issue the meta bind /
+  unbind without a permission check. It is on the `fix(broker):`
+  hardening track; embedded clients inherit the gap with everything
+  else.
 * **Prepared transactions race the janitor.** The shard's
   `ExpirePrepared` sweep drops prepared transactions older than
   `tx_timeout_ticks` ticks — a field that defaults to 0
