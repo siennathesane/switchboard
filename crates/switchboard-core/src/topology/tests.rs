@@ -461,6 +461,25 @@ fn auth_checks() {
     assert_eq!(e.level, Level::Connection);
 }
 
+/// Alert #23: the credential table is PHC-only. A hand-planted
+/// plaintext entry never authenticates — even against its own literal
+/// password — while PHC entries keep working. Normal flows can never
+/// plant plaintext: every proposer hashes at propose (alert #15).
+#[test]
+fn planted_plaintext_user_entry_never_authenticates() {
+    let mut s = state();
+    s.users.insert("planted".into(), "the-password".into());
+    assert!(s.check_credentials("planted", "the-password").is_err());
+    assert!(s.check_credentials("planted", "anything").is_err());
+    // PHC entries (the only kind normal flows write) still pass.
+    s.users.insert(
+        "real".into(),
+        crate::auth::hash_password("real", "the-password"),
+    );
+    s.check_credentials("real", "the-password").unwrap();
+    assert!(s.check_credentials("real", "wrong").is_err());
+}
+
 /// Alert #15: apply accepts PHC strings only. A CreateUser carrying a
 /// plaintext password (a proposer that skipped the hash) is refused, and
 /// a PHC-string command stores verbatim — the memory-hard hash runs at

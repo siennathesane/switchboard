@@ -244,31 +244,34 @@ pub fn is_phc(stored: &str) -> bool {
 
 /// Verify a password against a stored credential. Stored credentials are
 /// argon2 PHC strings — verified with the parameters embedded in the PHC
-/// string, so old hashes keep working after the deployment retunes —
-/// while plaintext survives from snapshots written before hashing
-/// existed and is matched as-is (re-set the password to upgrade it).
+/// string, so old hashes keep working after the deployment retunes.
+/// There is NO plaintext fallback (code-scanning alert #23): it existed
+/// only for pre-hashing data, and no such data exists — every flow has
+/// hashed at propose since alert #15 — so an entry lacking a valid PHC
+/// shape is corrupt or hand-planted and never authenticates (logged at
+/// debug for the operator).
 pub fn verify_password(password: &str, stored: &str) -> bool {
-    if stored.starts_with("$argon2") {
-        use argon2::password_hash::PasswordVerifier;
-        match argon2::password_hash::PasswordHash::new(stored) {
-            Ok(parsed) => {
-                let params = match argon2::Params::try_from(&parsed) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                };
-                let instance = argon2::Argon2::new(
-                    argon2::Algorithm::Argon2id,
-                    argon2::Version::V0x13,
-                    params,
-                );
-                instance
-                    .verify_password(password.as_bytes(), &parsed)
-                    .is_ok()
-            }
-            Err(_) => false,
+    if !stored.starts_with("$argon2") {
+        tracing::debug!(
+            stored_len = stored.len(),
+            "stored credential is not an argon2 PHC string; refusing (PHC-only)"
+        );
+        return false;
+    }
+    use argon2::password_hash::PasswordVerifier;
+    match argon2::password_hash::PasswordHash::new(stored) {
+        Ok(parsed) => {
+            let params = match argon2::Params::try_from(&parsed) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let instance =
+                argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            instance
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
         }
-    } else {
-        stored == password
+        Err(_) => false,
     }
 }
 
@@ -284,10 +287,19 @@ mod hashing_tests {
         assert!(!verify_password("wrong", &stored));
     }
 
+    /// Alert #23: no plaintext fallback. An entry without a valid PHC
+    /// shape never authenticates — even when the presented password is
+    /// byte-identical to the stored string.
     #[test]
-    fn legacy_plaintext_still_verifies() {
-        assert!(verify_password("guest", "guest"));
+    fn planted_plaintext_entry_never_authenticates() {
+        assert!(!verify_password("guest", "guest"));
         assert!(!verify_password("guest", "not-guest"));
+        // A $argon2-prefixed but unparseable string is equally dead.
+        assert!(!verify_password("guest", "$argon2not-a-phc-string"));
+        // PHC entries still verify (full round-trip covered above).
+        let stored = hash_password("dave", "pw");
+        assert!(verify_password("pw", &stored));
+        assert!(!verify_password("guest", &stored));
     }
 
     #[test]
