@@ -14,8 +14,14 @@ shift 3
 
 # Optional broker environment, written at lab creation (docker exec) so
 # sshd-spawned starts see it too — e.g. SB_TIME_SCALE=0.25 stretches the
-# raft timers 4x on contended CI runners.
+# raft timers 4x on contended CI runners. set -a is REQUIRED: POSIX sh
+# leaves sourced assignments unexported, so without it the broker child
+# never sees them (SWITCHBOARD_ALLOW_REMOTE_GUEST was silently never
+# reaching lab brokers — harmless only while the guest-loopback rule
+# could not fire; exposed when listener peer_ip stamping landed).
+set -a
 [ -f /var/run/sb-env ] && . /var/run/sb-env
+set +a
 
 mkdir -p /var/lib/switchboard /var/log/switchboard
 
