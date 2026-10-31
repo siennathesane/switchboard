@@ -53,6 +53,7 @@ case "$CMD" in
       docker exec "sb$i" sh -c "
         printf '%s\n' $i sb$i $N $extra > /var/run/sb-args
         grep -q STATS_UNAUTHED /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_STATS_UNAUTHED=1\n' >> /var/run/sb-env
+        grep -q ALLOW_REMOTE /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_ALLOW_REMOTE_GUEST=true\n' >> /var/run/sb-env
         touch /var/run/sb-enabled
         sb-start $i sb$i $N $extra" >/dev/null
     done

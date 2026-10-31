@@ -45,8 +45,10 @@ for var in SWITCHBOARD_ARGON2_M_KIB SWITCHBOARD_ARGON2_T SWITCHBOARD_ARGON2_P SW
 done
 # The lab's control container drives the brokers as `guest` from remote
 # IPs; the brokers' guest-loopback rule needs the explicit opt-out.
+# NB: clap bool flags accept only true/false from the environment — "1"
+# aborts the broker at startup (invalid value for --allow-remote-guest).
 for i in $(seq 1 "$N"); do
-  docker exec "sb$i" sh -c "grep -q ALLOW_REMOTE /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_ALLOW_REMOTE_GUEST=1\n' >> /var/run/sb-env"
+  docker exec "sb$i" sh -c "grep -q ALLOW_REMOTE /var/run/sb-env 2>/dev/null || printf 'SWITCHBOARD_ALLOW_REMOTE_GUEST=true\n' >> /var/run/sb-env"
 done
 # Same lab-only story for /stats and /metrics (alert #21): off loopback
 # they now require admin basic auth, and the bench soak driver scrapes
