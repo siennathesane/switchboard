@@ -284,7 +284,10 @@ async fn forward_write_maps_every_failure_shape() {
     )))
     .await;
     node.reroute_peer(42, peer).await;
-    match node.forward_write(42, crate::META_GROUP, cmd.clone()).await {
+    match node
+        .forward_write(42, crate::META_GROUP, cmd.clone(), None)
+        .await
+    {
         Err(ClusterError::Broker(e)) => assert!(e.to_string().contains("nope")),
         other => panic!("expected broker error, got {other:?}"),
     }
@@ -302,7 +305,9 @@ async fn forward_write_maps_every_failure_shape() {
         )))
         .await;
         node.reroute_peer(42, peer).await;
-        let r = node.forward_write(42, crate::META_GROUP, cmd.clone()).await;
+        let r = node
+            .forward_write(42, crate::META_GROUP, cmd.clone(), None)
+            .await;
         let msg = format!("{:?}", r.as_ref().err());
         match expect {
             "transient" => assert!(matches!(r, Err(ClusterError::Transient)), "{msg}"),
@@ -324,7 +329,7 @@ async fn forward_write_maps_every_failure_shape() {
     .await;
     node.reroute_peer(42, peer).await;
     assert!(matches!(
-        node.forward_write(42, crate::META_GROUP, cmd.clone()).await,
+        node.forward_write(42, crate::META_GROUP, cmd.clone(), None).await,
         Err(ClusterError::Codec(m)) if m.contains("boom")
     ));
 
@@ -334,7 +339,7 @@ async fn forward_write_maps_every_failure_shape() {
     .await;
     node.reroute_peer(42, peer).await;
     assert!(matches!(
-        node.forward_write(42, crate::META_GROUP, cmd).await,
+        node.forward_write(42, crate::META_GROUP, cmd, None).await,
         Err(ClusterError::Codec(m)) if m.contains("unexpected forward reply")
     ));
 }
@@ -892,6 +897,7 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
                 info: dead,
             }),
             0,
+            None,
         )
         .await
         .expect("meta poison write itself must land (node1 still reachable)");
@@ -906,7 +912,9 @@ async fn follower_write_with_poisoned_leader_hint_times_out() {
     // One write attempt: the follower cannot land the write locally, the
     // leader forward fails (dead address), and the stale-hint fallback
     // reports the retryable-transient outcome to the caller.
-    let r = node2.try_write_depth(crate::META_GROUP, &cmd, 0).await;
+    let r = node2
+        .try_write_depth(crate::META_GROUP, &cmd, 0, None)
+        .await;
     assert!(matches!(r, Err(ClusterError::Transient)), "got {r:?}");
 }
 
@@ -1171,4 +1179,105 @@ async fn stale_pooled_conn_retries_and_silence_times_out() {
         }
         other => panic!("expected a bounded timeout, got {other:?}"),
     }
+}
+
+/// jepsen sb-topo × chaos regression (run 41162997620): a logical write
+/// whose group is hosted elsewhere must respect the configured
+/// [`Timeouts::write_budget`] even when group members are paused or
+/// blackholed. The member scan in [`ClusterNode::try_write_depth`] used
+/// to let EVERY member consume a full `rpc_reply_budget`, and the outer
+/// retry loop only re-checked the deadline between attempts — two
+/// frozen members wedged each client write for ~2 × rpc_reply_budget
+/// past a 300 ms budget (in the lab, at SB_TIME_SCALE=0.25, ~22 s past
+/// a 20 s scaled budget), so zero topology ops completed in the whole
+/// 60 s jepsen window.
+///
+/// Group 7 is advertised on two blackholes (they accept TCP and never
+/// reply, exactly like a SIGSTOPped broker's kernel): the write must
+/// come back `Unreachable` within a fraction of ONE scaled reply
+/// budget, not two of them. The assertion is tempo-relative so it holds
+/// under any SB_TIME_SCALE another test in this binary may have set.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_budget_bounds_the_blackholed_member_scan() {
+    async fn blackhole() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    if let Ok(conn) = crate::transport::accept(tcp, None).await {
+                        // Hold it: no read, no reply, no close.
+                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                        drop(conn);
+                    }
+                });
+            }
+        });
+        addr
+    }
+    let member_a = blackhole().await;
+    let member_b = blackhole().await;
+
+    // A pending node (no bootstrap, no seeds): it hosts nothing, so a
+    // write to group 7 enters the non-member forward scan.
+    let cfg = NodeConfig {
+        id: 9,
+        data_dir: std::env::temp_dir().join(format!(
+            "sb-nt-budget-{}-{}",
+            std::process::id(),
+            free_port()
+        )),
+        client_addr: format!("127.0.0.1:{}", free_port()),
+        internal_addr: format!("127.0.0.1:{}", free_port()),
+        seeds: vec![],
+        bootstrap: false,
+        expected_nodes: 1,
+        peers: vec![],
+        timeouts: Timeouts {
+            write_budget: std::time::Duration::from_millis(300),
+            ..Timeouts::default()
+        },
+        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
+        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        internal_auth_secret: None,
+    };
+    let node = ClusterNode::start(cfg).await.unwrap();
+    // Shard group 7 on members {2, 3} (both blackholes), reached through
+    // the directory. `refresh_topology` cannot overwrite this view: the
+    // node has no local meta replica and no reachable peer to fetch from.
+    let mut topo = switchboard_core::topology::MetaState::default();
+    topo.groups.insert(7, vec![2, 3]);
+    node.topology_tx.send_replace(Arc::new(topo));
+    node.dir.update(2, member_a);
+    node.dir.update(3, member_b);
+
+    let start = tokio::time::Instant::now();
+    let res = node
+        .write(
+            7,
+            BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Stats {
+                queue: "je.reg\0/".into(),
+            }),
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(res, Err(ClusterError::Unreachable { group: 7 })),
+        "expected Unreachable, got {res:?}"
+    );
+    // One full scaled reply budget is the ceiling; the unfixed scan pays
+    // one per member (two here). Generous margins on both sides so the
+    // test stays deterministic on loaded runners.
+    let ceiling = switchboard_core::tempo::scale(std::time::Duration::from_secs(5));
+    assert!(
+        elapsed < ceiling.mul_f64(0.9),
+        "write overran its budget: {elapsed:?} (one reply budget is {ceiling:?}, \
+         the unfixed scan pays one per member)"
+    );
+
+    node.shutdown().await;
 }

@@ -1511,7 +1511,10 @@ impl ClusterNode {
         let deadline = tokio::time::Instant::now()
             + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
         loop {
-            match self.try_write_depth(group, &command, 0).await {
+            match self
+                .try_write_depth(group, &command, 0, Some(deadline))
+                .await
+            {
                 Ok(reply) => return Ok(reply),
                 Err(ClusterError::Transient) => {
                     if tokio::time::Instant::now() >= deadline {
@@ -1602,7 +1605,10 @@ impl ClusterNode {
                 let commands = BrokerCommand::Batch {
                     commands: batch.iter().map(|r| r.command.clone()).collect(),
                 };
-                match node.try_write_depth(group, &commands, 0).await {
+                match node
+                    .try_write_depth(group, &commands, 0, Some(deadline))
+                    .await
+                {
                     Ok(BrokerReply::Batch(replies)) if replies.len() == batch.len() => {
                         for (req, reply) in batch.drain(..).zip(replies) {
                             let _ = req.reply.send(Ok(reply));
@@ -1654,11 +1660,25 @@ impl ClusterNode {
     /// from local knowledge only, never chains another forward — stale
     /// mutual hints between two members would otherwise ping-pong the
     /// request forever).
+    ///
+    /// `deadline` is the calling logical write's budget
+    /// ([`Timeouts::write_budget`]), when known. It is threaded down so a
+    /// single attempt cannot serially burn one `rpc_reply_budget` per
+    /// group member: the outer retry loop only re-checks the deadline
+    /// BETWEEN attempts, so without this cap a member scan in which some
+    /// members are paused/blackholed overshoots the caller's budget by up
+    /// to members × rpc_reply_budget before it is ever noticed (jepsen
+    /// sb-topo × chaos, run 41162997620: client ops wedged ~22 s past a
+    /// 20 s scaled write budget; at lab tempo 0.25 one scan reaches
+    /// 60 s+). `None` preserves the historical unbudgeted behavior for
+    /// one-shot forwarded writes, which never run the member scan
+    /// (depth 1).
     async fn try_write_depth(
         self: &Arc<Self>,
         group: GroupId,
         command: &BrokerCommand,
         depth: u32,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<BrokerReply, ClusterError> {
         // If the topology says this group is hosted here, make sure the
         // local raft handle exists before writing (handles are normally
@@ -1687,7 +1707,9 @@ impl ClusterNode {
                 if let Some(l) = hint {
                     if l != self.id {
                         if depth == 0 {
-                            let r = self.forward_write(l, group, command.clone()).await;
+                            let r = self
+                                .forward_write(l, group, command.clone(), deadline)
+                                .await;
                             match r {
                                 Err(ClusterError::Io(_))
                                 | Err(ClusterError::Unreachable { .. })
@@ -1758,7 +1780,17 @@ impl ClusterNode {
             if *m == self.id {
                 continue;
             }
-            match self.forward_write(*m, group, command.clone()).await {
+            // The scan itself must respect the caller's budget: without
+            // this check a spent budget still dials every remaining
+            // member, each leg waiting up to rpc_reply_budget (a paused
+            // member's kernel accepts the connection and never replies).
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                break;
+            }
+            match self
+                .forward_write(*m, group, command.clone(), deadline)
+                .await
+            {
                 Ok(reply) => return Ok(reply),
                 Err(ClusterError::Transient) => continue,
                 Err(ClusterError::Unreachable { .. }) | Err(ClusterError::NotJoined) => continue,
@@ -1774,14 +1806,23 @@ impl ClusterNode {
         Err(ClusterError::Transient)
     }
 
+    /// Forward one write to `peer` for `group`. `deadline`, when set,
+    /// caps the reply wait at the caller's remaining write budget (see
+    /// [`Self::try_write_depth`]); `None` keeps the historical
+    /// full-`rpc_reply_budget` wait.
     async fn forward_write(
         self: &Arc<Self>,
         peer: NodeId,
         group: GroupId,
         command: BrokerCommand,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<BrokerReply, ClusterError> {
         let req = InternalRequest::Forward { group, command };
-        match self.call(peer, req).await {
+        let replied = match deadline {
+            Some(d) => self.call_with_deadline(peer, req, d).await,
+            None => self.call(peer, req).await,
+        };
+        match replied {
             Ok(InternalResponse::Forward(reply)) => match reply {
                 BrokerReply::Error(e) => Err(ClusterError::Broker(e)),
                 r => Ok(r),
@@ -1825,6 +1866,42 @@ impl ClusterNode {
         let back = self
             .channel
             .rpc(&addr, &bytes)
+            .await
+            .map_err(ClusterError::Io)?;
+        let msg: InternalMessage =
+            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
+        match msg {
+            InternalMessage::Response(r) => Ok(r),
+            other => Err(ClusterError::Codec(format!("unexpected {other:?}"))),
+        }
+    }
+
+    /// [`Self::call`] with the reply wait capped at `deadline` (the
+    /// calling logical write's remaining budget). See
+    /// [`Self::try_write_depth`] for why a forwarding scan must not let
+    /// each leg consume a full `rpc_reply_budget`.
+    async fn call_with_deadline(
+        &self,
+        peer: NodeId,
+        req: InternalRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<InternalResponse, ClusterError> {
+        let Some(addr) = self.dir.addr_of(peer) else {
+            return Err(ClusterError::Unreachable { group: META_GROUP });
+        };
+        let bytes = {
+            let env = Envelope {
+                from: self.id,
+                message: InternalMessage::Request(req),
+            };
+            bincode::serialize(&env).map_err(|e| ClusterError::Codec(e.to_string()))?
+        };
+        // Pooled request→reply; the reply wait never outlives the
+        // caller's budget, so a paused/blackholed member cannot stretch
+        // one write attempt past the configured write budget.
+        let back = self
+            .channel
+            .rpc_with_deadline(&addr, &bytes, deadline)
             .await
             .map_err(ClusterError::Io)?;
         let msg: InternalMessage =
@@ -2631,7 +2708,7 @@ impl ClusterNode {
                 // One local attempt only (depth 1): the forwarder owns
                 // retry policy; chaining forwards could loop on stale
                 // mutual leader hints.
-                match self.try_write_depth(group, &command, 1).await {
+                match self.try_write_depth(group, &command, 1, None).await {
                     Ok(reply) => {
                         // A fanout accepted through us just became pending
                         // on this (leading) node: start executing now.

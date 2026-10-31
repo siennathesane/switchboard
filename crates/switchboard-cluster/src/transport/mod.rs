@@ -151,6 +151,37 @@ impl PeerChannel {
     /// Requests are idempotent one-shot RPCs; at-least-once is
     /// acceptable for that retry.
     pub async fn rpc(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.rpc_inner(addr, req, None).await
+    }
+
+    /// [`Self::rpc`] with the reply wait additionally capped at
+    /// `deadline`. A logical operation that fans a request out to
+    /// several peers one at a time (write forwarding) must not let each
+    /// leg consume a full `reply_budget`: with N blackholed members the
+    /// caller's own budget would be overshot N× before it is ever
+    /// re-checked (jepsen sb-topo x chaos, run 41162997620: every
+    /// topology op wedged ~22 s past its 20 s scaled write budget
+    /// because one frozen shard-group member ate the whole budget and
+    /// the scan kept going). The deadline only ever SHRINKS the wait —
+    /// with the deadline far away this is byte-for-byte [`Self::rpc`].
+    pub async fn rpc_with_deadline(
+        &self,
+        addr: &str,
+        req: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<Vec<u8>> {
+        self.rpc_inner(addr, req, Some(deadline)).await
+    }
+
+    /// Shared body of [`Self::rpc`] / [`Self::rpc_with_deadline`].
+    /// `deadline`, when set, caps each reply wait to the smaller of the
+    /// scaled `reply_budget` and the time remaining.
+    async fn rpc_inner(
+        &self,
+        addr: &str,
+        req: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::io::Result<Vec<u8>> {
         let mut over_reused_conn = true;
         let mut conn = match self.take_idle(addr).await {
             Some(c) => c,
@@ -160,7 +191,22 @@ impl PeerChannel {
             }
         };
         loop {
-            let budget = switchboard_core::tempo::scale(self.reply_budget);
+            let budget = match deadline {
+                // Never wait past the caller's budget: the remaining time
+                // is the cap; a caller whose budget is already spent
+                // fails fast instead of parking for a full reply_budget.
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no reply from peer (caller budget exhausted)",
+                        ));
+                    }
+                    switchboard_core::tempo::scale(self.reply_budget).min(remaining)
+                }
+                None => switchboard_core::tempo::scale(self.reply_budget),
+            };
             let outcome = async {
                 conn.send(req).await?;
                 match tokio::time::timeout(budget, conn.recv()).await {
@@ -420,6 +466,41 @@ mod tests {
         let res = conn.recv().await;
         assert!(res.is_err(), "oversized frame must be rejected");
         server.await.unwrap();
+    }
+
+    /// A SIGSTOPped (or otherwise blackholed) peer accepts the TCP
+    /// connection and never replies: the plain [`PeerChannel::rpc`]
+    /// waits the full `reply_budget`, but a deadline-capped call must
+    /// give up at its deadline. This is the transport half of the
+    /// jepsen sb-topo x chaos liveness regression (run 41162997620),
+    /// where write-forwarding scans let each frozen shard-group member
+    /// consume a whole reply budget, overshooting every caller's write
+    /// budget.
+    #[tokio::test]
+    async fn rpc_with_deadline_gives_up_at_the_deadline_against_a_blackhole() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Accept and hang forever: never read, never reply, never close.
+        let sink = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let chan = PeerChannel::new(None, "localhost".into());
+        assert_eq!(
+            chan.reply_budget,
+            std::time::Duration::from_secs(5),
+            "default reply budget is the 5 s realtime bound"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        let res = chan.rpc_with_deadline(&addr, b"ping", deadline).await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "a blackhole must not produce a reply");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "deadline-capped rpc returned after {elapsed:?} (reply budget 5 s)"
+        );
+        sink.abort();
     }
 }
 
