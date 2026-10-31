@@ -73,21 +73,16 @@ pub fn temp_dir(name: &str) -> PathBuf {
 ///     effective) can starve a raft write.
 ///
 /// (b) The janitor writes `ShardCmd::ExpirePrepared` to every hosted
-///     shard group on every tick (node/mod.rs:2274-2277), and the shard
-///     state machine's `tx_timeout_ticks` defaults to 0 (derive(Default),
-///     shard/mod.rs:263) with cutoff `now - 0` (shard/mod.rs:630) — so an
-///     ExpirePrepared landing BETWEEN a client's PrepareTx and CommitTx
-///     raft writes silently drops the prepared ops while CommitTx still
-///     replies Ok ("Re-commit after recovery: idempotent",
-///     shard/mod.rs:600-602). Any broker client — TCP included — can lose
-///     an in-flight tx commit to a janitor tick (~every 20 ms at test
-///     tempo). This is a PRE-EXISTING broker race, faithfully inherited by
-///     embedded clients (embedded design §6: no divergence); it belongs to
-///     a separate `fix(broker):` hardening change (give
-///     `tx_timeout_ticks` a real default and/or make ExpirePrepared
-///     respect it), which this additive-only design may not make. Tests
-///     widen the janitor interval so the window is closed here; the
-///     inherited race is documented, not fixed.
+///     shard group on every tick (node/mod.rs), but the sweep grants a
+///     WALL-CLOCK grace measured from the prepare
+///     (`switchboard_core::shard::TX_GRACE_MS`, 60 s): a tick landing
+///     between a client's PrepareTx and CommitTx can never expire the tx,
+///     so the commit always lands (the fix(broker) change — previously
+///     the tick-budget expiry defaulted to 0 and such interleavings
+///     silently dropped the commit while CommitTx still replied Ok;
+///     see `janitor_sweep_between_prepare_and_commit_never_drops_the_commit`
+///     in shard/tests.rs). Widening the janitor interval here is now
+///     purely load hygiene — the race it used to paper over is fixed.
 pub fn test_timeouts() -> switchboard_cluster::node::Timeouts {
     let mut t = switchboard_cluster::node::Timeouts::default();
     t.write_budget = Duration::from_secs(30);

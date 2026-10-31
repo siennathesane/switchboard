@@ -321,7 +321,7 @@ mod tests {
                 password_hash: switchboard_core::auth::hash_password("u", "p"),
             },
             BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "vh".into() }),
-            BrokerCommand::Shard(ShardCmd::ExpirePrepared {}),
+            BrokerCommand::Shard(ShardCmd::ExpirePrepared { at_ms: 1 }),
         ];
         for c in cmds {
             let bytes = bincode::serialize(&c).unwrap();

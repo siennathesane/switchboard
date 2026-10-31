@@ -2485,17 +2485,24 @@ impl ClusterNode {
                         }),
                     )
                     .await;
+                // One wall-clock stamp for both sweeps below. The tx
+                // sweep skips prepares younger than TX_GRACE_MS, so a
+                // tick landing between a live client's PrepareTx and
+                // CommitTx never eats the commit (fix(broker)).
+                let sweep_at_ms = now_ms();
                 let _ = self
                     .write(
                         group,
-                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::ExpirePrepared {}),
+                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::ExpirePrepared {
+                            at_ms: sweep_at_ms,
+                        }),
                     )
                     .await;
                 let _ = self
                     .write(
                         group,
                         BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Sweep {
-                            at_ms: now_ms(),
+                            at_ms: sweep_at_ms,
                         }),
                     )
                     .await;

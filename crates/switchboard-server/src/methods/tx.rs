@@ -68,7 +68,11 @@ impl Channel {
             }
         }
 
-        // Phase 1: prepare on every involved shard.
+        // Phase 1: prepare on every involved shard. The prepare carries
+        // the proposing node's wall-clock stamp: the janitor's expiry
+        // sweep grants TX_GRACE_MS from this instant, so a sweep landing
+        // before phase 2 can never eat the commit.
+        let prepared_at_ms = switchboard_cluster::now_ms();
         for (shard, shard_ops) in &per_shard {
             shard_call(
                 node,
@@ -76,6 +80,7 @@ impl Channel {
                 ShardCmd::PrepareTx {
                     tx: tx_id,
                     ops: shard_ops.clone(),
+                    at_ms: prepared_at_ms,
                 },
             )
             .await?;

@@ -585,6 +585,7 @@ fn transactions_prepare_commit_abort_expire() {
                 seq: u64::MAX,
             }, // harmless ack
         ],
+        at_ms: 10_000,
     })
     .unwrap();
     assert!(s.prepared.contains_key(&tx));
@@ -600,6 +601,7 @@ fn transactions_prepare_commit_abort_expire() {
             queue: "q".into(),
             message: msg(b"tx-msg"),
         }],
+        at_ms: 10_000,
     })
     .unwrap();
     s.apply(&ShardCmd::CommitTx { tx }).unwrap();
@@ -609,18 +611,99 @@ fn transactions_prepare_commit_abort_expire() {
     s.apply(&ShardCmd::CommitTx { tx }).unwrap();
     assert_eq!(stats_of(&mut s, "q"), 1);
 
-    // Expiry: prepare, advance past the timeout, sweep.
-    s.tx_timeout_ticks = 5;
+    // Expiry: prepare, sweep once the wall-clock grace has passed.
     let tx2: TxId = (1, 2);
     s.apply(&ShardCmd::PrepareTx {
         tx: tx2,
         ops: vec![],
+        at_ms: 10_000,
     })
     .unwrap();
-    for _ in 0..10 {
-        s.apply(&ShardCmd::ExpirePrepared {}).unwrap();
-    }
+    // Inside the grace window the sweep is a no-op...
+    s.apply(&ShardCmd::ExpirePrepared {
+        at_ms: 10_000 + TX_GRACE_MS - 1,
+    })
+    .unwrap();
+    assert!(s.prepared.contains_key(&tx2));
+    // ...past it, the tx is reaped.
+    s.apply(&ShardCmd::ExpirePrepared {
+        at_ms: 10_000 + TX_GRACE_MS,
+    })
+    .unwrap();
     assert!(!s.prepared.contains_key(&tx2));
+}
+
+/// fix(broker): a prepared transaction must survive the janitor. The
+/// diagnosed race: the janitor's ExpirePrepared write landed between a
+/// client's PrepareTx and CommitTx, the (tick-budget) expiry dropped the
+/// prepared ops, and CommitTx then took its idempotent no-op path — the
+/// message was silently lost while the client saw success. This test
+/// FORCES that exact interleaving — the janitor's sweep applied directly
+/// between the two client commands, repeatedly — and asserts both the
+/// commit-delivers and rollback-drops outcomes under the wall-clock
+/// grace.
+#[test]
+fn janitor_sweep_between_prepare_and_commit_never_drops_the_commit() {
+    let mut s = state_with_queue();
+    let t0 = 1_000_000u64;
+    let commit_tx: TxId = (7, 1);
+
+    // Client phase 1: prepare (wall-clock stamped by the proposer).
+    s.apply(&ShardCmd::PrepareTx {
+        tx: commit_tx,
+        ops: vec![TxOp::Enqueue {
+            queue: "q".into(),
+            message: msg(b"committed"),
+        }],
+        at_ms: t0,
+    })
+    .unwrap();
+
+    // The janitor tick lands between prepare and commit — again and
+    // again, spread over the client's round trip. Every sweep skips the
+    // young tx: nothing is dropped, the prepared ops survive.
+    for delta_ms in [0_u64, 1, 5, 20, 100, 500] {
+        let (ShardReply::Expired { count }, _) = s
+            .apply(&ShardCmd::ExpirePrepared {
+                at_ms: t0 + delta_ms,
+            })
+            .unwrap()
+        else {
+            panic!("expected Expired");
+        };
+        assert_eq!(
+            count, 0,
+            "a prepared tx inside the grace window is untouchable"
+        );
+        assert!(
+            s.prepared.contains_key(&commit_tx),
+            "the janitor must not eat a tx the client is still committing (delta {delta_ms}ms)"
+        );
+    }
+
+    // Client phase 2: commit — the message IS delivered.
+    s.apply(&ShardCmd::CommitTx { tx: commit_tx }).unwrap();
+    assert_eq!(stats_of(&mut s, "q"), 1, "the committed message must land");
+
+    // Same interleaving with a rolled-back tx: its ops never deliver.
+    let abort_tx: TxId = (7, 2);
+    s.apply(&ShardCmd::PrepareTx {
+        tx: abort_tx,
+        ops: vec![TxOp::Enqueue {
+            queue: "q".into(),
+            message: msg(b"rolled-back"),
+        }],
+        at_ms: t0 + 1_000,
+    })
+    .unwrap();
+    s.apply(&ShardCmd::ExpirePrepared { at_ms: t0 + 1_050 })
+        .unwrap();
+    s.apply(&ShardCmd::AbortTx { tx: abort_tx }).unwrap();
+    assert_eq!(
+        stats_of(&mut s, "q"),
+        1,
+        "the rolled-back message must not land"
+    );
 }
 
 #[test]
@@ -633,6 +716,7 @@ fn commit_drops_ops_for_deleted_queues() {
             queue: "q".into(),
             message: msg(b"ok"),
         }],
+        at_ms: 1_000,
     })
     .unwrap();
     s.apply(&ShardCmd::DeleteQueueData { queue: "q".into() })
@@ -1041,6 +1125,7 @@ fn tx_commit_applies_ack_ops_too() {
             queue: "q".into(),
             seq: 0,
         }],
+        at_ms: 1_000,
     })
     .unwrap();
     assert_eq!(stats_of(&mut s, "q"), 1);
@@ -1058,6 +1143,7 @@ fn tx_abort_keeps_state() {
             queue: "q".into(),
             message: msg(b"never"),
         }],
+        at_ms: 1_000,
     })
     .unwrap();
     s.apply(&ShardCmd::AbortTx { tx: (7, 2) }).unwrap();
@@ -1132,19 +1218,23 @@ fn sweep_on_empty_state_is_fine() {
 #[test]
 fn expire_prepared_janitor_drops_stale_transactions() {
     let mut s = state_with_queue();
+    let t0 = 5_000_000u64;
     s.apply(&ShardCmd::PrepareTx {
         tx: (9, 1),
         ops: vec![TxOp::Enqueue {
             queue: "q".into(),
             message: msg(b"stale"),
         }],
+        at_ms: t0,
     })
     .unwrap();
-    // Advance the logical clock past the timeout via many no-op commands.
-    for _ in 0..(s.tx_timeout_ticks + 2) {
-        s.apply(&ShardCmd::Stats { queue: "q".into() }).unwrap();
-    }
-    let (ShardReply::Expired { count }, _) = s.apply(&ShardCmd::ExpirePrepared {}).unwrap() else {
+    // A crashed client's tx is reaped once the wall-clock grace passes.
+    let (ShardReply::Expired { count }, _) = s
+        .apply(&ShardCmd::ExpirePrepared {
+            at_ms: t0 + TX_GRACE_MS,
+        })
+        .unwrap()
+    else {
         panic!("expected Expired");
     };
     assert_eq!(count, 1);

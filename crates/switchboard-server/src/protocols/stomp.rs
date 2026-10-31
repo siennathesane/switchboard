@@ -766,6 +766,10 @@ async fn commit_transaction(
                 switchboard_cluster::BrokerCommand::Shard(
                     switchboard_core::shard::ShardCmd::PrepareTx {
                         tx: tx_id,
+                        // Wall-clock prepare stamp: the janitor grants
+                        // TX_GRACE_MS from here, so a sweep between
+                        // prepare and commit cannot drop the commit.
+                        at_ms: switchboard_cluster::now_ms(),
                         ops: ops.clone(),
                     },
                 ),

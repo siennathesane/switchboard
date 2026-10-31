@@ -303,6 +303,20 @@ pub enum TxOp {
     },
 }
 
+/// How long a prepared transaction is IMMUNE to the janitor's
+/// [`ShardCmd::ExpirePrepared`] sweep, in wall-clock milliseconds.
+///
+/// RabbitMQ has no AMQP 0-9-1 transaction timeout at all — tx state
+/// lives and dies with its channel — so expiry here exists only to reap
+/// the orphans of crashed clients (channel teardown does not abort
+/// prepared txs). The grace is wall-clock, not logical-tick, on purpose:
+/// a prepared tx must not be expiry-eligible before the client has any
+/// chance to commit, and ticks advance with shard load, so a tick budget
+/// could elapse inside one busy client round trip. 60 s dwarfs any real
+/// prepare→commit window (the raft write budget is 5 s) while still
+/// reaping crash garbage within the minute.
+pub const TX_GRACE_MS: u64 = 60_000;
+
 /// The shard state machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShardState {
@@ -310,10 +324,10 @@ pub struct ShardState {
     pub subs: BTreeMap<SubscriptionId, Subscription>,
     /// Transactions prepared on this shard, keyed by tx id.
     pub prepared: BTreeMap<TxId, Vec<TxOp>>,
-    /// Tick each prepared tx was created at, for expiry.
-    pub prepared_at: BTreeMap<TxId, u64>,
-    /// How many ticks a prepared tx may live before the janitor expires it.
-    pub tx_timeout_ticks: u64,
+    /// Wall-clock ms each prepared tx was created at (command-carried by
+    /// [`ShardCmd::PrepareTx`]); the janitor expires entries older than
+    /// [`TX_GRACE_MS`].
+    pub prepared_at_ms: BTreeMap<TxId, u64>,
     /// Logical clock advanced once per applied command.
     pub now: u64,
     /// Wall-clock ms carried by the most recent command that stamps time
@@ -334,8 +348,7 @@ impl PartialEq for ShardState {
         self.queues == other.queues
             && self.subs == other.subs
             && self.prepared == other.prepared
-            && self.prepared_at == other.prepared_at
-            && self.tx_timeout_ticks == other.tx_timeout_ticks
+            && self.prepared_at_ms == other.prepared_at_ms
             && self.now == other.now
             && self.last_ms == other.last_ms
     }
@@ -729,9 +742,9 @@ impl ShardState {
                 ))
             }
 
-            ShardCmd::PrepareTx { tx, ops } => {
+            ShardCmd::PrepareTx { tx, ops, at_ms } => {
                 self.prepared.insert(*tx, ops.clone());
-                self.prepared_at.insert(*tx, self.now);
+                self.prepared_at_ms.insert(*tx, *at_ms);
                 Ok((ShardReply::Ok, vec![]))
             }
 
@@ -740,7 +753,7 @@ impl ShardState {
                     // Re-commit after recovery: idempotent.
                     return Ok((ShardReply::Ok, vec![]));
                 };
-                self.prepared_at.remove(tx);
+                self.prepared_at_ms.remove(tx);
                 for op in &ops {
                     match op {
                         TxOp::Enqueue { queue, message } => {
@@ -766,21 +779,28 @@ impl ShardState {
 
             ShardCmd::AbortTx { tx } => {
                 self.prepared.remove(tx);
-                self.prepared_at.remove(tx);
+                self.prepared_at_ms.remove(tx);
                 Ok((ShardReply::Ok, vec![]))
             }
 
-            ShardCmd::ExpirePrepared {} => {
-                let cutoff = self.now.saturating_sub(self.tx_timeout_ticks);
+            ShardCmd::ExpirePrepared { at_ms } => {
+                // Wall-clock grace (fix(broker): a prepared transaction
+                // must survive the janitor): only transactions whose
+                // PREPARE is older than TX_GRACE_MS are eligible. A sweep
+                // landing between a live client's PrepareTx and CommitTx
+                // therefore never eats the commit — the old tick-budget
+                // expiry (default 0 ticks) silently dropped it while
+                // CommitTx still replied Ok.
+                let cutoff = at_ms.saturating_sub(TX_GRACE_MS);
                 let expired: Vec<TxId> = self
-                    .prepared_at
+                    .prepared_at_ms
                     .iter()
                     .filter(|(_, t)| **t <= cutoff)
                     .map(|(id, _)| *id)
                     .collect();
                 for id in &expired {
                     self.prepared.remove(id);
-                    self.prepared_at.remove(id);
+                    self.prepared_at_ms.remove(id);
                 }
                 Ok((
                     ShardReply::Expired {
@@ -1175,10 +1195,15 @@ pub enum ShardCmd {
     Stats {
         queue: String,
     },
-    /// Two-phase transactions: prepare stores, commit applies, abort drops.
+    /// Two-phase transactions: prepare stores, commit applies, abort
+    /// drops. `at_ms` is the proposing node's wall-clock stamp
+    /// (command-carried, so replicas stay identical): a prepared tx is
+    /// not expiry-eligible until [`TX_GRACE_MS`] of wall-clock time has
+    /// passed (see [`ShardCmd::ExpirePrepared`]).
     PrepareTx {
         tx: TxId,
         ops: Vec<TxOp>,
+        at_ms: u64,
     },
     CommitTx {
         tx: TxId,
@@ -1186,8 +1211,14 @@ pub enum ShardCmd {
     AbortTx {
         tx: TxId,
     },
-    /// Janitor sweep for abandoned prepared transactions.
-    ExpirePrepared {},
+    /// Janitor sweep for abandoned prepared transactions. `at_ms` is the
+    /// janitor's wall-clock stamp; a tx whose prepare is younger than
+    /// [`TX_GRACE_MS`] is SKIPPED — a live client must always get its
+    /// commit in (fix(broker): a prepared transaction must survive the
+    /// janitor).
+    ExpirePrepared {
+        at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

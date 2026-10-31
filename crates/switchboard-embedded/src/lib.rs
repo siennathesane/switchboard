@@ -87,13 +87,13 @@
 //! is still ungated today and remains on the separate `fix(broker):`
 //! hardening track) — no bypass, no divergence.
 //!
-//! One further inherited behavior to know about: the broker's janitor
-//! expires prepared transactions on every tick and the shard state
-//! machine's `tx_timeout_ticks` defaults to 0, so a tx commit racing a
-//! janitor tick can be silently dropped (Commit-Ok still returns). This
-//! affects TCP clients identically; until a `fix(broker):` change lands,
-//! embedders running transactions should widen `timeouts.janitor_interval`
-//! via [`BrokerConfig::timeouts`].
+//! Prepared-transaction safety: the janitor sweeps prepared txs on every
+//! tick, but a sweep grants a wall-clock grace
+//! (`switchboard_core::shard::TX_GRACE_MS`, 60 s) measured from the
+//! PREPARE, so a tick landing between a client's PrepareTx and CommitTx
+//! can never drop the commit (the fix(broker) change; previously the
+//! tick-budget expiry defaulted to 0 and silently dropped such commits).
+//! Abandoned txs of crashed clients are reaped once the grace passes.
 //!
 //! ## Stability (§3)
 //!
