@@ -502,14 +502,14 @@ fn null_arguments_are_rejected() {
         "publish(NULL body, len 7)",
     );
     // NULL body with len 0 is accepted by the ABI (frames written, SB_OK).
-    // KNOWN PRE-EXISTING BROKER GAP (documented, not fixed here): the
-    // server's session demux completes content only in its Body-frame arm
-    // (session/mod.rs:549 take_content), but a body_size == 0 publish has
-    // NO body frame on the wire (embedded driver.rs:1001 skips it per the
-    // AMQP spec), so an empty-body message is never applied — for TCP
-    // clients identically. The test therefore asserts the ABI contract
-    // (argument validation: NULL + 0 is the empty body, accepted) without
-    // depending on the broker's empty-body delivery.
+    // The broker gap this test used to tolerate is FIXED (9ff8bf1): the
+    // server's session demux now completes body_size == 0 content in its
+    // Header arm (a body_size == 0 publish has NO body frame on the wire —
+    // the embedded driver skips it per the AMQP spec), so an empty-body
+    // publish applies and is retrievable. The drain below DEPENDS on that:
+    // empty body first, then the non-empty sentinel in publish order,
+    // mirroring methods_arms.rs empty_body_publish_applies_and_round_trips
+    // and the switchboard-embedded e2e test of the same name.
     let mut qname: *mut c_char = std::ptr::null_mut();
     must_ok(
         sb_channel_queue_declare(channel, cstr_or_die("q").as_ptr(), 0, 0, 0, 0, &mut qname),
@@ -526,8 +526,18 @@ fn null_arguments_are_rejected() {
             std::ptr::null(),
             0,
         ),
-        "publish(NULL body, len 0) = empty body (accepted; delivery has the documented broker gap)",
+        "publish(NULL body, len 0) = empty body (applied since the 9ff8bf1 fix)",
     );
+    // The empty-body publish above now APPLIES through the fixed broker:
+    // drain it first and assert it round-trips as an empty body, so the
+    // non-empty fetch below reads its own message.
+    let mut empty = get_until_has(channel, "q", 1);
+    assert_eq!(
+        copy_body(&empty),
+        b"",
+        "empty-body publish round-trips empty"
+    );
+    must_ok(sb_message_free(&mut empty), "free empty-body message");
     // A NON-empty publish on the same queue still delivers end-to-end.
     must_ok(
         sb_channel_publish(
