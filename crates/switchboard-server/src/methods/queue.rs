@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use switchboard_cluster::ClusterNode;
 use switchboard_core::error::BrokerError;
@@ -11,10 +12,17 @@ use crate::methods::shard_call;
 
 use crate::methods::inner_vhost;
 use crate::methods::meta_call;
+use switchboard_core::model::QueueInfo;
 use switchboard_core::model::QueueOptions;
+use switchboard_core::shard::QueuePolicy;
+use switchboard_core::shard::shard_key;
 use switchboard_core::topology::GroupId;
 use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::MetaState;
+use switchboard_wire::field::FieldTable;
+use tokio::time::sleep;
+use tracing::warn;
 
 impl Channel {
     /// Exclusive-queue ownership guard (code-scanning alert #13): a
@@ -24,10 +32,7 @@ impl Channel {
     /// behavior), so exclusivity cannot be sidestepped by merely knowing
     /// the queue name. Ownership is per-connection (same connection,
     /// other channels: allowed).
-    pub(crate) fn assert_queue_ownership(
-        &self,
-        qi: &switchboard_core::model::QueueInfo,
-    ) -> ChannelResult<()> {
+    pub(crate) fn assert_queue_ownership(&self, qi: &QueueInfo) -> ChannelResult<()> {
         if !qi.options.exclusive {
             return Ok(());
         }
@@ -48,8 +53,8 @@ impl Channel {
         &self,
         node: &Arc<ClusterNode>,
         queue: &str,
-    ) -> ChannelResult<switchboard_core::model::QueueInfo> {
-        let resolve = |topo: &switchboard_core::topology::MetaState| {
+    ) -> ChannelResult<QueueInfo> {
+        let resolve = |topo: &MetaState| {
             topo.vhosts
                 .get(&inner_vhost(self))
                 .and_then(|v| v.queues.get(queue))
@@ -76,7 +81,7 @@ impl Channel {
         durable: bool,
         exclusive: bool,
         auto_delete: bool,
-        arguments: switchboard_wire::field::FieldTable,
+        arguments: FieldTable,
     ) -> ChannelResult<(String, u32, u32)> {
         let options = QueueOptions {
             durable,
@@ -86,7 +91,7 @@ impl Channel {
         };
         let owner = self.inner.lock().unwrap().conn;
         let vhost_name = inner_vhost(self);
-        let policy = switchboard_core::shard::QueuePolicy::from_arguments(&options.arguments);
+        let policy = QueuePolicy::from_arguments(&options.arguments);
         let reply = meta_call(
             node,
             MetaCmd::DeclareQueue {
@@ -114,7 +119,7 @@ impl Channel {
                     // Vhost-qualified shard-data key (alert #14): the
                     // same queue name in two vhosts must never share
                     // data.
-                    queue: switchboard_core::shard::shard_key(&vhost_name, &final_name),
+                    queue: shard_key(&vhost_name, &final_name),
                     policy,
                 },
             )
@@ -122,7 +127,7 @@ impl Channel {
             Ok((final_name, 0, 0))
         } else {
             // Live counts come from the owning shard (linearizable read).
-            let data_key = switchboard_core::shard::shard_key(&vhost_name, &final_name);
+            let data_key = shard_key(&vhost_name, &final_name);
             match Self::stats_lenient(node, shard, &data_key).await {
                 Ok(ShardReply::Stats {
                     depth,
@@ -143,7 +148,7 @@ impl Channel {
                 // usability (§4.8's declaration contract), so it may repair;
                 // a passive declare stays assertion-only and still 404s.
                 Err(e) if !passive && e.code == 404 => {
-                    tracing::warn!(
+                    warn!(
                         queue = %final_name,
                         shard,
                         "queue exists in meta without shard-side data; re-driving CreateQueueData"
@@ -152,7 +157,7 @@ impl Channel {
                         node,
                         shard,
                         ShardCmd::CreateQueueData {
-                            queue: switchboard_core::shard::shard_key(&vhost_name, &final_name),
+                            queue: shard_key(&vhost_name, &final_name),
                             policy,
                         },
                     )
@@ -178,7 +183,7 @@ impl Channel {
             shard,
             ShardCmd::Purge {
                 // Vhost-qualified shard-data key (alert #14).
-                queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
+                queue: shard_key(&inner_vhost(self), queue),
             },
         )
         .await?
@@ -210,21 +215,16 @@ impl Channel {
         // (a subscription registration requires queue data), so the
         // assertions are vacuously satisfied and the delete must proceed —
         // otherwise the queue could never be deleted by anyone.
-        let (depth, consumers) = match Self::stats_lenient(
-            node,
-            shard,
-            &switchboard_core::shard::shard_key(&inner_vhost(self), queue),
-        )
-        .await
-        {
-            Ok(ShardReply::Stats {
-                depth,
-                consumer_count,
-            }) => (depth, consumer_count),
-            Ok(_) => (0, 0),
-            Err(e) if e.code == 404 => (0, 0),
-            Err(e) => return Err(e),
-        };
+        let (depth, consumers) =
+            match Self::stats_lenient(node, shard, &shard_key(&inner_vhost(self), queue)).await {
+                Ok(ShardReply::Stats {
+                    depth,
+                    consumer_count,
+                }) => (depth, consumer_count),
+                Ok(_) => (0, 0),
+                Err(e) if e.code == 404 => (0, 0),
+                Err(e) => return Err(e),
+            };
         let reply = meta_call(
             node,
             MetaCmd::DeleteQueue {
@@ -246,7 +246,7 @@ impl Channel {
             shard,
             ShardCmd::DeleteQueueData {
                 // Vhost-qualified shard-data key (alert #14).
-                queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
+                queue: shard_key(&inner_vhost(self), queue),
             },
         )
         .await;
@@ -301,7 +301,7 @@ impl Channel {
             .await
             {
                 Err(e) if e.code == 404 && attempt + 1 < TRIES => {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    sleep(Duration::from_millis(25)).await;
                 }
                 other => return other,
             }

@@ -11,18 +11,26 @@
 //! group map, so all replicas agree.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
 use serde::Deserialize;
 use serde::Serialize;
 use switchboard_wire::constants::naming;
 use switchboard_wire::field::FieldTable;
+use tracing::warn;
 
+use crate::auth::hash_password;
+use crate::auth::is_phc;
+use crate::auth::verify_password;
 use crate::error::BrokerError;
 use crate::model::Binding;
+use crate::model::ConnectionId;
 use crate::model::Exchange;
 use crate::model::ExchangeKind;
 use crate::model::QueueInfo;
 use crate::model::QueueOptions;
+use crate::model::StoredMessage;
 use crate::model::binding_key;
 use crate::model::exchange;
 use crate::routing::TopologyView;
@@ -71,7 +79,7 @@ pub struct MetaState {
     /// pre-flag snapshots deserialize unchanged (nobody is flagged, and
     /// grandfathering carries them).
     #[serde(default)]
-    pub admins: std::collections::BTreeSet<String>,
+    pub admins: BTreeSet<String>,
     pub nodes: BTreeMap<u64, NodeInfo>,
     /// Shard group map: group id → member node ids. Computed by the
     /// membership controller and applied through [`MetaCmd::SetGroups`].
@@ -80,7 +88,7 @@ pub struct MetaState {
     pub epoch: u64,
     /// Retained MQTT messages, replicated through meta:
     /// (vhost, topic) → last retained message.
-    pub retained: BTreeMap<(String, String), crate::model::StoredMessage>,
+    pub retained: BTreeMap<(String, String), StoredMessage>,
     /// Fanout publishes accepted but not yet enqueued on all destination
     /// shard groups, in meta-log order. The meta leader executes them
     /// strictly FIFO (see the cluster crate), which makes every
@@ -93,7 +101,7 @@ pub struct MetaState {
     /// temporarily invisible on a replica whose local apply lags the
     /// quorum commit, but a recorded completion never un-happens.
     #[serde(default)]
-    pub recent_fanouts: std::collections::VecDeque<uuid::Uuid>,
+    pub recent_fanouts: VecDeque<uuid::Uuid>,
 }
 
 /// Cap on [`MetaState::recent_fanouts`]: only in-flight detection windows
@@ -105,7 +113,7 @@ pub const RECENT_FANOUTS_CAP: usize = 4096;
 pub struct PendingFanout {
     pub id: uuid::Uuid,
     pub vhost: String,
-    pub message: crate::model::StoredMessage,
+    pub message: StoredMessage,
     pub queues: Vec<String>,
 }
 
@@ -148,7 +156,7 @@ impl Permissions {
         match Regex::new(&anchored) {
             Ok(re) => re.is_match(resource),
             Err(e) => {
-                tracing::warn!(%pattern, %class, %e, "invalid permission regex; denying");
+                warn!(%pattern, %class, %e, "invalid permission regex; denying");
                 false
             }
         }
@@ -165,7 +173,7 @@ pub fn bootstrap() -> MetaState {
     s.declare_default_entities(DEFAULT_VHOST);
     s.users.insert(
         DEFAULT_USER.into(),
-        crate::auth::hash_password(DEFAULT_USER, DEFAULT_PASSWORD),
+        hash_password(DEFAULT_USER, DEFAULT_PASSWORD),
     );
     // The bootstrap user is admin-flagged from the start (code-scanning
     // alert #19): someone must be able to grant the flag to others.
@@ -216,7 +224,7 @@ impl MetaState {
     /// yet visible), never inside the meta raft critical section.
     pub fn check_credentials(&self, user: &str, password: &str) -> Result<(), BrokerError> {
         match self.users.get(user) {
-            Some(pw) if crate::auth::verify_password(password, pw) => Ok(()),
+            Some(pw) if verify_password(password, pw) => Ok(()),
             _ => Err(BrokerError::connection_access_refused(format!(
                 "authentication refused for user {user:?}"
             ))),
@@ -294,7 +302,7 @@ impl MetaState {
                 // stores the string verbatim, keeping memory-hard work
                 // out of the apply path. A plaintext arm does not exist;
                 // a command carrying one is refused.
-                if !crate::auth::is_phc(password_hash) {
+                if !is_phc(password_hash) {
                     return Err(BrokerError::access_refused(
                         "CreateUser requires an argon2 PHC string; hash the password at propose",
                     ));
@@ -630,7 +638,7 @@ impl MetaState {
                         "no queue or exchange {queue:?} in vhost {vhost:?}"
                     )));
                 }
-                let b = crate::model::Binding {
+                let b = Binding {
                     exchange: ex_name.clone(),
                     queue: queue.clone(),
                     routing_key: routing_key.clone(),
@@ -660,7 +668,7 @@ impl MetaState {
                         "cannot unbind from the default exchange",
                     ));
                 }
-                let b = crate::model::Binding {
+                let b = Binding {
                     exchange: ex_name.clone(),
                     queue: queue.clone(),
                     routing_key: routing_key.clone(),
@@ -778,7 +786,7 @@ pub enum MetaCmd {
     FanoutBegin {
         id: uuid::Uuid,
         vhost: String,
-        message: crate::model::StoredMessage,
+        message: StoredMessage,
         queues: Vec<String>,
     },
     /// Every destination of the fanout has been enqueued; drop it from the
@@ -809,7 +817,7 @@ pub enum MetaCmd {
         name: String,
         passive: bool,
         options: QueueOptions,
-        owner: crate::model::ConnectionId,
+        owner: ConnectionId,
     },
     /// Delete a queue. `depth` and `consumers` are the owner shard's
     /// linearizable counts, fetched just before this command; the state
@@ -853,7 +861,7 @@ pub enum MetaCmd {
     SetRetained {
         vhost: String,
         topic: String,
-        message: Option<crate::model::StoredMessage>,
+        message: Option<StoredMessage>,
     },
     /// Grant or revoke the admin flag for a user (code-scanning alert
     /// #19); refused for a user that does not exist, exactly like

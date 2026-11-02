@@ -24,41 +24,59 @@
 //!   3 messages still there — the restore survives a subsequent broker
 //!   restart.
 
+use std::env::current_exe;
+use std::env::set_var;
+use std::env::temp_dir as env_temp_dir;
+use std::env::var;
+use std::fs::remove_dir_all;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::exit;
+use std::process::id;
+use std::sync::Once;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use switchboard_cluster::node::Timeouts;
 use switchboard_embedded::Broker;
 use switchboard_embedded::BrokerConfig;
+use switchboard_embedded::ConfirmOutcome;
+use switchboard_embedded::EmbeddedChannel;
 use switchboard_embedded::MessageProperties;
 use switchboard_embedded::QueueOptions;
 use switchboard_store::BACKUP_FORMAT_VERSION;
 use switchboard_store::backup_store;
 use switchboard_store::restore_store;
+use tokio::runtime::Builder;
+use tokio::runtime::Runtime;
 
 const PHASE_ENV: &str = "SWITCHBOARD_STORE_BACKUP_PHASE";
 const DIR_A_ENV: &str = "SWITCHBOARD_STORE_BACKUP_DIR_A";
 const DIR_B_ENV: &str = "SWITCHBOARD_STORE_BACKUP_DIR_B";
 const ARCHIVE_ENV: &str = "SWITCHBOARD_STORE_BACKUP_ARCHIVE";
 
-static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Install test tempo / light hashing params once per process (mirrors
 /// switchboard-embedded/tests/support/mod.rs:30-57: 50x shorter waits via
 /// `SB_TIME_SCALE`, argon2 test params so broker starts don't starve).
 fn init() {
-    static LOG: std::sync::Once = std::sync::Once::new();
+    static LOG: Once = Once::new();
     LOG.call_once(|| {
-        if std::env::var("SB_TIME_SCALE").is_err() {
+        if var("SB_TIME_SCALE").is_err() {
             unsafe {
-                std::env::set_var("SB_TIME_SCALE", "50");
+                set_var("SB_TIME_SCALE", "50");
             }
         }
-        if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+        if var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+                set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
             }
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+                set_var("SWITCHBOARD_ARGON2_T", "1");
             }
         }
         tracing_subscriber::fmt()
@@ -75,19 +93,19 @@ fn temp_dir(name: &str) -> PathBuf {
     let unique = format!(
         "{}-{}-{}",
         name,
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let dir = std::env::temp_dir().join(format!("switchboard-store-{unique}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = env_temp_dir().join(format!("switchboard-store-{unique}"));
+    let _ = remove_dir_all(&dir);
     dir
 }
 
 /// Timeouts for test brokers: wide write budgets (contention absorption)
 /// and a janitor interval far beyond the test duration (the known
 /// ExpirePrepared-vs-tx race documented in the embedded support module).
-fn test_timeouts() -> switchboard_cluster::node::Timeouts {
-    let mut t = switchboard_cluster::node::Timeouts::default();
+fn test_timeouts() -> Timeouts {
+    let mut t = Timeouts::default();
     t.write_budget = Duration::from_secs(30);
     t.fanout_budget = Duration::from_secs(30);
     t.rpc_reply_budget = Duration::from_secs(30);
@@ -102,7 +120,7 @@ fn persistent(body: &[u8]) -> (MessageProperties, Vec<u8>) {
     (p, body.to_vec())
 }
 
-async fn open_channel(broker: &Broker) -> switchboard_embedded::EmbeddedChannel {
+async fn open_channel(broker: &Broker) -> EmbeddedChannel {
     let conn = broker.connect("guest", "guest").await.expect("connect");
     conn.open_channel().await.expect("channel")
 }
@@ -113,12 +131,12 @@ async fn open_channel(broker: &Broker) -> switchboard_embedded::EmbeddedChannel 
 fn spawn_phase(
     test_name: &str,
     phase: &str,
-    dir_a: &std::path::Path,
-    dir_b: &std::path::Path,
-    archive: &std::path::Path,
-) -> std::process::ExitStatus {
-    let exe = std::env::current_exe().expect("current_exe");
-    let mut cmd = std::process::Command::new(exe);
+    dir_a: &Path,
+    dir_b: &Path,
+    archive: &Path,
+) -> ExitStatus {
+    let exe = current_exe().expect("current_exe");
+    let mut cmd = Command::new(exe);
     cmd.arg("--exact").arg(test_name).arg("--nocapture");
     cmd.env(PHASE_ENV, phase);
     cmd.env(DIR_A_ENV, dir_a);
@@ -128,17 +146,15 @@ fn spawn_phase(
         .expect("failed to spawn backup round-trip phase child")
 }
 
-fn child_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
+fn child_runtime() -> Runtime {
+    Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("child runtime")
 }
 
 fn dir_from_env(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("{env} must be set in a phase child")),
-    )
+    PathBuf::from(var(env).unwrap_or_else(|_| panic!("{env} must be set in a phase child")))
 }
 
 const QUEUE: &str = "backup-q";
@@ -152,7 +168,7 @@ fn backup_restore_roundtrip_survives_restart() {
     let archive = temp_dir("backup-roundtrip-arch").join("node.swbk");
 
     // ---- phase a: broker + durable queue + 3 persistent messages ----
-    match std::env::var(PHASE_ENV).as_deref() {
+    match var(PHASE_ENV).as_deref() {
         Ok("a") => {
             child_runtime().block_on(async {
                 let dir_a = dir_from_env(DIR_A_ENV);
@@ -170,7 +186,7 @@ fn backup_restore_roundtrip_survives_restart() {
                         .await
                         .expect("confirmed publish");
                     assert!(
-                        matches!(outcome, switchboard_embedded::ConfirmOutcome::Acked),
+                        matches!(outcome, ConfirmOutcome::Acked),
                         "publish {i} must be durable (acked), got {outcome:?}"
                     );
                 }
@@ -183,7 +199,7 @@ fn backup_restore_roundtrip_survives_restart() {
             });
             // Explicit exit: lingering join handles must not hang the
             // libtest child after the phase body is done.
-            std::process::exit(0);
+            exit(0);
         }
         Ok("b") => {
             child_runtime().block_on(async {
@@ -211,7 +227,7 @@ fn backup_restore_roundtrip_survives_restart() {
                 );
                 broker.stop(Duration::from_secs(60)).await.expect("stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         Ok("c") => {
             child_runtime().block_on(async {
@@ -234,7 +250,7 @@ fn backup_restore_roundtrip_survives_restart() {
                 assert!(empty, "exactly 3 messages survive the restart");
                 broker.stop(Duration::from_secs(60)).await.expect("stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         _ => {}
     }
@@ -259,7 +275,7 @@ fn backup_restore_roundtrip_survives_restart() {
     let c = spawn_phase(test_name, "c", &dir_a, &dir_b, &archive);
     assert!(c.success(), "phase c failed: {c}");
 
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
-    let _ = std::fs::remove_dir_all(archive.parent().unwrap());
+    let _ = remove_dir_all(&dir_a);
+    let _ = remove_dir_all(&dir_b);
+    let _ = remove_dir_all(archive.parent().unwrap());
 }

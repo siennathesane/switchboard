@@ -4,12 +4,16 @@
 
 mod support;
 
+use std::time::Duration;
 use support::basic_get;
 use support::connect_and_open;
 use support::publish;
 use support::start_broker;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::PROTOCOL_HEADER;
 use switchboard_wire::method::Method;
+use tokio::io::AsyncReadExt;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_declare_publish_get_roundtrip() {
@@ -287,13 +291,13 @@ async fn protocol_header_garbage_gets_protocol_header_reply() {
     c.writer.flush().await.unwrap();
     // Server writes a valid protocol header then closes (§4.2.2).
     let mut buf = [0u8; 8];
-    let n = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf)
+    let n = AsyncReadExt::read(&mut c.read_half, &mut buf)
         .await
         .unwrap();
     assert_eq!(n, 8);
-    assert_eq!(&buf, &switchboard_wire::PROTOCOL_HEADER);
+    assert_eq!(&buf, &PROTOCOL_HEADER);
     // Then EOF.
-    let n2 = tokio::io::AsyncReadExt::read(&mut c.read_half, &mut buf)
+    let n2 = AsyncReadExt::read(&mut c.read_half, &mut buf)
         .await
         .unwrap();
     assert_eq!(n2, 0);
@@ -512,7 +516,7 @@ async fn consumer_receives_deliveries_and_acks() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
     assert!(
         basic_get(&mut c, 1, "stream", true)
             .await

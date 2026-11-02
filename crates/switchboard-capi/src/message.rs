@@ -4,8 +4,13 @@
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_char;
+use std::ptr::null_mut;
 use std::slice::from_raw_parts;
 
+use crate::status::SB_ERR_INVALID_UTF8;
+use crate::status::SB_ERR_NULL_ARG;
+use crate::status::SbStatus;
+use crate::status::fail;
 use switchboard_embedded::Delivery;
 use switchboard_embedded::ReturnedMessage;
 
@@ -47,11 +52,11 @@ impl SbMessage {
             (*out) = SbMessage {
                 delivery_tag: 0,
                 redelivered: 0,
-                exchange: std::ptr::null_mut(),
-                routing_key: std::ptr::null_mut(),
-                consumer_tag: std::ptr::null_mut(),
-                content_type: std::ptr::null_mut(),
-                body: std::ptr::null_mut(),
+                exchange: null_mut(),
+                routing_key: null_mut(),
+                consumer_tag: null_mut(),
+                content_type: null_mut(),
+                body: null_mut(),
                 body_len: 0,
             };
             (*out).delivery_tag = d.delivery_tag;
@@ -92,7 +97,7 @@ pub(crate) fn alloc_string(s: &str) -> *mut c_char {
     let truncated: String = s.chars().take_while(|&c| c != '\0').collect();
     match CString::new(truncated) {
         Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => null_mut(),
     }
 }
 
@@ -101,18 +106,18 @@ pub(crate) fn alloc_string(s: &str) -> *mut c_char {
 /// # Safety
 /// `p` must be NULL or point to a valid NUL-terminated C string (the same
 /// precondition every C library string argument has).
-pub(crate) unsafe fn cstr(arg: &str, p: *const c_char) -> Result<String, crate::status::SbStatus> {
+pub(crate) unsafe fn cstr(arg: &str, p: *const c_char) -> Result<String, SbStatus> {
     if p.is_null() {
-        return Err(crate::status::fail(
-            crate::status::SB_ERR_NULL_ARG,
+        return Err(fail(
+            SB_ERR_NULL_ARG,
             format_args!("{arg} must not be NULL"),
         ));
     }
     let s = unsafe { CStr::from_ptr(p) };
     match s.to_str() {
         Ok(s) => Ok(s.to_owned()),
-        Err(_) => Err(crate::status::fail(
-            crate::status::SB_ERR_INVALID_UTF8,
+        Err(_) => Err(fail(
+            SB_ERR_INVALID_UTF8,
             format_args!("{arg} is not valid UTF-8"),
         )),
     }
@@ -122,10 +127,7 @@ pub(crate) unsafe fn cstr(arg: &str, p: *const c_char) -> Result<String, crate::
 ///
 /// # Safety
 /// Same precondition as [`cstr`].
-pub(crate) unsafe fn opt_cstr(
-    arg: &str,
-    p: *const c_char,
-) -> Result<Option<String>, crate::status::SbStatus> {
+pub(crate) unsafe fn opt_cstr(arg: &str, p: *const c_char) -> Result<Option<String>, SbStatus> {
     if p.is_null() {
         return Ok(None);
     }
@@ -142,13 +144,13 @@ pub(crate) unsafe fn bytes<'a>(
     arg: &str,
     ptr: *const u8,
     len: usize,
-) -> Result<&'a [u8], crate::status::SbStatus> {
+) -> Result<&'a [u8], SbStatus> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(&[]);
         }
-        return Err(crate::status::fail(
-            crate::status::SB_ERR_NULL_ARG,
+        return Err(fail(
+            SB_ERR_NULL_ARG,
             format_args!("{arg} is NULL but {arg}_len is {len}"),
         ));
     }

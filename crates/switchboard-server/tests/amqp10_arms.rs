@@ -10,11 +10,20 @@ use std::time::Duration;
 
 use gateway_support::start_gateway;
 use gateway_support::with_timeout;
+use switchboard_server::ConnectionLimits;
 use switchboard_server::protocols::amqp10::frames;
+use switchboard_server::protocols::amqp10::serve;
 use switchboard_server::protocols::amqp10::types;
+use switchboard_wire::BasicProperties;
 use switchboard_wire::method::Method;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::spawn;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// One gateway per test (most deterministic under parallel harness load).
 async fn gw() -> (String, gateway_support::NodeGuard) {
@@ -22,7 +31,7 @@ async fn gw() -> (String, gateway_support::NodeGuard) {
 }
 
 /// Read one amqp10 frame from the socket (reassembling reads).
-async fn read_frame(sock: &mut tokio::net::TcpStream) -> frames::Frame {
+async fn read_frame(sock: &mut TcpStream) -> frames::Frame {
     let mut buf = [0u8; 4096];
     let mut raw = Vec::new();
     loop {
@@ -39,8 +48,8 @@ async fn read_frame(sock: &mut tokio::net::TcpStream) -> frames::Frame {
 
 /// SASL-ANONYMOUS handshake + open + begin; returns the socket with the
 /// open/begin replies consumed frame-by-frame (they can arrive split).
-async fn amqp10_open_session(addr: &str) -> tokio::net::TcpStream {
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+async fn amqp10_open_session(addr: &str) -> TcpStream {
+    let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms
@@ -61,11 +70,11 @@ async fn amqp10_open_session(addr: &str) -> tokio::net::TcpStream {
     // The open and begin replies arrive as frames; the generic type
     // decoder rejects connection-level performatives, so assert on
     // delivery (any bytes) rather than the code.
-    let open_reply = tokio::time::timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
+    let open_reply = timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
         .await
         .unwrap();
     assert!(!open_reply.is_empty(), "open reply");
-    let begin_reply = tokio::time::timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
+    let begin_reply = timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
         .await
         .unwrap();
     assert!(!begin_reply.is_empty(), "begin reply");
@@ -73,7 +82,7 @@ async fn amqp10_open_session(addr: &str) -> tokio::net::TcpStream {
 }
 
 /// Read exactly one transport frame (header + declared size).
-async fn read_frame_raw(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     let mut head = [0u8; 8];
     sock.read_exact(&mut head).await.unwrap();
@@ -134,7 +143,7 @@ async fn a10_topic_and_exchange_addresses_resolve() {
     )
     .await
     .unwrap();
-    let props = switchboard_wire::BasicProperties::new();
+    let props = BasicProperties::new();
     amqp.send_content(1, &props, b"topic-news").await.unwrap();
 
     let frame = with_timeout(read_frame(&mut sock), 30).await;
@@ -231,12 +240,9 @@ async fn a10_sender_target_exchange_address_routes() {
 
     // The transfer's publish is asynchronous to the transfer write; poll
     // the queue until it shows up.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "routed message never appeared"
-        );
+        assert!(Instant::now() < deadline, "routed message never appeared");
         amqp.send_method(
             1,
             &Method::BasicGet {
@@ -399,7 +405,7 @@ async fn a10_link_credit_flow_grant_is_accepted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a10_sasl_frame_that_is_not_init_closes() {
     let (addr, _node) = gw().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
     let _ = sock.read(&mut buf).await.unwrap();
@@ -410,7 +416,7 @@ async fn a10_sasl_frame_that_is_not_init_closes() {
     ))
     .await
     .unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -420,7 +426,7 @@ async fn a10_sasl_frame_that_is_not_init_closes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a10_sasl_init_with_non_binary_response_still_authenticates() {
     let (addr, _node) = gw().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
     let _ = sock.read(&mut buf).await.unwrap();
@@ -439,7 +445,7 @@ async fn a10_sasl_init_with_non_binary_response_still_authenticates() {
     let _ = sock.read(&mut buf).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     sock.write_all(&frames::open("anon2")).await.unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -449,7 +455,7 @@ async fn a10_sasl_init_with_non_binary_response_still_authenticates() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a10_bad_second_protocol_header_closes() {
     let (addr, _node) = gw().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
     let _ = sock.read(&mut buf).await.unwrap();
@@ -466,7 +472,7 @@ async fn a10_bad_second_protocol_header_closes() {
     let _ = sock.read(&mut buf).await.unwrap();
     // Wrong header after SASL: connection closes.
     sock.write_all(b"AMQP\x00\x00\x09\x01").await.unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -481,7 +487,7 @@ async fn a10_malformed_frames_close_gracefully() {
     sock.write_all(&[0, 0, 0, 16, 0x01, 0, 0, 0]).await.unwrap();
     sock.write_all(&[0u8; 8]).await.unwrap();
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -490,7 +496,7 @@ async fn a10_malformed_frames_close_gracefully() {
     // size < header length → closed as well.
     let mut sock = amqp10_open_session(&addr).await;
     sock.write_all(&[0, 0, 0, 7, 0x02, 0, 0, 0]).await.unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut buf))
         .await
         .unwrap()
         .unwrap();
@@ -520,7 +526,7 @@ async fn a10_extended_header_frame_parses_and_session_survives() {
     // Either a CLOSE reply or a clean close is acceptable; the frame
     // must not wedge the session.
     let mut rbuf = [0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut rbuf))
+    let n = timeout(Duration::from_secs(10), sock.read(&mut rbuf))
         .await
         .unwrap();
     let _ = n;
@@ -611,12 +617,9 @@ async fn a10_amqp_value_body_and_properties_sections_parse() {
 
     // The message landed via the properties `to`.
     let mut amqp = support::connect_and_open(&addr, "/").await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "sectioned message never routed"
-        );
+        assert!(Instant::now() < deadline, "sectioned message never routed");
         amqp.send_method(
             1,
             &Method::BasicGet {
@@ -629,7 +632,7 @@ async fn a10_amqp_value_body_and_properties_sections_parse() {
         .unwrap();
         match amqp.expect(1).await.unwrap() {
             Method::BasicGetOk { .. } => break,
-            Method::BasicGetEmpty { .. } => tokio::time::sleep(Duration::from_millis(100)).await,
+            Method::BasicGetEmpty { .. } => sleep(Duration::from_millis(100)).await,
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -726,7 +729,7 @@ async fn a10_disposition_with_unknown_state_still_settles_as_ack() {
     .await
     .unwrap();
     // Queue must be empty afterwards (acked, not requeued).
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
     amqp.send_method(
         1,
         &Method::BasicGet {
@@ -761,10 +764,10 @@ async fn publish_and_confirm(amqp: &mut support::TestClient, queue: &str, body: 
     )
     .await
     .unwrap();
-    amqp.send_content(1, &switchboard_wire::BasicProperties::new(), body)
+    amqp.send_content(1, &BasicProperties::new(), body)
         .await
         .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(10), amqp.expect(1))
+    let m = timeout(Duration::from_secs(10), amqp.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -781,7 +784,7 @@ async fn publish_and_confirm(amqp: &mut support::TestClient, queue: &str, body: 
 #[tokio::test(flavor = "multi_thread")]
 async fn amqp10_preauth_oversized_frame_size_closes_the_connection() {
     let (addr, _n) = gw().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     // The server answers with sasl-mechanisms; read it so the write of
     // the hostile header is not racing the greeting.
@@ -793,7 +796,7 @@ async fn amqp10_preauth_oversized_frame_size_closes_the_connection() {
         .await
         .unwrap();
     let mut tail = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(15), sock.read_to_end(&mut tail))
+    let _ = timeout(Duration::from_secs(15), sock.read_to_end(&mut tail))
         .await
         .expect("server must close the connection");
 }
@@ -808,13 +811,13 @@ async fn amqp10_preauth_oversized_frame_size_closes_the_connection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn amqp10_sasl_skip_from_loopback_still_opens_as_guest() {
     let (addr, _n) = gw().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms
     // No SASL frame at all — OPEN directly.
     sock.write_all(&frames::open("no-sasl")).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
+    let reply = timeout(Duration::from_secs(10), read_frame_raw(&mut sock))
         .await
         .expect("server must answer (or close) promptly");
     assert!(
@@ -831,22 +834,22 @@ async fn amqp10_sasl_skip_from_non_loopback_peer_is_refused() {
     let node = guard.0.clone();
     // Serve amqp10 directly with a forged non-loopback peer IP (the
     // gateway stamps the real one; the rule under test is identical).
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let accept = tokio::spawn(async move {
+    let accept = spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
                 continue;
             };
             let node = node.clone();
-            tokio::spawn(async move {
-                let mut limits = switchboard_server::ConnectionLimits::default();
+            spawn(async move {
+                let mut limits = ConnectionLimits::default();
                 limits.peer_ip = Some("203.0.113.7".parse().unwrap()); // TEST-NET-3
-                let _ = switchboard_server::protocols::amqp10::serve(sock, node, limits).await;
+                let _ = serve(sock, node, limits).await;
             });
         }
     });
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms still offered

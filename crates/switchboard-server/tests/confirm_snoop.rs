@@ -3,8 +3,12 @@
 
 mod support;
 
+use std::time::Duration;
+use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
+use tokio::time::Instant;
+use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snoop_confirm_frames() {
@@ -111,7 +115,7 @@ async fn snoop_confirm_frames() {
     )
     .await
     .unwrap();
-    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one")
+    c.send_content(1, &BasicProperties::new(), b"one")
         .await
         .unwrap();
     println!("[snoop] after pub1: {:?}", c.expect(1).await.unwrap());
@@ -203,7 +207,7 @@ async fn snoop_confirm_frames() {
     )
     .await
     .unwrap();
-    c.send_content(1, &switchboard_wire::BasicProperties::new(), b"one")
+    c.send_content(1, &BasicProperties::new(), b"one")
         .await
         .unwrap();
     println!("[snoop] after pub1: {:?}", c.expect(1).await.unwrap());
@@ -236,14 +240,10 @@ async fn snoop_confirm_frames() {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 4096];
     let mut acc: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut frames = 0usize;
-    while tokio::time::Instant::now() < deadline && frames < 12 {
-        let n = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            c.read_half.read(&mut buf),
-        )
-        .await;
+    while Instant::now() < deadline && frames < 12 {
+        let n = timeout(Duration::from_millis(500), c.read_half.read(&mut buf)).await;
         match n {
             Ok(Ok(0)) => break,
             Err(_) => continue, // silence until the deadline

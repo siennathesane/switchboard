@@ -21,6 +21,8 @@
 
 mod support;
 
+use std::env::set_var;
+use std::env::var;
 use std::time::Duration;
 
 use support::basic_get;
@@ -30,6 +32,9 @@ use support::start_broker;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
+use tokio::spawn;
+use tokio::sync::oneshot::channel;
+use tokio::time::timeout;
 
 const QUEUE: &str = "cancel-barrier";
 const TAG: &str = "ct-race";
@@ -42,8 +47,8 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
     // the server's heartbeat to ~1.2 s, and this test deliberately stays
     // read-only for seconds while it drains ~1500 deliveries — the
     // silence deadline would kill the connection mid-assertion.
-    if std::env::var("SB_TIME_SCALE").is_err() {
-        unsafe { std::env::set_var("SB_TIME_SCALE", "1") };
+    if var("SB_TIME_SCALE").is_err() {
+        unsafe { set_var("SB_TIME_SCALE", "1") };
     }
     support::init_tracing();
     let (_node, addr) = start_broker("cancel-barrier").await;
@@ -96,9 +101,9 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
     // A second connection floods the queue while the consumer runs, so
     // the cancel lands mid-stream against dispatches in flight — the
     // same shape as the harness teardown crash.
-    let (flood_done_tx, mut flood_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let (flood_done_tx, mut flood_done_rx) = channel::<()>();
     let flood_addr = addr.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         let mut b = connect_and_open(&flood_addr, "/")
             .await
             .expect("flood conn");
@@ -122,7 +127,7 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
     // cancel mid-stream.
     let mut delivered_before_ok = 0u32;
     loop {
-        let (m, _) = tokio::time::timeout(Duration::from_secs(30), a.expect_method(1))
+        let (m, _) = timeout(Duration::from_secs(30), a.expect_method(1))
             .await
             .expect("timed out waiting for the delivery stream to start")
             .unwrap();
@@ -166,7 +171,7 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
     // is exactly where amqplib threw 541 "Unknown consumer".)
     let mut cancel_ok_seen = false;
     while !cancel_ok_seen {
-        let (m, _) = tokio::time::timeout(Duration::from_secs(30), a.expect_method(1))
+        let (m, _) = timeout(Duration::from_secs(30), a.expect_method(1))
             .await
             .expect("timed out waiting for BasicCancelOk")
             .unwrap();
@@ -232,7 +237,7 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
         if total >= FLOOD {
             break;
         }
-        match tokio::time::timeout(Duration::from_millis(1500), a.expect_method(1)).await {
+        match timeout(Duration::from_millis(1500), a.expect_method(1)).await {
             Ok(Ok((m, _))) => match m {
                 Method::BasicConsumeOk { consumer_tag } => {
                     assert_eq!(consumer_tag, TAG_AFTER);
@@ -269,7 +274,7 @@ async fn cancel_ok_is_a_per_consumer_delivery_barrier_on_the_wire() {
     .await
     .unwrap();
     loop {
-        let (m, _) = tokio::time::timeout(Duration::from_secs(30), a.expect_method(1))
+        let (m, _) = timeout(Duration::from_secs(30), a.expect_method(1))
             .await
             .expect("timed out waiting for ct-after's CancelOk")
             .unwrap();

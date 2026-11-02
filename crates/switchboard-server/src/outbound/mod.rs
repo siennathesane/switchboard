@@ -2,6 +2,8 @@
 //! drained by the writer task with heartbeat injection.
 
 use bytes::BytesMut;
+use switchboard_wire::BasicProperties;
+use switchboard_wire::Frame;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
 
@@ -29,16 +31,16 @@ pub enum OutboundFrame {
 pub fn encode(frame: &OutboundFrame, out: &mut BytesMut) {
     match frame {
         OutboundFrame::Method { channel, method } => {
-            switchboard_wire::Frame::method(*channel, method).encode(out);
+            Frame::method(*channel, method).encode(out);
         }
         OutboundFrame::Header { channel, header } => {
-            switchboard_wire::Frame::header(*channel, header).encode(out);
+            Frame::header(*channel, header).encode(out);
         }
         OutboundFrame::Body { channel, data } => {
-            switchboard_wire::Frame::body(*channel, data).encode(out);
+            Frame::body(*channel, data).encode(out);
         }
         OutboundFrame::Heartbeat => {
-            switchboard_wire::Frame::heartbeat().encode(out);
+            Frame::heartbeat().encode(out);
         }
         OutboundFrame::Shutdown => {}
     }
@@ -58,7 +60,7 @@ pub fn max_body_size(frame_max: u32) -> usize {
 pub fn message_frames(
     channel: u16,
     method: Method,
-    props: switchboard_wire::BasicProperties,
+    props: BasicProperties,
     body: &[u8],
     frame_max: u32,
 ) -> Vec<OutboundFrame> {
@@ -85,6 +87,8 @@ pub fn message_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use switchboard_wire::BasicProperties;
+    use switchboard_wire::FrameReader;
     use switchboard_wire::field::FieldTable;
     use switchboard_wire::wireio::Decoder;
 
@@ -100,7 +104,7 @@ mod tests {
         };
         let mut buf = BytesMut::new();
         encode(&f, &mut buf);
-        let mut r = switchboard_wire::FrameReader::new();
+        let mut r = FrameReader::new();
         r.feed(&buf);
         let frame = r.next_frame(0).unwrap().unwrap();
         assert_eq!(frame.channel, 2);
@@ -125,7 +129,7 @@ mod tests {
                 exchange: "".into(),
                 routing_key: String::new(),
             },
-            switchboard_wire::BasicProperties::new(),
+            BasicProperties::new(),
             &vec![7u8; 500],
             128,
         );
@@ -161,7 +165,7 @@ mod tests {
                 routing_key: String::new(),
                 message_count: 0,
             },
-            switchboard_wire::BasicProperties::new(),
+            BasicProperties::new(),
             &[],
             131_072,
         );
@@ -170,7 +174,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip_through_wire() {
-        let mut props = switchboard_wire::BasicProperties::new();
+        let mut props = BasicProperties::new();
         props.delivery_mode = Some(2);
         props.headers = Some(FieldTable::new());
         let frames = message_frames(
@@ -189,7 +193,7 @@ mod tests {
         // Encode the header frame and decode it back.
         let mut buf = BytesMut::new();
         encode(&frames[1], &mut buf);
-        let mut r = switchboard_wire::FrameReader::new();
+        let mut r = FrameReader::new();
         r.feed(&buf);
         let frame = r.next_frame(0).unwrap().unwrap();
         let header = frame.content_header(60).unwrap();

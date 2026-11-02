@@ -12,6 +12,9 @@
 
 mod support;
 
+use std::env::var;
+use std::process::abort;
+use std::process::exit;
 use std::time::Duration;
 
 use switchboard_embedded::Broker;
@@ -23,6 +26,9 @@ use switchboard_wire::field::FieldTable;
 
 use support::RESTART_PHASE_ENV;
 use support::init;
+use switchboard_embedded::ConnectError;
+use switchboard_embedded::EmbeddedChannel;
+use tokio::time::sleep;
 
 fn persistent(body: &[u8]) -> (MessageProperties, Vec<u8>) {
     let mut p = MessageProperties::default();
@@ -31,7 +37,7 @@ fn persistent(body: &[u8]) -> (MessageProperties, Vec<u8>) {
     (p, body.to_vec())
 }
 
-async fn open(broker: &Broker) -> switchboard_embedded::EmbeddedChannel {
+async fn open(broker: &Broker) -> EmbeddedChannel {
     let conn = broker.connect("guest", "guest").await.expect("connect");
     conn.open_channel().await.expect("channel")
 }
@@ -43,7 +49,7 @@ async fn open(broker: &Broker) -> switchboard_embedded::EmbeddedChannel {
 #[test]
 fn restart_durable_graceful() {
     init();
-    match std::env::var(RESTART_PHASE_ENV).as_deref() {
+    match var(RESTART_PHASE_ENV).as_deref() {
         Ok("durable-a") => {
             let rt = support::child_runtime();
             rt.block_on(async {
@@ -77,7 +83,7 @@ fn restart_durable_graceful() {
             });
             // Explicit exit: lingering join handles must not hang the
             // libtest child after the phase body is done.
-            std::process::exit(0);
+            exit(0);
         }
         Ok("durable-b") => {
             let rt = support::child_runtime();
@@ -103,7 +109,7 @@ fn restart_durable_graceful() {
                 assert!(ch.get("persist-q", true).await.expect("get").is_none());
                 broker.stop(Duration::from_secs(60)).await.expect("stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         _ => {}
     }
@@ -123,7 +129,7 @@ fn restart_durable_graceful() {
 #[test]
 fn restart_hold_and_credential_skip() {
     init();
-    match std::env::var(RESTART_PHASE_ENV).as_deref() {
+    match var(RESTART_PHASE_ENV).as_deref() {
         Ok("hold-a") => {
             let rt = support::child_runtime();
             rt.block_on(async {
@@ -157,7 +163,7 @@ fn restart_hold_and_credential_skip() {
                     .await
                     .expect("graceful stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         Ok("hold-b") => {
             let rt = support::child_runtime();
@@ -182,10 +188,7 @@ fn restart_hold_and_credential_skip() {
                 // pw2 must NOT authenticate: nothing was written.
                 let refused = broker.connect("app", "pw2").await;
                 assert!(
-                    matches!(
-                        refused,
-                        Err(switchboard_embedded::ConnectError::AccessRefused)
-                    ),
+                    matches!(refused, Err(ConnectError::AccessRefused)),
                     "pw2 was correctly NOT written, got {refused:?}"
                 );
 
@@ -199,7 +202,7 @@ fn restart_hold_and_credential_skip() {
                         redelivered = Some(d);
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(100)).await;
                 }
                 assert!(
                     redelivered.is_some(),
@@ -207,7 +210,7 @@ fn restart_hold_and_credential_skip() {
                 );
                 broker.stop(Duration::from_secs(60)).await.expect("stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         _ => {}
     }
@@ -227,7 +230,7 @@ fn restart_hold_and_credential_skip() {
 #[test]
 fn restart_hard_no_stop() {
     init();
-    match std::env::var(RESTART_PHASE_ENV).as_deref() {
+    match var(RESTART_PHASE_ENV).as_deref() {
         Ok("hard-a") => {
             let rt = support::child_runtime();
             rt.block_on(async {
@@ -264,7 +267,7 @@ fn restart_hard_no_stop() {
                 assert!(!d.redelivered);
                 // Every raft apply already persisted before the write
                 // resolved, so dying without stop is safe for the data.
-                std::process::abort();
+                abort();
             });
             unreachable!("abort never returns");
         }
@@ -301,7 +304,7 @@ fn restart_hard_no_stop() {
                 assert!(d.redelivered, "orphan release sets redelivered");
                 broker.stop(Duration::from_secs(60)).await.expect("stop");
             });
-            std::process::exit(0);
+            exit(0);
         }
         _ => {}
     }

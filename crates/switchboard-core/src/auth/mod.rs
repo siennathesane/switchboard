@@ -11,8 +11,12 @@
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::field::FieldValue;
 use switchboard_wire::wireio::Decoder;
+use tracing::debug;
 
 use crate::error::BrokerError;
+use std::env::var;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// The security mechanisms this server advertises (§2.2.4: space-separated
 /// in the `mechanisms` longstr).
@@ -83,6 +87,8 @@ pub fn authenticate(
 mod tests {
     use super::*;
     use crate::error::Level;
+    use switchboard_wire::FieldValue;
+    use switchboard_wire::wireio::Encoder;
 
     fn check(user: &str, pass: &str) -> Result<(), BrokerError> {
         if user == "guest" && pass == "guest" {
@@ -120,15 +126,9 @@ mod tests {
     #[test]
     fn amqplain_roundtrip() {
         let mut t = FieldTable::new();
-        t.insert(
-            "LOGIN",
-            switchboard_wire::FieldValue::ShortString("guest".into()),
-        );
-        t.insert(
-            "PASSWORD",
-            switchboard_wire::FieldValue::ShortString("guest".into()),
-        );
-        let mut e = switchboard_wire::wireio::Encoder::new();
+        t.insert("LOGIN", FieldValue::ShortString("guest".into()));
+        t.insert("PASSWORD", FieldValue::ShortString("guest".into()));
+        let mut e = Encoder::new();
         t.encode(&mut e);
         // AMQPLAIN response is the table WITHOUT its length prefix.
         let body = e.finish();
@@ -145,11 +145,8 @@ mod tests {
     #[test]
     fn amqplain_missing_fields() {
         let mut t = FieldTable::new();
-        t.insert(
-            "LOGIN",
-            switchboard_wire::FieldValue::ShortString("guest".into()),
-        );
-        let mut e = switchboard_wire::wireio::Encoder::new();
+        t.insert("LOGIN", FieldValue::ShortString("guest".into()));
+        let mut e = Encoder::new();
         t.encode(&mut e);
         let response = &e.finish()[4..];
         let err = authenticate("AMQPLAIN", response, check).unwrap_err();
@@ -159,10 +156,9 @@ mod tests {
 
 /// Memo slot: `((user, password), PHC string)` — keyed by BOTH the user
 /// and the password (code-scanning alert #22).
-fn hash_memo() -> &'static std::sync::Mutex<Option<((String, String), String)>> {
-    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<((String, String), String)>>> =
-        std::sync::OnceLock::new();
-    MEMO.get_or_init(|| std::sync::Mutex::new(None))
+fn hash_memo() -> &'static Mutex<Option<((String, String), String)>> {
+    static MEMO: OnceLock<Mutex<Option<((String, String), String)>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(None))
 }
 
 /// Argon2 parameters for NEW hashes: OWASP baseline by default
@@ -175,7 +171,7 @@ fn hash_memo() -> &'static std::sync::Mutex<Option<((String, String), String)>> 
 /// embedded in its PHC string, so tuning only affects new hashes.
 fn argon2_params() -> argon2::Params {
     fn num(key: &str, default: u32) -> u32 {
-        std::env::var(key)
+        var(key)
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
@@ -252,7 +248,7 @@ pub fn is_phc(stored: &str) -> bool {
 /// debug for the operator).
 pub fn verify_password(password: &str, stored: &str) -> bool {
     if !stored.starts_with("$argon2") {
-        tracing::debug!(
+        debug!(
             stored_len = stored.len(),
             "stored credential is not an argon2 PHC string; refusing (PHC-only)"
         );

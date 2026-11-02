@@ -3,25 +3,26 @@
 //! formation-time bootstrap write, so a deployment gets the credentials
 //! it asked for instead of the public dev default.
 
+use std::env::temp_dir;
+use std::net::TcpListener;
+use std::process::id;
 use std::sync::Arc;
+use std::time::Duration;
 
 use switchboard_cluster::ClusterNode;
 use switchboard_cluster::NodeConfig;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_credentials_flow_into_formation() {
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
+        TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port()
     }
-    let dir = std::env::temp_dir().join(format!(
-        "sb-bootcred-{}-{}",
-        std::process::id(),
-        free_port()
-    ));
+    let dir = temp_dir().join(format!("sb-bootcred-{}-{}", id(), free_port()));
     let cfg = NodeConfig {
         id: 1,
         data_dir: dir,
@@ -47,7 +48,7 @@ async fn bootstrap_credentials_flow_into_formation() {
         if !topo.vhosts.is_empty() && !topo.groups.is_empty() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
     assert!(
         !node.topology().vhosts.is_empty(),

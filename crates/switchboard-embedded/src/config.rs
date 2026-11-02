@@ -2,7 +2,10 @@
 //! providers — every knob is a builder method taking owned typed values
 //! (embedded design §1 goal 4).
 
+use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
+use switchboard_cluster::node::Timeouts;
 
 /// Per-connection protocol limits for embedded connections. Defaults mirror
 /// the server's negotiated defaults (`ConnectionLimits`, channel/mod.rs:55-65)
@@ -78,12 +81,12 @@ pub struct JoinSpec {
     pub seeds: Vec<String>,
     /// Internal listen address for this node; peers dial back on it for
     /// raft/forwarding traffic.
-    pub internal_listen: std::net::SocketAddr,
+    pub internal_listen: SocketAddr,
 }
 
 impl JoinSpec {
     /// Join through `seeds`, listening for peer traffic on `internal_listen`.
-    pub fn new(seeds: Vec<String>, internal_listen: std::net::SocketAddr) -> Self {
+    pub fn new(seeds: Vec<String>, internal_listen: SocketAddr) -> Self {
         JoinSpec {
             seeds,
             internal_listen,
@@ -113,10 +116,10 @@ pub struct BrokerConfig {
     /// applies the ensure-user-if-absent write after readiness — with the
     /// literal name `"guest"` refused by [`crate::Broker::start`].
     pub(crate) bootstrap_credentials: Option<(String, String)>,
-    pub(crate) timeouts: switchboard_cluster::node::Timeouts,
+    pub(crate) timeouts: Timeouts,
     pub(crate) limits: EmbeddedLimits,
     pub(crate) join: Option<JoinSpec>,
-    pub(crate) amqp_listener: Option<std::net::SocketAddr>,
+    pub(crate) amqp_listener: Option<SocketAddr>,
 }
 
 impl BrokerConfig {
@@ -130,7 +133,7 @@ impl BrokerConfig {
             node_id: 1,
             expected_nodes: 1,
             bootstrap_credentials: None,
-            timeouts: switchboard_cluster::node::Timeouts::default(),
+            timeouts: Timeouts::default(),
             limits: EmbeddedLimits::default(),
             join: None,
             amqp_listener: None,
@@ -201,7 +204,7 @@ impl BrokerConfig {
     /// `switchboard_cluster::node::Timeouts::default()` — reachable only
     /// via the pub `node` module; the cluster crate root does not
     /// re-export `Timeouts` (cluster/src/lib.rs:25).
-    pub fn timeouts(mut self, t: switchboard_cluster::node::Timeouts) -> Self {
+    pub fn timeouts(mut self, t: Timeouts) -> Self {
         self.timeouts = t;
         self
     }
@@ -226,13 +229,13 @@ impl BrokerConfig {
     /// (`listener::run`, listener/mod.rs:19). Default: none — purely
     /// in-process. The listener runs until [`crate::Broker::stop`] aborts
     /// it.
-    pub fn amqp_listener(mut self, addr: std::net::SocketAddr) -> Self {
+    pub fn amqp_listener(mut self, addr: SocketAddr) -> Self {
         self.amqp_listener = Some(addr);
         self
     }
 
     /// The configured data directory.
-    pub fn data_dir(&self) -> &std::path::Path {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 }

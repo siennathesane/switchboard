@@ -2,6 +2,7 @@
 
 use super::*;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::field::FieldTable;
 
 fn msg(body: &[u8]) -> StoredMessage {
     StoredMessage {
@@ -1063,7 +1064,7 @@ fn release_restores_byte_window() {
 // QueuePolicy parsing + shard janitor arms
 // ---------------------------------------------------------------------
 
-fn policy_from(table: switchboard_wire::field::FieldTable) -> QueuePolicy {
+fn policy_from(table: FieldTable) -> QueuePolicy {
     QueuePolicy::from_arguments(&table)
 }
 
@@ -1071,7 +1072,7 @@ fn policy_from(table: switchboard_wire::field::FieldTable) -> QueuePolicy {
 fn queue_policy_parses_ttl_and_dlx_variants() {
     use switchboard_wire::field::FieldValue;
 
-    let mut t = switchboard_wire::field::FieldTable::new();
+    let mut t = FieldTable::new();
     t.insert("x-message-ttl", FieldValue::SignedLongLong(5000));
     t.insert(
         "x-dead-letter-exchange",
@@ -1086,16 +1087,16 @@ fn queue_policy_parses_ttl_and_dlx_variants() {
     assert_eq!(p.dead_letter_exchange.as_deref(), Some("dlx"));
     assert_eq!(p.dead_letter_routing_key.as_deref(), Some("dlrk"));
 
-    let mut t = switchboard_wire::field::FieldTable::new();
+    let mut t = FieldTable::new();
     t.insert("x-message-ttl", FieldValue::SignedInt(300));
     assert_eq!(policy_from(t).message_ttl_ms, Some(300));
 
-    let mut t = switchboard_wire::field::FieldTable::new();
+    let mut t = FieldTable::new();
     t.insert("x-message-ttl", FieldValue::UnsignedInt(250));
     assert_eq!(policy_from(t).message_ttl_ms, Some(250));
 
     // Unknown args and negative TTLs are ignored.
-    let mut t = switchboard_wire::field::FieldTable::new();
+    let mut t = FieldTable::new();
     t.insert("x-unknown", FieldValue::Boolean(true));
     t.insert("x-message-ttl", FieldValue::SignedInt(-1));
     let ignored = policy_from(t);

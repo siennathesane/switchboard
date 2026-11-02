@@ -25,6 +25,7 @@ use switchboard_embedded::EmbeddedConnection;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 
+use crate::consumer_api::SbConsumer;
 use crate::status::SbStatus;
 use crate::table::Kind;
 use crate::table::{self};
@@ -110,9 +111,7 @@ pub(crate) fn as_channel(ptr: *mut SbChannel) -> Result<&'static SbChannel, SbSt
     Ok(unsafe { &*ptr })
 }
 
-pub(crate) fn as_consumer(
-    ptr: *mut crate::consumer_api::SbConsumer,
-) -> Result<&'static crate::consumer_api::SbConsumer, SbStatus> {
+pub(crate) fn as_consumer(ptr: *mut SbConsumer) -> Result<&'static SbConsumer, SbStatus> {
     table::check(ptr as *mut c_void, Kind::Consumer, "consumer")?;
     Ok(unsafe { &*ptr })
 }

@@ -1,7 +1,12 @@
 //! Tests for `topology.
 
 use super::*;
+use crate::auth::hash_password;
 use crate::error::Level;
+use crate::model::ConnectionId;
+use crate::model::StoredMessage;
+use crate::model::generate_queue_name;
+use std::collections::BTreeMap;
 
 fn state() -> MetaState {
     let mut s = bootstrap();
@@ -15,8 +20,8 @@ impl MetaState {
     }
 }
 
-fn owner() -> crate::model::ConnectionId {
-    crate::model::ConnectionId { node: 1, conn: 1 }
+fn owner() -> ConnectionId {
+    ConnectionId { node: 1, conn: 1 }
 }
 
 fn declare_q(state: &mut MetaState, name: &str, durable: bool) -> MetaReply {
@@ -43,7 +48,7 @@ fn declare_q_full(
     options: QueueOptions,
 ) -> (MetaReply, Vec<MetaEffect>) {
     let resolved = if name.is_empty() {
-        crate::model::generate_queue_name()
+        generate_queue_name()
     } else {
         name.to_string()
     };
@@ -156,7 +161,7 @@ fn queue_declare_reserved_names_and_server_naming() {
 
     // Server-named queues: the caller resolves the name (deterministic
     // replication), apply just accepts it.
-    let generated = crate::model::generate_queue_name();
+    let generated = generate_queue_name();
     assert!(generated.starts_with("amq.gen-"));
     assert_eq!(generated.len(), "amq.gen-".len() + 22);
     let (r, _) = s
@@ -208,7 +213,7 @@ fn exclusive_queue_ownership() {
     assert_eq!(s.vhost("/").unwrap().queues[&name].owner, Some(owner()));
 
     // Another connection: 405 RESOURCE_LOCKED.
-    let other = crate::model::ConnectionId { node: 2, conn: 9 };
+    let other = ConnectionId { node: 2, conn: 9 };
     let e = s
         .apply(&MetaCmd::DeclareQueue {
             vhost: "/".into(),
@@ -472,10 +477,8 @@ fn planted_plaintext_user_entry_never_authenticates() {
     assert!(s.check_credentials("planted", "the-password").is_err());
     assert!(s.check_credentials("planted", "anything").is_err());
     // PHC entries (the only kind normal flows write) still pass.
-    s.users.insert(
-        "real".into(),
-        crate::auth::hash_password("real", "the-password"),
-    );
+    s.users
+        .insert("real".into(), hash_password("real", "the-password"));
     s.check_credentials("real", "the-password").unwrap();
     assert!(s.check_credentials("real", "wrong").is_err());
 }
@@ -498,7 +501,7 @@ fn create_user_stores_phc_only() {
     assert!(!s.users.contains_key("ghost"));
 
     // PHC arm: stored verbatim, byte-identical to what apply received.
-    let phc = crate::auth::hash_password("ghost", "hunter2");
+    let phc = hash_password("ghost", "hunter2");
     s.apply(&MetaCmd::CreateUser {
         name: "ghost".into(),
         password_hash: phc.clone(),
@@ -540,7 +543,7 @@ fn permission_patterns_full_match_not_substring() {
     let mut s = state();
     s.permissions.insert(
         "restricted".into(),
-        std::collections::BTreeMap::from([(
+        BTreeMap::from([(
             "/".into(),
             Permissions {
                 configure: "logs".into(),
@@ -558,10 +561,10 @@ fn permission_patterns_full_match_not_substring() {
 #[test]
 fn forget_node_cascades_its_exclusive_queues() {
     let mut s = state();
-    let dead_owner = crate::model::ConnectionId { node: 7, conn: 3 };
+    let dead_owner = ConnectionId { node: 7, conn: 3 };
     s.apply(&MetaCmd::DeclareQueue {
         vhost: "/".into(),
-        name: crate::model::generate_queue_name(),
+        name: generate_queue_name(),
         passive: false,
         options: QueueOptions {
             exclusive: true,
@@ -653,7 +656,7 @@ fn vhost_isolation() {
 #[test]
 fn set_retained_stores_and_clears() {
     let mut s = state();
-    let msg = crate::model::StoredMessage {
+    let msg = StoredMessage {
         properties: Default::default(),
         body: b"state".to_vec(),
         exchange: "amq.topic".into(),
@@ -1018,7 +1021,7 @@ fn fanout_done_moves_the_id_to_recent_and_out_of_pending() {
         .apply(&MetaCmd::FanoutBegin {
             id,
             vhost: "/".into(),
-            message: crate::model::StoredMessage {
+            message: StoredMessage {
                 properties: Default::default(),
                 body: b"m".to_vec(),
                 exchange: "amq.direct".into(),
@@ -1058,7 +1061,7 @@ fn admin_flag_grant_revoke_and_cascade() {
     );
     s.apply(&MetaCmd::CreateUser {
         name: "boss".into(),
-        password_hash: crate::auth::hash_password("boss", "pw"),
+        password_hash: hash_password("boss", "pw"),
     })
     .unwrap();
 

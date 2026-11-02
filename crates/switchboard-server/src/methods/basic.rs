@@ -17,12 +17,16 @@ use crate::methods::send_frame;
 use crate::methods::shard_call;
 use crate::methods::shard_call_lenient;
 use crate::outbound::OutboundFrame;
+use switchboard_core::shard::GET_HOLDER_NODE;
+use switchboard_core::shard::shard_key;
 use switchboard_core::topology::Perm;
 
 use crate::channel::TxOp as ChannelTxOp;
 use crate::channel::Unacked;
+use crate::methods::inner_vhost;
 use crate::outbound::message_frames;
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
 impl Channel {
     pub(crate) async fn get(
@@ -36,16 +40,13 @@ impl Channel {
         let qi = self.queue_info(node, queue).await?;
         self.assert_queue_ownership(&qi)?;
         let shard = self.queue_shard(node, queue).await?;
-        let get_id = self
-            .sub_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let get_id = self.sub_counter.fetch_add(1, Ordering::Relaxed);
 
         authorize_ch(self, node, Perm::Read, queue)?;
         // Vhost-qualified shard-data key (alert #14); the same key must
         // back the unacked record so a later Ack round-trips to the
         // queue the message actually came from.
-        let data_key =
-            switchboard_core::shard::shard_key(&crate::methods::inner_vhost(self), queue);
+        let data_key = shard_key(&inner_vhost(self), queue);
         let reply = shard_call_lenient(
             node,
             shard,
@@ -75,7 +76,7 @@ impl Channel {
                             shard,
                             seq,
                             sub: Some(SubscriptionId {
-                                node: switchboard_core::shard::GET_HOLDER_NODE,
+                                node: GET_HOLDER_NODE,
                                 sub: get_id,
                             }),
                             consumer_tag: None,
@@ -328,7 +329,7 @@ impl Channel {
                 .collect()
         };
         for (shard, sub, prefetch) in credits {
-            let credit = crate::channel::Channel::initial_credit(prefetch);
+            let credit = Channel::initial_credit(prefetch);
             shard_call(node, shard, ShardCmd::Credit { sub, count: credit }).await?;
         }
         // §3.2.2: recover carries no nowait bit — Recover-Ok is mandatory.

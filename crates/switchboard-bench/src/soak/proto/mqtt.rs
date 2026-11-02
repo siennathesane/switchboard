@@ -20,6 +20,14 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 use crate::soak::Ctx;
 use crate::soak::check;
@@ -128,22 +136,19 @@ enum Ev {
 }
 
 /// Read one MQTT packet with a deadline.
-async fn read_ev(
-    r: &mut (impl AsyncReadExt + Unpin),
-    deadline: tokio::time::Instant,
-) -> Result<Ev, String> {
+async fn read_ev(r: &mut (impl AsyncReadExt + Unpin), deadline: Instant) -> Result<Ev, String> {
     async fn one_byte(
         r: &mut (impl AsyncReadExt + Unpin),
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<u8, String> {
         let mut b = [0u8; 1];
-        tokio::select! {
+        select! {
             x = r.read(&mut b) => {
                 if x.map_err(|e| e.to_string())? == 0 {
                     return Err("closed".into());
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => return Err("mqtt read deadline".into()),
+            _ = sleep_until(deadline) => return Err("mqtt read deadline".into()),
         }
         Ok(b[0])
     }
@@ -165,9 +170,9 @@ async fn read_ev(
     }
     let mut buf = vec![0u8; remaining];
     if remaining > 0 {
-        tokio::select! {
+        select! {
             x = r.read_exact(&mut buf) => { x.map_err(|e| e.to_string())?; }
-            _ = tokio::time::sleep_until(deadline) => return Err("mqtt read deadline".into()),
+            _ = sleep_until(deadline) => return Err("mqtt read deadline".into()),
         }
     }
     let mut pos = 0;
@@ -220,8 +225,8 @@ async fn read_ev(
 // ---------------------------------------------------------------------
 
 struct MqttConn {
-    r: tokio::net::tcp::OwnedReadHalf,
-    w: tokio::net::tcp::OwnedWriteHalf,
+    r: OwnedReadHalf,
+    w: OwnedWriteHalf,
     host: String,
 }
 
@@ -233,14 +238,14 @@ async fn dial(ctx: &Arc<Ctx>, client_id: &str, clean: bool, workload: &str) -> O
         }
         let Some(host) = ctx.endpoints.random().await else {
             ctx.infra_bounce(workload, "-", "no endpoints for mqtt".into());
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             continue;
         };
         match raw_dial(&host, client_id, clean).await {
             Ok(c) => return Some(MqttConn { host, ..c }),
             Err(e) => {
                 ctx.infra_bounce(workload, &host, format!("mqtt connect failed: {e}"));
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -254,11 +259,7 @@ async fn raw_dial(host: &str, client_id: &str, clean: bool) -> Result<MqttConn, 
         .await
         .map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
-    let ev = read_ev(
-        &mut r,
-        tokio::time::Instant::now() + Duration::from_secs(10),
-    )
-    .await?;
+    let ev = read_ev(&mut r, Instant::now() + Duration::from_secs(10)).await?;
     match ev {
         Ev::ConnAck { code: 0, .. } => Ok(MqttConn {
             r,
@@ -332,7 +333,7 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
                 ctx.infra_bounce("mqtt", &c.host, "retained publish failed".into());
                 continue 'conn;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(300)).await;
             let _ = c.send(&disconnect()).await;
             drop(c);
             generation += 1;
@@ -427,7 +428,7 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
         // Publish(our delivery) -> PUBACK it.
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => {
                         let _ = c.send(&disconnect()).await;
                         return;
@@ -575,8 +576,8 @@ pub async fn run_roundtrip(ctx: Arc<Ctx>) {
     }
 }
 
-fn soon(secs: u64) -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(secs)
+fn soon(secs: u64) -> Instant {
+    Instant::now() + Duration::from_secs(secs)
 }
 
 // ---------------------------------------------------------------------
@@ -590,9 +591,9 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
         if !client::alive(&ctx) {
             return;
         }
-        tokio::select! {
+        select! {
             _ = ctx.token.cancelled() => return,
-            _ = tokio::time::sleep(period) => {}
+            _ = sleep(period) => {}
         }
         if !ctx.gate.open() {
             continue;
@@ -675,7 +676,7 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
         }
         let _ = p.send(&disconnect()).await;
         drop(p);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(500)).await;
         // Reconnect: session_present must be true; expect exactly the k
         // offline messages (durable session queue redelivery).
         let Some(mut c) = dial(&ctx, id, false, "mqtt.persist").await else {
@@ -736,11 +737,11 @@ pub async fn run_persist(ctx: Arc<Ctx>) {
     }
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     if ctx.cfg.rates.mqtt > 0.0 {
-        v.push(tokio::spawn(run_roundtrip(ctx.clone())));
-        v.push(tokio::spawn(run_persist(ctx.clone())));
+        v.push(spawn(run_roundtrip(ctx.clone())));
+        v.push(spawn(run_persist(ctx.clone())));
     }
     v
 }

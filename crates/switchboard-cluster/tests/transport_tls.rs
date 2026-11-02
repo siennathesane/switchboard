@@ -3,7 +3,9 @@
 //! anchor. Covers the rustls (aws-lc-rs) accept/connect paths of the
 //! internal protocol and the client-listener TLS arm.
 
+use std::io::ErrorKind;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::CertifiedKey;
 use rcgen::generate_simple_self_signed;
@@ -32,20 +34,18 @@ async fn cluster_transport_tls_roundtrip() {
     // Server side: acceptor from the generated identity.
     let acceptor = tls_acceptor(&cert_pem, &key_pem).expect("acceptor");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let server = tokio::spawn(async move {
+    let server = spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let mut accepted = switchboard_cluster::transport::accept(sock, Some(&acceptor))
-            .await
-            .expect("tls accept");
+        let mut accepted = accept(sock, Some(&acceptor)).await.expect("tls accept");
         let frame = accepted.read_frame_full().await.unwrap();
         accepted.write_frame(&frame).await.unwrap();
     });
 
     // Client side: trust ONLY the generated cert (product helper).
     let _ = cert_der;
-    let connector = switchboard_cluster::transport::tls_connector(&cert_pem).expect("connector");
+    let connector = tls_connector(&cert_pem).expect("connector");
     let channel = PeerChannel::new(Some(connector), "localhost".into());
 
     let mut conn = channel.connect(&addr).await.expect("tls connect");
@@ -68,14 +68,14 @@ async fn cluster_transport_tls_client_rejects_unknown_ca() {
 
     // The client trusts a DIFFERENT self-signed cert.
     let (_other_pem, _other_key, _other_der) = self_signed(&vec!["other".to_string()]);
-    let connector = switchboard_cluster::transport::tls_connector(&_other_pem).expect("connector");
+    let connector = tls_connector(&_other_pem).expect("connector");
     let channel = PeerChannel::new(Some(connector), "localhost".into());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let server = tokio::spawn(async move {
+    let server = spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let _ = switchboard_cluster::transport::accept(sock, Some(&acceptor)).await;
+        let _ = accept(sock, Some(&acceptor)).await;
     });
 
     // The TLS handshake must FAIL: the presented cert chains to an
@@ -86,7 +86,7 @@ async fn cluster_transport_tls_client_rejects_unknown_ca() {
         .err()
         .expect("handshake must fail");
     assert!(
-        err.to_string().contains("certificate") || err.kind() == std::io::ErrorKind::InvalidData,
+        err.to_string().contains("certificate") || err.kind() == ErrorKind::InvalidData,
         "unexpected error: {err}"
     );
     server.await.unwrap();
@@ -94,6 +94,12 @@ async fn cluster_transport_tls_client_rejects_unknown_ca() {
 
 use switchboard_cluster::transport::PeerChannel;
 use switchboard_cluster::transport::PeerConn;
+use switchboard_cluster::transport::accept;
+use switchboard_cluster::transport::tls_connector;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::spawn;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tls_peer_channel_send_recv_with_self_signed_trust() {
@@ -103,15 +109,13 @@ async fn tls_peer_channel_send_recv_with_self_signed_trust() {
     let (cert_pem, key_pem, cert_der) = self_signed(&names);
     let acceptor = tls_acceptor(&cert_pem, &key_pem).unwrap();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     // Two frames exchanged back-to-back over one TLS connection.
-    let server = tokio::spawn(async move {
+    let server = spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let mut accepted = switchboard_cluster::transport::accept(sock, Some(&acceptor))
-            .await
-            .unwrap();
+        let mut accepted = accept(sock, Some(&acceptor)).await.unwrap();
         let f1 = accepted.read_frame_full().await.unwrap();
         accepted.write_frame(&f1).await.unwrap();
         let f2 = accepted.read_frame_full().await.unwrap();
@@ -146,13 +150,11 @@ async fn tls_peer_channel_send_recv_with_self_signed_trust() {
 async fn oversized_internal_frames_are_rejected() {
     // A length prefix beyond the internal frame limit: the peer closes
     // the connection instead of buffering forever.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let server = tokio::spawn(async move {
+    let server = spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let mut accepted = switchboard_cluster::transport::accept(sock, None)
-            .await
-            .expect("accept");
+        let mut accepted = accept(sock, None).await.expect("accept");
         // The Debug form distinguishes plain and TLS accepts.
         let dbg = format!("{accepted:?}");
         assert!(dbg.starts_with("Accepted("), "{dbg}");
@@ -163,12 +165,12 @@ async fn oversized_internal_frames_are_rejected() {
     // Raw socket (no framing helper): the test writes the length prefix
     // itself.
     use tokio::io::AsyncWriteExt;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     // Announce an absurd frame: 0x7FFF_FFFF bytes (LE length prefix).
     sock.write_all(&[0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
     sock.flush().await.unwrap();
     // Keep the socket open; the server hangs up.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
     let _ = sock.shutdown().await;
     server.await.unwrap();
 }

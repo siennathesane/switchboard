@@ -543,7 +543,7 @@ mod ack_encoding_tests {
             delivery_tag: 3,
             multiple: false,
         };
-        let mut e = crate::wireio::Encoder::new();
+        let mut e = Encoder::new();
         m.encode(&mut e);
         let bytes = e.finish();
         // class 60 + method 80 + tag(8) + flag octet
@@ -559,11 +559,11 @@ mod ack_encoding_tests {
             delivery_tag: 9,
             multiple: true,
         };
-        let mut e = crate::wireio::Encoder::new();
+        let mut e = Encoder::new();
         m.encode(&mut e);
         let bytes = e.finish();
         assert_eq!(bytes[12], 0x01);
-        let mut d = crate::wireio::Decoder::new(&bytes);
+        let mut d = Decoder::new(&bytes);
         let back = Method::decode(&mut d).unwrap();
         assert_eq!(
             back,

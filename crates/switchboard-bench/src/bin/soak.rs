@@ -3,9 +3,11 @@
 //! Deployment 1↔9 continuously — and fail on the first client-visible
 //! error. See `bench/SOAK.md`.
 
+use std::process::exit;
 use std::time::Duration;
 
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use clap::Parser;
 use switchboard_bench::soak::ScaleMode;
@@ -110,14 +112,14 @@ async fn main() -> Result<()> {
     }
     cfg.report_every = parse_duration(&args.report_every)?;
     for r in &args.rate {
-        cfg.rates.apply(r).map_err(|e| anyhow::anyhow!(e))?;
+        cfg.rates.apply(r).map_err(|e| anyhow!(e))?;
     }
     let leak: Vec<f64> = args
         .leak
         .split(',')
         .map(|v| v.trim().parse())
         .collect::<Result<_, _>>()
-        .map_err(|_| anyhow::anyhow!("--leak wants rss_mb_h,fds_h,disk_mb_h"))?;
+        .map_err(|_| anyhow!("--leak wants rss_mb_h,fds_h,disk_mb_h"))?;
     if leak.len() != 3 {
         bail!("--leak wants rss_mb_h,fds_h,disk_mb_h");
     }
@@ -150,7 +152,7 @@ async fn main() -> Result<()> {
 
     let report = run(cfg).await;
     if !report.passed {
-        std::process::exit(1);
+        exit(1);
     }
     Ok(())
 }

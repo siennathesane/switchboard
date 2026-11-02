@@ -1,5 +1,9 @@
 //! MQTT 3.1.1 packet codec (the subset the bridge speaks).
 
+use crate::protocols::PREAUTH_MAX_FRAME_BYTES;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
 use tokio::io::AsyncRead;
 
 /// MQTT control packet types.
@@ -241,7 +245,7 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Packet, usize)>, String> {
 
 /// Read one packet straight off a stream. `Ok(None)` = clean EOF between
 /// packets.
-pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Packet>> {
+pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> IoResult<Option<Packet>> {
     use tokio::io::AsyncReadExt;
     let mut head = [0u8; 1];
     // First byte.
@@ -258,8 +262,8 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
     loop {
         let mut b = [0u8; 1];
         if r.read(&mut b).await? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
                 "mqtt: eof in remaining length",
             ));
         }
@@ -270,8 +274,8 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
             break;
         }
         if multiplier > 128 * 128 * 128 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(Error::new(
+                ErrorKind::InvalidData,
                 "mqtt: remaining length too long",
             ));
         }
@@ -280,12 +284,12 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
     // 4-byte varint announces up to 268,435,455 bytes (~256 MiB), and
     // this read covers the CONNECT that precedes any authentication.
     // Cap the allocation before it happens (code-scanning alert #12).
-    if remaining > crate::protocols::PREAUTH_MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+    if remaining > PREAUTH_MAX_FRAME_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             format!(
                 "mqtt: remaining length {remaining} exceeds the pre-auth frame cap {}",
-                crate::protocols::PREAUTH_MAX_FRAME_BYTES
+                PREAUTH_MAX_FRAME_BYTES
             ),
         ));
     }
@@ -294,13 +298,9 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opt
     let mut full = vec![head[0]];
     full.extend_from_slice(&varint);
     full.extend_from_slice(&body);
-    let parsed =
-        parse(&full).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let parsed = parse(&full).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
     match parsed {
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "mqtt: short packet",
-        )),
+        None => Err(Error::new(ErrorKind::InvalidData, "mqtt: short packet")),
         Some((p, _)) => {
             let _ = (ptype, flags);
             Ok(Some(p))
@@ -652,6 +652,7 @@ mod parse_edge_tests {
 #[cfg(test)]
 mod edge_tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[test]
     fn truncated_varint_needs_more_bytes() {
@@ -701,14 +702,14 @@ mod edge_tests {
     async fn read_packet_reports_eof_inside_the_varint() {
         let mut r: &[u8] = &[0xC0, 0x80];
         let err = read_packet(&mut r).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
     async fn read_packet_rejects_overlong_varints() {
         let mut r: &[u8] = &[0xC0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
         let err = read_packet(&mut r).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("too long"));
     }
 
@@ -728,6 +729,8 @@ mod edge_tests {
 #[cfg(test)]
 mod preauth_cap_tests {
     use super::*;
+    use crate::protocols::PREAUTH_MAX_FRAME_BYTES;
+    use std::io::ErrorKind;
 
     #[tokio::test]
     async fn read_packet_rejects_oversized_remaining_length_before_allocating() {
@@ -735,13 +738,13 @@ mod preauth_cap_tests {
         // ~256 MiB): must fail fast with InvalidData, never allocate.
         let mut r: &[u8] = &[0x10, 0xFF, 0xFF, 0xFF, 0x7F];
         let err = read_packet(&mut r).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("pre-auth frame cap"), "{err}");
     }
 
     #[tokio::test]
     async fn read_packet_rejects_remaining_length_just_above_the_cap() {
-        let cap = crate::protocols::PREAUTH_MAX_FRAME_BYTES;
+        let cap = PREAUTH_MAX_FRAME_BYTES;
         // Split (cap + 1) into a full 4-byte varint.
         let over = (cap + 1) as u32;
         let mut r: &[u8] = &[
@@ -752,7 +755,7 @@ mod preauth_cap_tests {
             ((over >> 21) & 0x7F) as u8,
         ];
         let err = read_packet(&mut r).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]

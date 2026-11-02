@@ -3,6 +3,8 @@
 //! HTTP health probe), selected by sniffing the first bytes — with or
 //! without TLS in front.
 
+use std::io::Error;
+use std::io::Result as IoResult;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -10,11 +12,13 @@ use tracing::info;
 use tracing::warn;
 
 use switchboard_cluster::ClusterNode;
+use tokio::spawn;
 
 use crate::channel::ConnectionLimits;
 use crate::protocols::ProtocolConfig;
 use crate::protocols::serve_client;
 use crate::tls::TlsIdentity;
+use crate::tls::acceptor;
 
 /// Run a client-facing listener until the process exits.
 pub async fn run(
@@ -23,13 +27,13 @@ pub async fn run(
     limits: ConnectionLimits,
     tls: Option<TlsIdentity>,
     protocols: ProtocolConfig,
-) -> std::io::Result<()> {
+) -> IoResult<()> {
     let acceptor = match &tls {
-        Some(id) => match crate::tls::acceptor(id) {
+        Some(id) => match acceptor(id) {
             Ok(a) => Some(a),
             Err(e) => {
                 warn!(err = %e, "tls disabled: bad identity");
-                return Err(std::io::Error::other(e));
+                return Err(Error::other(e));
             }
         },
         None => None,
@@ -61,7 +65,7 @@ pub async fn run(
         match &acceptor {
             Some(a) => {
                 let a = a.clone();
-                tokio::spawn(async move {
+                spawn(async move {
                     match a.accept(socket).await {
                         Ok(tls) => {
                             let _ = serve_client(tls, node, limits, protocols).await;
@@ -71,7 +75,7 @@ pub async fn run(
                 });
             }
             None => {
-                tokio::spawn(async move {
+                spawn(async move {
                     let _ = serve_client(socket, node, limits, protocols).await;
                 });
             }

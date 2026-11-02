@@ -5,6 +5,7 @@
 
 use serde::Deserialize;
 use serde::Serialize;
+use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::field::FieldValue;
 
@@ -110,7 +111,7 @@ pub struct Binding {
 /// bodies" (§3.1.1) — we store them verbatim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredMessage {
-    pub properties: switchboard_wire::BasicProperties,
+    pub properties: BasicProperties,
     pub body: Vec<u8>,
     /// The exchange the publisher addressed (replayed in Deliver/Get-Ok).
     pub exchange: String,
@@ -188,6 +189,7 @@ pub fn flag_arg(args: &FieldTable, name: &str) -> Option<bool> {
 #[cfg(test)]
 mod kind_tests {
     use super::*;
+    use crate::model::flag_arg;
 
     #[test]
     fn from_str_accepts_all_kinds_and_rejects_other() {
@@ -218,8 +220,8 @@ mod kind_tests {
         let mut t = FieldTable::new();
         t.insert("flag", FieldValue::Boolean(true));
         t.insert("num", FieldValue::SignedInt(3));
-        assert_eq!(crate::model::flag_arg(&t, "flag"), Some(true));
-        assert_eq!(crate::model::flag_arg(&t, "num"), None);
-        assert_eq!(crate::model::flag_arg(&t, "missing"), None);
+        assert_eq!(flag_arg(&t, "flag"), Some(true));
+        assert_eq!(flag_arg(&t, "num"), None);
+        assert_eq!(flag_arg(&t, "missing"), None);
     }
 }

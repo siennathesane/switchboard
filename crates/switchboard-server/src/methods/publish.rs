@@ -18,11 +18,21 @@ use crate::outbound::OutboundFrame;
 use switchboard_core::topology::Perm;
 
 use crate::channel::TxOp as ChannelTxOp;
+use crate::channel::stored_message;
+use crate::methods::ce;
 use crate::outbound::message_frames;
+use switchboard_cluster::now_ms;
+use switchboard_core::error::Level;
+use switchboard_core::model::ExchangeKind;
 use switchboard_core::routing::route;
 use switchboard_core::shard::ShardReply;
+use switchboard_core::shard::shard_key;
+use switchboard_core::tempo::scale;
 use switchboard_core::topology::VhostView;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::constants::reply::UNEXPECTED_FRAME;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 impl Channel {
     pub async fn publish(
@@ -47,9 +57,9 @@ impl Channel {
             ),
             _ => {
                 return Err(BrokerError {
-                    code: switchboard_wire::constants::reply::UNEXPECTED_FRAME,
+                    code: UNEXPECTED_FRAME,
                     text: "content completed without Basic.Publish".into(),
-                    level: switchboard_core::error::Level::Connection,
+                    level: Level::Connection,
                     class_id: 0,
                     method_id: 0,
                 });
@@ -67,7 +77,7 @@ impl Channel {
             .vhosts
             .get(&inner_vhost(self))
             .and_then(|v| v.exchanges.get(&exchange))
-            .map(|e| e.kind == switchboard_core::model::ExchangeKind::Topic)
+            .map(|e| e.kind == ExchangeKind::Topic)
             .unwrap_or(false);
         if topic_exchange {
             authorize_ch(self, node, Perm::Write, &routing_key)?;
@@ -84,8 +94,7 @@ impl Channel {
         // retries within a bounded window before concluding "unroutable".
         // Treating that window as unroutable confirmed-and-dropped
         // messages (the first-publish loss the scale test caught).
-        let deadline = tokio::time::Instant::now()
-            + switchboard_core::tempo::scale(Duration::from_millis(750));
+        let deadline = Instant::now() + scale(Duration::from_millis(750));
         let (vhost, destinations) = loop {
             let destinations = route(
                 &VhostView { vhost: &vhost },
@@ -93,7 +102,7 @@ impl Channel {
                 &routing_key,
                 &props,
             );
-            if !destinations.is_empty() || tokio::time::Instant::now() >= deadline {
+            if !destinations.is_empty() || Instant::now() >= deadline {
                 break (vhost, destinations);
             }
             node.refresh_topology().await;
@@ -103,7 +112,7 @@ impl Channel {
                     return Err(BrokerError::invalid_path("vhost vanished").channel_level());
                 }
             }
-            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(25))).await;
+            sleep(scale(Duration::from_millis(25))).await;
         };
 
         if destinations.is_empty() {
@@ -142,7 +151,7 @@ impl Channel {
                 first.shard,
                 ShardCmd::Stats {
                     // Vhost-qualified shard-data key (alert #14).
-                    queue: switchboard_core::shard::shard_key(&inner_vhost(self), &destinations[0]),
+                    queue: shard_key(&inner_vhost(self), &destinations[0]),
                 },
             )
             .await?;
@@ -161,8 +170,7 @@ impl Channel {
             }
         }
 
-        let message =
-            crate::channel::stored_message(exchange.clone(), routing_key.clone(), props, body);
+        let message = stored_message(exchange.clone(), routing_key.clone(), props, body);
 
         // In tx mode the publishes join the transaction buffer (§2.2.9);
         // confirms fire at commit.
@@ -182,7 +190,7 @@ impl Channel {
                 tx.ops.push(ChannelTxOp::Publish {
                     // The buffered enqueue must land on the same
                     // qualified entry the direct path uses.
-                    queue: switchboard_core::shard::shard_key(&vhost_name, q),
+                    queue: shard_key(&vhost_name, q),
                     shard,
                     message: message.clone(),
                     confirm_seq: (confirm_seq != 0).then_some(confirm_seq),
@@ -214,7 +222,7 @@ impl Channel {
             if multi.len() > 1 {
                 node.fanout_publish(inner_vhost(self).to_string(), message.clone(), multi)
                     .await
-                    .map_err(crate::methods::ce)?;
+                    .map_err(ce)?;
                 self.confirm_fire(confirm_seq);
                 return Ok(());
             }
@@ -228,9 +236,9 @@ impl Channel {
                 shard,
                 ShardCmd::Enqueue {
                     // Vhost-qualified shard-data key (alert #14).
-                    queue: switchboard_core::shard::shard_key(&inner_vhost(self), q),
+                    queue: shard_key(&inner_vhost(self), q),
                     message: message.clone(),
-                    at_ms: switchboard_cluster::now_ms(),
+                    at_ms: now_ms(),
                 },
             )
             .await?;

@@ -12,17 +12,27 @@
 mod gateway_support;
 mod support;
 
+use std::env::remove_var;
+use std::env::set_var;
+use std::env::var;
+use std::time::Duration;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// Each test boots a full broker; running them in parallel saturates CPU
 /// and skews raft timing, so they are serialized behind a shared lock
 /// (same discipline as the gateway suite).
-static GATEWAY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static GATEWAY_LOCK: Mutex<()> = Mutex::const_new(());
 
-async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+async fn lock() -> MutexGuard<'static, ()> {
     GATEWAY_LOCK.lock().await
 }
 
@@ -30,12 +40,12 @@ async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
 /// verified in this process (the gateway support module does not set
 /// them; see support::init_tracing for the rationale).
 fn light_hashing() {
-    if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+    if var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
         unsafe {
-            std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+            set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
         }
         unsafe {
-            std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+            set_var("SWITCHBOARD_ARGON2_T", "1");
         }
     }
 }
@@ -73,16 +83,12 @@ async fn http_request(
     if let Some(b) = body {
         req.push_str(b);
     }
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(req.as_bytes()).await.unwrap();
     sock.flush().await.unwrap();
     let mut buf = Vec::new();
     // The server answers `Connection: close` and shuts down; read to EOF.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        sock.read_to_end(&mut buf),
-    )
-    .await;
+    let _ = timeout(Duration::from_secs(20), sock.read_to_end(&mut buf)).await;
     let text = String::from_utf8_lossy(&buf).into_owned();
     let status = text
         .split_whitespace()
@@ -101,7 +107,7 @@ async fn api_get(path: &str, auth: Option<&str>) -> (u16, String) {
         if code == 200 || code == 403 || attempt == 39 {
             return (code, text);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
     unreachable!()
 }
@@ -150,7 +156,7 @@ async fn connect_and_open_creds(
             Ok(c) => return Ok(c),
             Err(e) => {
                 last = e;
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(200)).await;
             }
         }
     }
@@ -177,7 +183,7 @@ async fn connect_once(
     c.send_method(
         0,
         &Method::ConnectionStartOk {
-            client_properties: switchboard_wire::field::FieldTable::new(),
+            client_properties: FieldTable::new(),
             mechanism: "PLAIN".into(),
             response,
             locale: "en_US".into(),
@@ -1001,7 +1007,7 @@ async fn admin_api_strict_mode_makes_the_flag_the_only_path() {
     // per request, so flipping it while holding the suite lock is
     // visible immediately (and always reset on the way out).
     unsafe {
-        std::env::set_var("SWITCHBOARD_ADMIN_STRICT", "1");
+        set_var("SWITCHBOARD_ADMIN_STRICT", "1");
     }
     let (code, text) = api_get("/api/users", Some(&legacy)).await;
     assert_eq!(
@@ -1012,7 +1018,7 @@ async fn admin_api_strict_mode_makes_the_flag_the_only_path() {
     let (code, text) = api_get("/api/users", Some(&admin)).await;
     assert_eq!(code, 200, "flagged user refused under strict mode: {text}");
     unsafe {
-        std::env::remove_var("SWITCHBOARD_ADMIN_STRICT");
+        remove_var("SWITCHBOARD_ADMIN_STRICT");
     }
     // …and removing the variable restores grandfathering.
     let (code, text) = api_get("/api/users", Some(&legacy)).await;

@@ -9,11 +9,19 @@
 //! only the leader acts on them.
 
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::io::Cursor;
+use std::io::Error as IoError;
+use std::mem::take;
+use std::str::from_utf8;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use crate::typ::BrokerCommand;
 
+use bincode::deserialize;
+use bincode::serialize;
 use openraft::AnyError;
 use openraft::Entry;
 use openraft::LogId;
@@ -25,12 +33,28 @@ use openraft::StoredMembership;
 use openraft::raft::ClientWriteResponse;
 use openraft::storage::RaftStateMachine;
 use openraft::storage::Snapshot;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
+use switchboard_core::model::SubscriptionId;
+use switchboard_core::shard::QueueData;
+use switchboard_core::shard::QueueMessage;
+use switchboard_core::shard::QueuePolicy;
+use switchboard_core::shard::ShardCmd;
+use switchboard_core::shard::ShardEffect;
+use switchboard_core::shard::ShardReply;
+use switchboard_core::shard::ShardState;
+use switchboard_core::shard::ShardStoreOp;
+use switchboard_core::shard::Subscription;
+use switchboard_core::shard::TxId;
+use switchboard_core::shard::TxOp;
+use switchboard_core::topology::MetaState;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::debug;
 
 use crate::kv::RocksKv;
 use crate::typ::BrokerReply;
 use crate::typ::BrokerState;
+use crate::typ::DedupLog;
 use crate::typ::Effect;
 use crate::typ::NodeId;
 use crate::typ::SwitchboardTypeConfig;
@@ -97,13 +121,13 @@ fn parse_msg_key(key: &[u8], prefix: &[u8]) -> Option<(String, u64)> {
     }
     let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
     let queue = rest.get(2..2 + len)?;
-    let queue = std::str::from_utf8(queue).ok()?.to_string();
+    let queue = from_utf8(queue).ok()?.to_string();
     let tail = rest.get(2 + len..)?;
     let tail = tail.strip_prefix(b"/".as_slice())?;
     if tail.len() != 20 {
         return None;
     }
-    let seq: u64 = std::str::from_utf8(tail).ok()?.parse().ok()?;
+    let seq: u64 = from_utf8(tail).ok()?.parse().ok()?;
     Some((queue, seq))
 }
 
@@ -113,18 +137,18 @@ fn parse_msg_key(key: &[u8], prefix: &[u8]) -> Option<(String, u64)> {
 /// whole state, so this mirrors the shape with `msgs` present.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct BrokerStateImage {
-    meta: switchboard_core::topology::MetaState,
+    meta: MetaState,
     shard: ShardStateImage,
     bootstrapped: bool,
-    dedup: crate::typ::DedupLog,
+    dedup: DedupLog,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ShardStateImage {
     queues: BTreeMap<String, QueueImage>,
-    subs: BTreeMap<switchboard_core::model::SubscriptionId, switchboard_core::shard::Subscription>,
-    prepared: BTreeMap<switchboard_core::shard::TxId, Vec<switchboard_core::shard::TxOp>>,
-    prepared_at_ms: BTreeMap<switchboard_core::shard::TxId, u64>,
+    subs: BTreeMap<SubscriptionId, Subscription>,
+    prepared: BTreeMap<TxId, Vec<TxOp>>,
+    prepared_at_ms: BTreeMap<TxId, u64>,
     now: u64,
     last_ms: u64,
 }
@@ -132,8 +156,8 @@ struct ShardStateImage {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct QueueImage {
     next_seq: u64,
-    msgs: BTreeMap<u64, switchboard_core::shard::QueueMessage>,
-    policy: switchboard_core::shard::QueuePolicy,
+    msgs: BTreeMap<u64, QueueMessage>,
+    policy: QueuePolicy,
 }
 
 impl BrokerStateImage {
@@ -170,13 +194,13 @@ impl BrokerStateImage {
     fn into_state(self) -> BrokerState {
         let mut state = BrokerState {
             meta: self.meta,
-            shard: switchboard_core::shard::ShardState {
+            shard: ShardState {
                 queues: self
                     .shard
                     .queues
                     .into_iter()
                     .map(|(name, q)| {
-                        let mut qd = switchboard_core::shard::QueueData::new(q.policy);
+                        let mut qd = QueueData::new(q.policy);
                         qd.next_seq = q.next_seq;
                         qd.msgs = q.msgs;
                         qd.reindex();
@@ -198,13 +222,13 @@ impl BrokerStateImage {
     }
 }
 
-fn any_err(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
+fn any_err(e: impl Error + Send + Sync + 'static) -> AnyError {
     AnyError::new(&e)
 }
 
 fn io_fail(
     verb: openraft::ErrorVerb,
-    e: impl std::error::Error + Send + Sync + 'static,
+    e: impl Error + Send + Sync + 'static,
 ) -> StorageError<NodeId> {
     StorageIOError::new(
         openraft::ErrorSubject::StateMachine,
@@ -214,8 +238,8 @@ fn io_fail(
     .into()
 }
 
-fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
-    bincode::serialize(v).map_err(|e| {
+fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
+    serialize(v).map_err(|e| {
         StorageIOError::new(
             openraft::ErrorSubject::Store,
             openraft::ErrorVerb::Write,
@@ -226,7 +250,7 @@ fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
 }
 
 fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<NodeId>> {
-    bincode::deserialize(bytes).map_err(|e| {
+    deserialize(bytes).map_err(|e| {
         StorageIOError::new(
             openraft::ErrorSubject::Store,
             openraft::ErrorVerb::Read,
@@ -242,7 +266,7 @@ fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<NodeId>> {
 pub struct SnapshotBuilder {
     kv: RocksKv,
     prefix: Vec<u8>,
-    state: Arc<std::sync::Mutex<BrokerState>>,
+    state: Arc<Mutex<BrokerState>>,
 }
 
 impl RaftSnapshotBuilder<SwitchboardTypeConfig> for SnapshotBuilder {
@@ -295,14 +319,14 @@ impl RaftSnapshotBuilder<SwitchboardTypeConfig> for SnapshotBuilder {
 /// `GET /stats` so a live cluster can prove where messages go.
 #[derive(Debug, Default)]
 pub struct SmCounters {
-    pub enqueued: std::sync::atomic::AtomicU64,
-    pub handed_out: std::sync::atomic::AtomicU64,
-    pub acked: std::sync::atomic::AtomicU64,
-    pub noack_removed: std::sync::atomic::AtomicU64,
-    pub released: std::sync::atomic::AtomicU64,
-    pub purged: std::sync::atomic::AtomicU64,
-    pub expired: std::sync::atomic::AtomicU64,
-    pub deleted: std::sync::atomic::AtomicU64,
+    pub enqueued: AtomicU64,
+    pub handed_out: AtomicU64,
+    pub acked: AtomicU64,
+    pub noack_removed: AtomicU64,
+    pub released: AtomicU64,
+    pub purged: AtomicU64,
+    pub expired: AtomicU64,
+    pub deleted: AtomicU64,
 }
 
 impl SmCounters {
@@ -327,15 +351,15 @@ impl SmCounters {
 pub struct StateMachine {
     kv: RocksKv,
     prefix: Vec<u8>,
-    state: Arc<std::sync::Mutex<BrokerState>>,
+    state: Arc<Mutex<BrokerState>>,
     /// Message-lifecycle counters for this group's state machine. Arc:
     /// every clone of this struct shares one tally.
     pub counters: Arc<SmCounters>,
-    last_applied: Arc<std::sync::Mutex<Option<LogId<NodeId>>>>,
+    last_applied: Arc<Mutex<Option<LogId<NodeId>>>>,
     /// Last applied membership, persisted so a restart restores the
     /// group with its voter set intact (openraft reads it through
     /// `applied_state`; an empty answer would strand the group).
-    membership: Arc<std::sync::Mutex<StoredMembership<NodeId, openraft::impls::BasicNode>>>,
+    membership: Arc<Mutex<StoredMembership<NodeId, openraft::impls::BasicNode>>>,
     /// Effects from applies; drained by the group's leader-side pump.
     pub effects_tx: UnboundedSender<Effect>,
 }
@@ -391,10 +415,10 @@ impl StateMachine {
             let Some((queue, seq)) = parse_msg_key(&k, &prefix) else {
                 return Err(io_fail(
                     openraft::ErrorVerb::Read,
-                    std::io::Error::other("bad message key"),
+                    IoError::other("bad message key"),
                 ));
             };
-            let m: switchboard_core::shard::QueueMessage = de(&v)?;
+            let m: QueueMessage = de(&v)?;
             match state.shard.queues.get_mut(&queue) {
                 Some(q) => {
                     q.msgs.insert(seq, m);
@@ -424,9 +448,9 @@ impl StateMachine {
             kv,
             prefix,
             counters: Arc::new(SmCounters::default()),
-            state: Arc::new(std::sync::Mutex::new(state)),
-            last_applied: Arc::new(std::sync::Mutex::new(last_applied)),
-            membership: Arc::new(std::sync::Mutex::new(membership)),
+            state: Arc::new(Mutex::new(state)),
+            last_applied: Arc::new(Mutex::new(last_applied)),
+            membership: Arc::new(Mutex::new(membership)),
             effects_tx,
         })
     }
@@ -439,7 +463,7 @@ impl StateMachine {
     /// Cheap copy of the meta half only (topology refreshes run on every
     /// reconcile tick and fanout poll; cloning the shard's message store
     /// for each would be the very cost this design removed).
-    pub fn read_meta(&self) -> switchboard_core::topology::MetaState {
+    pub fn read_meta(&self) -> MetaState {
         self.state.lock().expect("sm lock").meta.clone()
     }
 
@@ -447,7 +471,7 @@ impl StateMachine {
     /// state lock without cloning the shard state. Runs once per
     /// cross-node delivered message; a full-state clone here is a
     /// per-message stall proportional to every queued message.
-    pub fn sub_owner(&self, sub: switchboard_core::model::SubscriptionId) -> Option<u64> {
+    pub fn sub_owner(&self, sub: SubscriptionId) -> Option<u64> {
         self.state
             .lock()
             .expect("sm lock")
@@ -475,7 +499,7 @@ impl StateMachine {
 
     /// Identity of the shared state cell (diagnostics).
     pub fn state_ptr(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.state) as usize
+        Arc::as_ptr(&self.state) as usize
     }
 
     pub fn last_applied(&self) -> Option<LogId<NodeId>> {
@@ -508,22 +532,19 @@ fn count_one(c: &SmCounters, cmd: &BrokerCommand, reply: &BrokerReply, effects: 
     };
     if let BrokerCommand::Shard(shard) = cmd {
         match shard {
-            switchboard_core::shard::ShardCmd::Enqueue { .. } => {
+            ShardCmd::Enqueue { .. } => {
                 c.enqueued.fetch_add(1, Ordering::Relaxed);
             }
-            switchboard_core::shard::ShardCmd::Ack { queue: _, seqs } => {
+            ShardCmd::Ack { queue: _, seqs } => {
                 c.acked.fetch_add(seqs.len() as u64, Ordering::Relaxed);
             }
-            switchboard_core::shard::ShardCmd::Purge { queue: _ } => {
-                if let BrokerReply::Shard(switchboard_core::shard::ShardReply::Purged {
-                    message_count,
-                }) = reply
-                {
+            ShardCmd::Purge { queue: _ } => {
+                if let BrokerReply::Shard(ShardReply::Purged { message_count }) = reply {
                     c.purged
                         .fetch_add(u64::from(*message_count), Ordering::Relaxed);
                 }
             }
-            switchboard_core::shard::ShardCmd::DeleteQueueData { queue: _ } => {
+            ShardCmd::DeleteQueueData { queue: _ } => {
                 // The messages went with the queue; the state is already
                 // applied, so there is nothing countable here.
                 c.deleted.fetch_add(0, Ordering::Relaxed);
@@ -532,10 +553,7 @@ fn count_one(c: &SmCounters, cmd: &BrokerCommand, reply: &BrokerReply, effects: 
         }
     }
     for eff in effects {
-        if let Effect::Shard(switchboard_core::shard::ShardEffect::MessageReady {
-            deleted, ..
-        }) = eff
-        {
+        if let Effect::Shard(ShardEffect::MessageReady { deleted, .. }) = eff {
             if *deleted {
                 c.noack_removed.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -543,7 +561,7 @@ fn count_one(c: &SmCounters, cmd: &BrokerCommand, reply: &BrokerReply, effects: 
             }
         }
     }
-    if let BrokerReply::Shard(switchboard_core::shard::ShardReply::Released { released }) = reply {
+    if let BrokerReply::Shard(ShardReply::Released { released }) = reply {
         c.released
             .fetch_add(u64::from(*released), Ordering::Relaxed);
     }
@@ -589,9 +607,9 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
                         // (the entry is consumed either way). `Put`
                         // resolves the message's current in-memory state,
                         // so no body is copied here.
-                        for op in std::mem::take(&mut st.shard.store) {
+                        for op in take(&mut st.shard.store) {
                             match op {
-                                switchboard_core::shard::ShardStoreOp::Put { queue, seq } => {
+                                ShardStoreOp::Put { queue, seq } => {
                                     if let Some(m) =
                                         st.shard.queues.get(&queue).and_then(|q| q.msgs.get(&seq))
                                     {
@@ -599,10 +617,10 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
                                             .push((msg_key(&self.prefix, &queue, seq), ser(m)?));
                                     }
                                 }
-                                switchboard_core::shard::ShardStoreOp::Del { queue, seq } => {
+                                ShardStoreOp::Del { queue, seq } => {
                                     msg_dels.push(msg_key(&self.prefix, &queue, seq));
                                 }
-                                switchboard_core::shard::ShardStoreOp::DelQueue { queue } => {
+                                ShardStoreOp::DelQueue { queue } => {
                                     del_queues.push(queue);
                                 }
                             }
@@ -625,7 +643,7 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
                     reply
                 }
                 openraft::EntryPayload::Membership(mem) => {
-                    tracing::debug!(?mem, "membership change applied");
+                    debug!(?mem, "membership change applied");
                     let stored: StoredMembership<NodeId, openraft::impls::BasicNode> =
                         StoredMembership::new(Some(log_id), (*mem).clone());
                     *self.membership.lock().expect("sm lock") = stored;
@@ -736,13 +754,20 @@ impl RaftStateMachine<SwitchboardTypeConfig> for StateMachine {
 mod tests {
     use super::*;
     use crate::typ::BrokerCommand;
+    use switchboard_core::auth::hash_password;
+    use switchboard_core::model::ConnectionId;
+    use switchboard_core::model::StoredMessage;
+    use switchboard_core::model::SubscriptionId;
     use switchboard_core::shard::ShardCmd;
+    use switchboard_core::shard::ShardEffect;
     use switchboard_core::topology::MetaCmd;
+    use switchboard_core::topology::MetaReply;
     use switchboard_wire::BasicProperties;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn sm(name: &str) -> StateMachine {
         let kv = RocksKv::open_temp(name);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         StateMachine::new(kv, 3, tx).unwrap()
     }
 
@@ -766,7 +791,7 @@ mod tests {
                         user: "guest".into(),
                         // Propose-side hash (alert #15): the replicated
                         // command carries a PHC string only.
-                        password_hash: switchboard_core::auth::hash_password("guest", "guest"),
+                        password_hash: hash_password("guest", "guest"),
                     },
                     0,
                 ),
@@ -781,13 +806,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.len(), 2);
         assert_eq!(resp[0], BrokerReply::Bootstrapped);
-        assert_eq!(
-            resp[1],
-            BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok)
-        );
+        assert_eq!(resp[1], BrokerReply::Meta(MetaReply::Ok));
 
         // State survives reopening from disk.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         let reopened = StateMachine::new(machine.kv.clone(), 3, tx).unwrap();
         assert!(reopened.read_state().bootstrapped);
         assert!(reopened.read_state().meta.vhosts.contains_key("staging"));
@@ -797,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn shard_applies_emit_effects_to_channel() {
         let kv = RocksKv::open_temp("sm-effects");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = unbounded_channel();
         let mut machine = StateMachine::new(kv, 5, tx).unwrap();
 
         machine
@@ -813,7 +835,7 @@ mod tests {
                     BrokerCommand::Shard(ShardCmd::Enqueue {
                         at_ms: 100,
                         queue: "q".into(),
-                        message: switchboard_core::model::StoredMessage {
+                        message: StoredMessage {
                             properties: BasicProperties::new(),
                             body: b"m".to_vec(),
                             exchange: "amq.direct".into(),
@@ -833,19 +855,19 @@ mod tests {
                 entry(
                     BrokerCommand::Shard(ShardCmd::RegisterSubscription {
                         byte_limit: 0,
-                        sub: switchboard_core::model::SubscriptionId { node: 1, sub: 1 },
+                        sub: SubscriptionId { node: 1, sub: 1 },
                         queue: "q".into(),
                         node: 1,
                         consumer_tag: "c".into(),
                         no_ack: false,
                         exclusive: false,
-                        conn: switchboard_core::model::ConnectionId { node: 1, conn: 1 },
+                        conn: ConnectionId { node: 1, conn: 1 },
                     }),
                     2,
                 ),
                 entry(
                     BrokerCommand::Shard(ShardCmd::Credit {
-                        sub: switchboard_core::model::SubscriptionId { node: 1, sub: 1 },
+                        sub: SubscriptionId { node: 1, sub: 1 },
                         count: 1,
                     }),
                     3,
@@ -856,7 +878,7 @@ mod tests {
 
         let mut saw_ready = false;
         while let Ok(e) = rx.try_recv() {
-            if let Effect::Shard(switchboard_core::shard::ShardEffect::MessageReady { .. }) = e {
+            if let Effect::Shard(ShardEffect::MessageReady { .. }) = e {
                 saw_ready = true;
             }
         }
@@ -888,7 +910,7 @@ mod tests {
                 BrokerCommand::Bootstrap {
                     vhost: "/".into(),
                     user: "guest".into(),
-                    password_hash: switchboard_core::auth::hash_password("guest", "guest"),
+                    password_hash: hash_password("guest", "guest"),
                 },
                 0,
             ),
@@ -906,7 +928,7 @@ mod tests {
 
         // Install into a fresh machine: same state.
         let kv = RocksKv::open_temp("sm-snapshot-target");
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         let mut target = StateMachine::new(kv, 9, tx).unwrap();
         let data = *snap.snapshot;
         target

@@ -3,8 +3,14 @@
 //! subscription, and malformed frames — the wire behaviors every peer
 //! and every forwarded write relies on.
 
+use std::env::temp_dir;
+use std::net::TcpListener;
+use std::process::id as process_id;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bincode::deserialize;
+use bincode::serialize;
 use switchboard_cluster::ClusterNode;
 use switchboard_cluster::NodeConfig;
 use switchboard_cluster::proto::AdminRequest;
@@ -13,25 +19,27 @@ use switchboard_cluster::proto::Envelope;
 use switchboard_cluster::proto::InternalMessage;
 use switchboard_cluster::proto::InternalRequest;
 use switchboard_cluster::proto::InternalResponse;
+use switchboard_cluster::transport::PeerChannel;
+use switchboard_cluster::transport::PeerConn;
 use switchboard_core::model::StoredMessage;
 use switchboard_core::model::SubscriptionId;
+use switchboard_wire::BasicProperties;
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
+use tokio::time::timeout;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
 }
 
-async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
+async fn bootstrap_node(tag: &str, id: u64) -> Arc<ClusterNode> {
     let cfg = NodeConfig {
         id,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-ip-{tag}-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-ip-{tag}-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -39,21 +47,18 @@ async fn bootstrap_node(tag: &str, id: u64) -> std::sync::Arc<ClusterNode> {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     ClusterNode::start(cfg).await.unwrap()
 }
 
 /// Exchange one envelope with the node's internal listener.
-async fn roundtrip(
-    conn: &mut switchboard_cluster::transport::PeerConn,
-    env: &Envelope,
-) -> InternalResponse {
-    conn.send(&bincode::serialize(env).unwrap()).await.unwrap();
+async fn roundtrip(conn: &mut PeerConn, env: &Envelope) -> InternalResponse {
+    conn.send(&serialize(env).unwrap()).await.unwrap();
     let back = conn.recv().await.unwrap();
-    let InternalMessage::Response(resp) = bincode::deserialize(&back).unwrap() else {
+    let InternalMessage::Response(resp) = deserialize(&back).unwrap() else {
         panic!("expected a response");
     };
     resp
@@ -62,7 +67,7 @@ async fn roundtrip(
 #[tokio::test(flavor = "multi_thread")]
 async fn internal_protocol_admin_and_error_arms() {
     let node = bootstrap_node("proto", 1).await;
-    let mut conn = switchboard_cluster::transport::PeerChannel::new(None, "sb".into())
+    let mut conn = PeerChannel::new(None, "sb".into())
         .connect(&node.cfg.internal_addr)
         .await
         .unwrap();
@@ -95,9 +100,7 @@ async fn internal_protocol_admin_and_error_arms() {
         .await
         .unwrap();
     let back = conn.recv().await.unwrap();
-    let InternalMessage::Response(InternalResponse::Error(_)) =
-        bincode::deserialize(&back).unwrap()
-    else {
+    let InternalMessage::Response(InternalResponse::Error(_)) = deserialize(&back).unwrap() else {
         panic!("codec error expected");
     };
 
@@ -112,7 +115,7 @@ async fn internal_protocol_admin_and_error_arms() {
                 queue: "ghost".into(),
                 seq: 1,
                 message: StoredMessage {
-                    properties: switchboard_wire::BasicProperties::new(),
+                    properties: BasicProperties::new(),
                     body: b"x".to_vec(),
                     exchange: String::new(),
                     routing_key: String::new(),
@@ -129,5 +132,5 @@ async fn internal_protocol_admin_and_error_arms() {
         InternalResponse::Admin(AdminResponse::NotFound)
     ));
 
-    let _ = tokio::time::timeout(Duration::from_secs(1), node.shutdown());
+    let _ = timeout(Duration::from_secs(1), node.shutdown());
 }

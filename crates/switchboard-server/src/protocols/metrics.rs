@@ -12,9 +12,14 @@
 //! and the same access gate as `/stats` — loopback unauthenticated, admin
 //! basic credentials from any other peer (code-scanning alert #21).
 
+use std::str::from_utf8;
 use std::sync::Arc;
 
+use super::connstats::snapshot;
+use super::http::proc_self_stats;
+
 use switchboard_cluster::ClusterNode;
+use tracing::warn;
 
 /// Render the Prometheus exposition for this node.
 pub fn render(node: &Arc<ClusterNode>) -> String {
@@ -100,7 +105,7 @@ pub fn render(node: &Arc<ClusterNode>) -> String {
         "counter",
         "Client connections accepted since process start, per protocol.",
     );
-    for (name, current, total) in super::connstats::snapshot() {
+    for (name, current, total) in snapshot() {
         labeled(
             &mut out,
             "switchboard_connections",
@@ -138,7 +143,7 @@ pub fn render(node: &Arc<ClusterNode>) -> String {
     emit_gauge(&mut out, "switchboard_bindings", bindings);
 
     // ---- process vitals (same source /stats uses) ----
-    let (rss_kb, fds) = super::http::proc_self_stats();
+    let (rss_kb, fds) = proc_self_stats();
     emit_gauge(&mut out, "switchboard_uptime_seconds", node.uptime_secs());
     emit_gauge(&mut out, "switchboard_rss_kb", rss_kb);
     emit_gauge(&mut out, "switchboard_open_fds", fds);
@@ -217,7 +222,7 @@ fn push_u64(out: &mut String, value: u64) {
             break;
         }
     }
-    out.push_str(std::str::from_utf8(&buf[i..]).unwrap_or("0"));
+    out.push_str(from_utf8(&buf[i..]).unwrap_or("0"));
     out.push('\n');
 }
 
@@ -225,7 +230,7 @@ fn push_u64(out: &mut String, value: u64) {
 /// an unknown key is an invariant break worth a loud, parseable line —
 /// not a silent skip.
 fn return_invariant(name: &str) -> &'static str {
-    tracing::warn!(counter = %name, "unknown message-lifecycle counter in /metrics");
+    warn!(counter = %name, "unknown message-lifecycle counter in /metrics");
     "Unknown message-lifecycle counter (see broker log)."
 }
 

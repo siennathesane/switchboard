@@ -7,9 +7,19 @@
 //! cdylib exports), so `cargo test -p switchboard-capi` exercises the
 //! shipping surface.
 
+use std::env::temp_dir as std_temp_dir;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_char;
+use std::mem::zeroed;
+use std::process::id;
+use std::ptr::null;
+use std::ptr::null_mut;
+use std::slice::from_raw_parts;
+use std::thread::sleep;
+use std::thread::spawn;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -22,12 +32,7 @@ fn temp_dir(tag: &str) -> CString {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "switchboard-capi-test-{}-{}-{}",
-        tag,
-        std::process::id(),
-        nanos
-    ));
+    let dir = std_temp_dir().join(format!("switchboard-capi-test-{}-{}-{}", tag, id(), nanos));
     CString::new(dir.to_string_lossy().as_bytes().to_vec()).expect("temp path is UTF-8")
 }
 
@@ -62,13 +67,13 @@ fn expect_status(status: SbStatus, want: SbStatus, what: &str) {
 /// documented tx/commit race mitigation) and return the handle.
 fn start_broker(tag: &str) -> *mut SbBroker {
     let dir = temp_dir(tag);
-    let mut cfg: *mut SbConfig = std::ptr::null_mut();
+    let mut cfg: *mut SbConfig = null_mut();
     must_ok(sb_config_create(dir.as_ptr(), &mut cfg), "sb_config_create");
     must_ok(
         sb_config_set_janitor_interval_ms(cfg, 60_000),
         "sb_config_set_janitor_interval_ms",
     );
-    let mut broker: *mut SbBroker = std::ptr::null_mut();
+    let mut broker: *mut SbBroker = null_mut();
     must_ok(sb_broker_start(cfg, &mut broker), "sb_broker_start");
     assert!(!broker.is_null(), "sb_broker_start left a NULL broker");
     must_ok(sb_config_free(cfg), "sb_config_free (right after start)");
@@ -76,7 +81,7 @@ fn start_broker(tag: &str) -> *mut SbBroker {
 }
 
 fn open_channel(broker: *mut SbBroker) -> *mut SbChannel {
-    let mut client: *mut SbClient = std::ptr::null_mut();
+    let mut client: *mut SbClient = null_mut();
     must_ok(
         sb_broker_connect(
             broker,
@@ -86,7 +91,7 @@ fn open_channel(broker: *mut SbBroker) -> *mut SbChannel {
         ),
         "sb_broker_connect",
     );
-    let mut channel: *mut SbChannel = std::ptr::null_mut();
+    let mut channel: *mut SbChannel = null_mut();
     must_ok(
         sb_client_open_channel(client, &mut channel),
         "sb_client_open_channel",
@@ -99,7 +104,7 @@ fn open_channel(broker: *mut SbBroker) -> *mut SbChannel {
 fn setup_queue(broker: *mut SbBroker, queue: &str, bodies: &[&[u8]]) -> *mut SbChannel {
     let channel = open_channel(broker);
     let q = cstr_or_die(queue);
-    let mut name: *mut c_char = std::ptr::null_mut();
+    let mut name: *mut c_char = null_mut();
     must_ok(
         sb_channel_queue_declare(channel, q.as_ptr(), 0, 0, 0, 0, &mut name),
         "sb_channel_queue_declare",
@@ -115,7 +120,7 @@ fn setup_queue(broker: *mut SbBroker, queue: &str, bodies: &[&[u8]]) -> *mut SbC
                 channel,
                 cstr_or_die("").as_ptr(), // default exchange -> direct to queue
                 q.as_ptr(),
-                std::ptr::null(),
+                null(),
                 1, // transient
                 body.as_ptr(),
                 body.len(),
@@ -133,7 +138,7 @@ fn copy_body(msg: &SbMessage) -> Vec<u8> {
         return Vec::new();
     }
     assert!(!msg.body.is_null(), "non-zero body_len with NULL body");
-    unsafe { std::slice::from_raw_parts(msg.body, msg.body_len) }.to_vec()
+    unsafe { from_raw_parts(msg.body, msg.body_len) }.to_vec()
 }
 
 /// sb_channel_get until a message arrives (with a bounded deadline).
@@ -144,10 +149,10 @@ fn copy_body(msg: &SbMessage) -> Vec<u8> {
 /// cadence), so the ABI tests poll too.
 fn get_until_has(channel: *mut SbChannel, queue: &str, no_ack: i32) -> SbMessage {
     let q = cstr_or_die(queue);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut has: i32 = 0;
-        let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+        let mut msg: SbMessage = unsafe { zeroed() };
         must_ok(
             sb_channel_get(channel, q.as_ptr(), no_ack, &mut has, &mut msg),
             "sb_channel_get",
@@ -156,10 +161,10 @@ fn get_until_has(channel: *mut SbChannel, queue: &str, no_ack: i32) -> SbMessage
             return msg;
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "no message within 10s for {queue}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        sleep(Duration::from_millis(25));
     }
 }
 
@@ -184,7 +189,7 @@ fn happy_path_roundtrip() {
 
     // Queue drained: SB_OK + has_message = 0.
     let mut has: i32 = -1;
-    let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+    let mut msg: SbMessage = unsafe { zeroed() };
     must_ok(
         sb_channel_get(
             channel,
@@ -203,26 +208,26 @@ fn happy_path_roundtrip() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("capi-happy").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"pushed".as_ptr(),
             6,
         ),
         "publish for consumer",
     );
-    let mut consumer: *mut SbConsumer = std::ptr::null_mut();
+    let mut consumer: *mut SbConsumer = null_mut();
     must_ok(
         sb_channel_consume(
             channel,
             cstr_or_die("capi-happy").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             0,
             &mut consumer,
         ),
         "sb_channel_consume",
     );
-    let mut tag: *mut c_char = std::ptr::null_mut();
+    let mut tag: *mut c_char = null_mut();
     must_ok(sb_consumer_tag(consumer, &mut tag), "sb_consumer_tag");
     let tag_s = unsafe { CStr::from_ptr(tag) }
         .to_string_lossy()
@@ -231,7 +236,7 @@ fn happy_path_roundtrip() {
     must_ok(sb_string_free(tag), "sb_string_free(tag)");
 
     let mut has: i32 = -1;
-    let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+    let mut msg: SbMessage = unsafe { zeroed() };
     must_ok(
         sb_consumer_next(consumer, 5_000, &mut has, &mut msg),
         "sb_consumer_next",
@@ -249,7 +254,7 @@ fn happy_path_roundtrip() {
 
     // Idle drain: 100 ms budget, nothing there -> SB_OK + 0.
     let mut has: i32 = -1;
-    let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+    let mut msg: SbMessage = unsafe { zeroed() };
     must_ok(
         sb_consumer_next(consumer, 100, &mut has, &mut msg),
         "sb_consumer_next (idle)",
@@ -259,7 +264,7 @@ fn happy_path_roundtrip() {
     must_ok(sb_consumer_cancel(consumer), "sb_consumer_cancel");
     // After cancel the handle is DEAD (still freeable).
     let mut has: i32 = -1;
-    let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+    let mut msg: SbMessage = unsafe { zeroed() };
     expect_status(
         sb_consumer_next(consumer, 100, &mut has, &mut msg),
         SB_ERR_HANDLE_DEAD,
@@ -275,7 +280,7 @@ fn happy_path_roundtrip() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("capi-happy").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"committed".as_ptr(),
             9,
@@ -292,7 +297,7 @@ fn happy_path_roundtrip() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("capi-happy").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"rolled-back".as_ptr(),
             11,
@@ -301,7 +306,7 @@ fn happy_path_roundtrip() {
     );
     must_ok(sb_channel_tx_rollback(channel), "tx_rollback");
     let mut has: i32 = -1;
-    let mut msg: SbMessage = unsafe { std::mem::zeroed() };
+    let mut msg: SbMessage = unsafe { zeroed() };
     must_ok(
         sb_channel_get(
             channel,
@@ -317,7 +322,7 @@ fn happy_path_roundtrip() {
     // Publisher confirms through the ABI — on a FRESH channel: tx and
     // confirm mode are mutually exclusive (406) and `channel` is still
     // transactional from the tx block above.
-    let mut confirm_client: *mut SbClient = std::ptr::null_mut();
+    let mut confirm_client: *mut SbClient = null_mut();
     must_ok(
         sb_broker_connect(
             broker,
@@ -327,7 +332,7 @@ fn happy_path_roundtrip() {
         ),
         "connect for confirm channel",
     );
-    let mut confirm_channel: *mut SbChannel = std::ptr::null_mut();
+    let mut confirm_channel: *mut SbChannel = null_mut();
     must_ok(
         sb_client_open_channel(confirm_client, &mut confirm_channel),
         "open confirm channel",
@@ -338,7 +343,7 @@ fn happy_path_roundtrip() {
             confirm_channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("capi-happy").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"acked".as_ptr(),
             5,
@@ -353,7 +358,7 @@ fn happy_path_roundtrip() {
             confirm_channel,
             cstr_or_die("no-such-exchange").as_ptr(),
             cstr_or_die("x").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"gone".as_ptr(),
             4,
@@ -398,7 +403,7 @@ fn happy_path_roundtrip() {
         SB_ERR_ADMIN_REFUSED,
         "set_permissions for a missing user",
     );
-    let mut vclient: *mut SbClient = std::ptr::null_mut();
+    let mut vclient: *mut SbClient = null_mut();
     expect_status(
         sb_broker_connect_vhost(
             broker,
@@ -435,22 +440,19 @@ fn null_arguments_are_rejected() {
     // Broker/config entry points.
     let dir = temp_dir("null-args");
     expect_status(
-        sb_config_create(std::ptr::null(), std::ptr::null_mut()),
+        sb_config_create(null(), null_mut()),
         SB_ERR_NULL_ARG,
         "sb_config_create(NULL, NULL)",
     );
-    let mut cfg: *mut SbConfig = std::ptr::null_mut();
+    let mut cfg: *mut SbConfig = null_mut();
     must_ok(sb_config_create(dir.as_ptr(), &mut cfg), "sb_config_create");
     expect_status(
-        sb_broker_start(cfg, std::ptr::null_mut()),
+        sb_broker_start(cfg, null_mut()),
         SB_ERR_NULL_ARG,
         "sb_broker_start(cfg, NULL out)",
     );
     expect_status(
-        sb_broker_start(
-            std::ptr::null(),
-            &mut (std::ptr::null_mut() as *mut SbBroker),
-        ),
+        sb_broker_start(null(), &mut (null_mut() as *mut SbBroker)),
         SB_ERR_NULL_ARG,
         "sb_broker_start(NULL cfg)",
     );
@@ -459,7 +461,7 @@ fn null_arguments_are_rejected() {
     // Untouched out-pointers on failure: sb_config_create must not write.
     let mut cfg2: *mut SbConfig = 0x1234 as *mut SbConfig;
     expect_status(
-        sb_config_create(std::ptr::null(), &mut cfg2),
+        sb_config_create(null(), &mut cfg2),
         SB_ERR_NULL_ARG,
         "sb_config_create(NULL dir)",
     );
@@ -473,18 +475,12 @@ fn null_arguments_are_rejected() {
     let channel = open_channel(broker);
 
     expect_status(
-        sb_channel_queue_declare(channel, std::ptr::null(), 0, 0, 0, 0, std::ptr::null_mut()),
+        sb_channel_queue_declare(channel, null(), 0, 0, 0, 0, null_mut()),
         SB_ERR_NULL_ARG,
         "queue_declare(NULL name)",
     );
     expect_status(
-        sb_channel_get(
-            channel,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ),
+        sb_channel_get(channel, null(), 0, null_mut(), null_mut()),
         SB_ERR_NULL_ARG,
         "get(NULL queue, NULL outs)",
     );
@@ -493,9 +489,9 @@ fn null_arguments_are_rejected() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("q").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
-            std::ptr::null(),
+            null(),
             7, // NULL body with non-zero length
         ),
         SB_ERR_NULL_ARG,
@@ -510,7 +506,7 @@ fn null_arguments_are_rejected() {
     // empty body first, then the non-empty sentinel in publish order,
     // mirroring methods_arms.rs empty_body_publish_applies_and_round_trips
     // and the switchboard-embedded e2e test of the same name.
-    let mut qname: *mut c_char = std::ptr::null_mut();
+    let mut qname: *mut c_char = null_mut();
     must_ok(
         sb_channel_queue_declare(channel, cstr_or_die("q").as_ptr(), 0, 0, 0, 0, &mut qname),
         "declare q",
@@ -521,9 +517,9 @@ fn null_arguments_are_rejected() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("q").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
-            std::ptr::null(),
+            null(),
             0,
         ),
         "publish(NULL body, len 0) = empty body (applied since the 9ff8bf1 fix)",
@@ -544,7 +540,7 @@ fn null_arguments_are_rejected() {
             channel,
             cstr_or_die("").as_ptr(),
             cstr_or_die("q").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"nonempty".as_ptr(),
             8,
@@ -562,7 +558,7 @@ fn null_arguments_are_rejected() {
             cstr_or_die("q").as_ptr(),
             0,
             &mut dropped_has,
-            std::ptr::null_mut(),
+            null_mut(),
         ),
         SB_ERR_NULL_ARG,
         "get(NULL out message)",
@@ -591,9 +587,9 @@ fn garbage_handles_are_detected() {
         SB_ERR_INVALID_HANDLE,
         "sb_broker_is_ready(fake)",
     );
-    let mut ch_out: *mut SbChannel = std::ptr::null_mut();
+    let mut ch_out: *mut SbChannel = null_mut();
     let mut id_out: u16 = 0;
-    let mut tag_out: *mut c_char = std::ptr::null_mut();
+    let mut tag_out: *mut c_char = null_mut();
     expect_status(
         sb_client_open_channel(fake_client, &mut ch_out),
         SB_ERR_INVALID_HANDLE,
@@ -609,7 +605,7 @@ fn garbage_handles_are_detected() {
         SB_ERR_INVALID_HANDLE,
         "sb_consumer_tag(fake)",
     );
-    let mut broker_out: *mut SbBroker = std::ptr::null_mut();
+    let mut broker_out: *mut SbBroker = null_mut();
     expect_status(
         sb_broker_start(fake_config, &mut broker_out),
         SB_ERR_INVALID_HANDLE,
@@ -636,7 +632,7 @@ fn garbage_handles_are_detected() {
         "sb_broker_free(fake)",
     );
     // Wrong-KIND handle: a config ptr must not pass for a broker.
-    let mut cfg: *mut SbConfig = std::ptr::null_mut();
+    let mut cfg: *mut SbConfig = null_mut();
     let dir = temp_dir("kind-confusion");
     must_ok(sb_config_create(dir.as_ptr(), &mut cfg), "sb_config_create");
     expect_status(
@@ -658,11 +654,11 @@ fn garbage_handles_are_detected() {
 #[test]
 fn freed_then_used_is_detected() {
     let dir = temp_dir("freed");
-    let mut cfg: *mut SbConfig = std::ptr::null_mut();
+    let mut cfg: *mut SbConfig = null_mut();
     must_ok(sb_config_create(dir.as_ptr(), &mut cfg), "sb_config_create");
     must_ok(sb_config_free(cfg), "sb_config_free");
     // Freed config: start must refuse.
-    let mut broker: *mut SbBroker = std::ptr::null_mut();
+    let mut broker: *mut SbBroker = null_mut();
     expect_status(
         sb_broker_start(cfg, &mut broker),
         SB_ERR_INVALID_HANDLE,
@@ -678,7 +674,7 @@ fn freed_then_used_is_detected() {
 
     // Client freed-then-used, via a real broker.
     let broker = start_broker("freed");
-    let mut client: *mut SbClient = std::ptr::null_mut();
+    let mut client: *mut SbClient = null_mut();
     must_ok(
         sb_broker_connect(
             broker,
@@ -689,7 +685,7 @@ fn freed_then_used_is_detected() {
         "connect",
     );
     must_ok(sb_client_close(client), "sb_client_close");
-    let mut channel: *mut SbChannel = std::ptr::null_mut();
+    let mut channel: *mut SbChannel = null_mut();
     expect_status(
         sb_client_open_channel(client, &mut channel),
         SB_ERR_HANDLE_DEAD,
@@ -770,7 +766,7 @@ fn freed_then_used_is_detected() {
 #[test]
 fn last_error_is_thread_local() {
     // A thread that has never called a failing sb_* has NO error.
-    let handle = std::thread::spawn(|| sb_last_error().is_null());
+    let handle = spawn(|| sb_last_error().is_null());
     assert!(
         handle.join().expect("join"),
         "fresh thread must report NULL last error"
@@ -794,7 +790,7 @@ fn last_error_is_thread_local() {
     );
 
     // And a second thread still sees NULL (never failed there).
-    let handle = std::thread::spawn(|| sb_last_error().is_null());
+    let handle = spawn(|| sb_last_error().is_null());
     assert!(handle.join().expect("join"));
 }
 
@@ -836,7 +832,7 @@ fn channels_are_independent_and_mandatory_reports_routing() {
     let broker = start_broker("channels");
     // ONE connection, TWO channels on it (channel numbers are
     // connection-scoped, so they must differ).
-    let mut client: *mut SbClient = std::ptr::null_mut();
+    let mut client: *mut SbClient = null_mut();
     must_ok(
         sb_broker_connect(
             broker,
@@ -846,13 +842,13 @@ fn channels_are_independent_and_mandatory_reports_routing() {
         ),
         "sb_broker_connect",
     );
-    let mut c1: *mut SbChannel = std::ptr::null_mut();
-    let mut c2: *mut SbChannel = std::ptr::null_mut();
+    let mut c1: *mut SbChannel = null_mut();
+    let mut c2: *mut SbChannel = null_mut();
     must_ok(sb_client_open_channel(client, &mut c1), "open c1");
     must_ok(sb_client_open_channel(client, &mut c2), "open c2");
 
     for (channel, queue) in [(c1, "ch-a"), (c2, "ch-b")] {
-        let mut name: *mut c_char = std::ptr::null_mut();
+        let mut name: *mut c_char = null_mut();
         must_ok(
             sb_channel_queue_declare(channel, cstr_or_die(queue).as_ptr(), 0, 0, 0, 0, &mut name),
             &format!("declare {queue}"),
@@ -863,7 +859,7 @@ fn channels_are_independent_and_mandatory_reports_routing() {
                 channel,
                 cstr_or_die("").as_ptr(),
                 cstr_or_die(queue).as_ptr(),
-                std::ptr::null(),
+                null(),
                 1,
                 if queue == "ch-a" {
                     b"a1".as_ptr()
@@ -893,7 +889,7 @@ fn channels_are_independent_and_mandatory_reports_routing() {
             c2,
             cstr_or_die("").as_ptr(),
             cstr_or_die("nothing-binds-this").as_ptr(),
-            std::ptr::null(),
+            null(),
             0,
             b"x".as_ptr(),
             1,
@@ -927,7 +923,7 @@ fn channels_are_independent_and_mandatory_reports_routing() {
 #[test]
 fn broker_data_dir_round_trips() {
     let broker = start_broker("datadir");
-    let mut dir: *mut c_char = std::ptr::null_mut();
+    let mut dir: *mut c_char = null_mut();
     must_ok(sb_broker_data_dir(broker, &mut dir), "sb_broker_data_dir");
     let s = unsafe { CStr::from_ptr(dir) }
         .to_string_lossy()
@@ -937,14 +933,11 @@ fn broker_data_dir_round_trips() {
     must_ok(sb_broker_free(broker), "free broker");
 
     // NULL tolerance on free fns.
-    must_ok(sb_string_free(std::ptr::null_mut()), "string_free(NULL)");
-    must_ok(sb_message_free(std::ptr::null_mut()), "message_free(NULL)");
-    must_ok(sb_config_free(std::ptr::null_mut()), "config_free(NULL)");
-    must_ok(sb_client_free(std::ptr::null_mut()), "client_free(NULL)");
-    must_ok(sb_channel_free(std::ptr::null_mut()), "channel_free(NULL)");
-    must_ok(
-        sb_consumer_free(std::ptr::null_mut()),
-        "consumer_free(NULL)",
-    );
-    must_ok(sb_broker_free(std::ptr::null_mut()), "broker_free(NULL)");
+    must_ok(sb_string_free(null_mut()), "string_free(NULL)");
+    must_ok(sb_message_free(null_mut()), "message_free(NULL)");
+    must_ok(sb_config_free(null_mut()), "config_free(NULL)");
+    must_ok(sb_client_free(null_mut()), "client_free(NULL)");
+    must_ok(sb_channel_free(null_mut()), "channel_free(NULL)");
+    must_ok(sb_consumer_free(null_mut()), "consumer_free(NULL)");
+    must_ok(sb_broker_free(null_mut()), "broker_free(NULL)");
 }

@@ -2,6 +2,7 @@
 //! encodings, described values, and the constructor used by
 //! performatives and message sections.
 
+use std::str::from_utf8;
 /// An AMQP 1.0 value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -215,8 +216,7 @@ fn decode_inner(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             let (len, w) = read_vlen(buf, *pos, constructor == 0xB1)?;
             *pos += w;
             need(buf, *pos, len)?;
-            let s =
-                std::str::from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in string")?;
+            let s = from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in string")?;
             *pos += len;
             Value::String(s.to_string())
         }
@@ -224,8 +224,7 @@ fn decode_inner(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             let (len, w) = read_vlen(buf, *pos, constructor == 0xB3)?;
             *pos += w;
             need(buf, *pos, len)?;
-            let s =
-                std::str::from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in symbol")?;
+            let s = from_utf8(&buf[*pos..*pos + len]).map_err(|_| "bad utf8 in symbol")?;
             *pos += len;
             Value::Symbol(s.to_string())
         }

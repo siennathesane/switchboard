@@ -18,6 +18,7 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use support::basic_get;
@@ -27,21 +28,21 @@ use support::start_broker;
 
 use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::BrokerReply;
+use switchboard_cluster::ClusterNode;
 use switchboard_cluster::META_GROUP;
 use switchboard_core::model::ConnectionId;
 use switchboard_core::model::QueueOptions;
 use switchboard_core::shard::ShardCmd;
 use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_wire::BasicProperties;
 use switchboard_wire::method::Method;
+use tokio::time::sleep;
 
 /// Commit a meta-only `DeclareQueue` (no shard-side `CreateQueueData`):
 /// the exact durable state a node crash/pause between the two writes of
 /// `queue_declare` leaves behind. Returns the queue's shard group.
-async fn inject_meta_only_queue(
-    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
-    name: &str,
-) -> u32 {
+async fn inject_meta_only_queue(node: &Arc<ClusterNode>, name: &str) -> u32 {
     let reply = node
         .write(
             META_GROUP,
@@ -75,11 +76,7 @@ async fn inject_meta_only_queue(
 
 /// Assert the shard group really has no data for `queue` — the bug's
 /// precondition.
-async fn assert_shard_data_missing(
-    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
-    shard: u32,
-    queue: &str,
-) {
+async fn assert_shard_data_missing(node: &Arc<ClusterNode>, shard: u32, queue: &str) {
     let reply = node
         .write(
             shard,
@@ -169,7 +166,7 @@ async fn active_declare_heals_queue_missing_shard_data() {
         1,
         "",
         "stuck",
-        &switchboard_wire::BasicProperties::new(),
+        &BasicProperties::new(),
         b"healed",
         false,
     )
@@ -242,5 +239,5 @@ async fn delete_succeeds_when_shard_data_missing() {
         other => panic!("expected Channel.Close 404, got {other:?}"),
     }
     // Let the ChannelCloseOk drain before teardown.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_millis(50)).await;
 }

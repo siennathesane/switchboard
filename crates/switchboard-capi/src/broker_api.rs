@@ -9,6 +9,7 @@ use std::time::Duration;
 use switchboard_cluster::node::Timeouts;
 use switchboard_embedded::Broker;
 use switchboard_embedded::BrokerConfig;
+use switchboard_embedded::Permissions;
 use tokio::runtime::Runtime;
 
 use crate::handles::SbBroker;
@@ -511,7 +512,7 @@ pub extern "C" fn sb_broker_set_permissions(
         b.rt.block_on(inner.set_permissions(
             &user,
             &vhost,
-            switchboard_embedded::Permissions {
+            Permissions {
                 configure,
                 write,
                 read,

@@ -16,6 +16,9 @@
 pub mod frames;
 pub mod types;
 use std::collections::HashMap;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU32;
@@ -30,6 +33,7 @@ use switchboard_cluster::ClusterNode;
 use switchboard_core::model::StoredMessage;
 use switchboard_wire::properties::BasicProperties;
 
+use crate::protocols::PREAUTH_MAX_FRAME_BYTES;
 use crate::protocols::shared;
 use crate::protocols::shared::BridgeConsumer;
 use crate::protocols::shared::BridgeContext;
@@ -37,7 +41,19 @@ use crate::protocols::shared::BridgeContext;
 use self::frames::codes;
 use self::types::Value;
 use self::types::decode;
+use self::types::encode;
+use crate::channel::ConnectionLimits;
 use switchboard_core::error::BrokerError;
+use switchboard_core::model::generate_queue_name;
+use switchboard_core::topology::GroupId;
+use tokio::io::split;
+use tokio::spawn;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
+use tracing::debug;
+use tracing::info;
 
 /// Address mapping (STOMP-compatible).
 #[derive(Debug, Clone)]
@@ -82,7 +98,7 @@ struct Link {
     target: Option<Dest>,
     /// Credit the client granted us for broker→client transfers.
     credit: Arc<AtomicI64>,
-    notify: Arc<tokio::sync::Notify>,
+    notify: Arc<Notify>,
     /// True when broker→client transfers must be sent `settled = false`
     /// (receiver attached with snd-settle-mode = unsettled).
     unsettled: bool,
@@ -149,29 +165,25 @@ fn encode_message(content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
             Box::new(Value::ULong(codes::SECTION_PROPERTIES)),
             Box::new(Value::List(fields)),
         );
-        self::types::encode(&props, &mut out);
+        encode(&props, &mut out);
     }
     let data = Value::Described(
         Box::new(Value::ULong(codes::SECTION_DATA)),
         Box::new(Value::Binary(body.to_vec())),
     );
-    self::types::encode(&data, &mut out);
+    encode(&data, &mut out);
     out
 }
 
-type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
+type SharedWriter<W> = Arc<Mutex<W>>;
 
 /// Serve one AMQP 1.0 connection to completion.
-pub async fn serve<S>(
-    io: S,
-    node: Arc<ClusterNode>,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+pub async fn serve<S>(io: S, node: Arc<ClusterNode>, limits: ConnectionLimits) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, writer) = tokio::io::split(io);
-    let writer: SharedWriter<_> = Arc::new(tokio::sync::Mutex::new(writer));
+    let (mut reader, writer) = split(io);
+    let writer: SharedWriter<_> = Arc::new(Mutex::new(writer));
     use tokio::io::AsyncReadExt;
 
     // ---- protocol header ----
@@ -223,7 +235,7 @@ where
                 (user, pass)
             }
             other => {
-                tracing::debug!(mechanism = %other, "amqp10: unsupported SASL mechanism");
+                debug!(mechanism = %other, "amqp10: unsupported SASL mechanism");
                 return Ok(());
             }
         };
@@ -275,7 +287,7 @@ where
         .await
         .is_err()
         {
-            tracing::info!("amqp10: SASL skipped and anonymous access refused");
+            info!("amqp10: SASL skipped and anonymous access refused");
             return Ok(());
         }
     }
@@ -288,11 +300,10 @@ where
     // (code-scanning alert #8).
     let ctx =
         Arc::new(BridgeContext::create_as(node.clone(), "/".into(), authed_user.clone()).await);
-    let links: Arc<tokio::sync::Mutex<HashMap<u32, Arc<tokio::sync::Mutex<Link>>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let links: Arc<Mutex<HashMap<u32, Arc<Mutex<Link>>>>> = Arc::new(Mutex::new(HashMap::new()));
     // delivery-id → (consumer, seq) for unsettled broker→client transfers.
-    let pending_settlements: Arc<tokio::sync::Mutex<HashMap<u32, (Arc<BridgeConsumer>, u64)>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_settlements: Arc<Mutex<HashMap<u32, (Arc<BridgeConsumer>, u64)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let delivery_counter = Arc::new(AtomicU32::new(1));
     let mut session_begun = false;
     let next_outgoing_id: u32 = 1;
@@ -347,7 +358,7 @@ where
                     .await
                     {
                         Ok((consumer, credit, notify)) => {
-                            let link = Arc::new(tokio::sync::Mutex::new(Link {
+                            let link = Arc::new(Mutex::new(Link {
                                 handle,
                                 client_is_receiver,
                                 consumer: Some(consumer.clone()),
@@ -360,7 +371,7 @@ where
                             link
                         }
                         Err(e) => {
-                            tracing::debug!(err = %e, "amqp10: attach source failed");
+                            debug!(err = %e, "amqp10: attach source failed");
                             let _ = writer.lock().await.write_all(&frames::detach(handle)).await;
                             return Ok(());
                         }
@@ -372,13 +383,13 @@ where
                         .and_then(|v| v.map_get("address"))
                         .and_then(Value::as_str)
                         .map(resolve_address);
-                    let link = Arc::new(tokio::sync::Mutex::new(Link {
+                    let link = Arc::new(Mutex::new(Link {
                         handle,
                         client_is_receiver,
                         consumer: None,
                         target,
                         credit: Arc::new(AtomicI64::new(0)),
-                        notify: Arc::new(tokio::sync::Notify::new()),
+                        notify: Arc::new(Notify::new()),
                         unsettled: false,
                     }));
                     links.lock().await.insert(handle, link.clone());
@@ -416,7 +427,7 @@ where
                     // would drop the connection with the client's next
                     // frame unread.
                     let message = parse_message(&f.payload).unwrap_or_else(|e| {
-                        tracing::debug!(err = %e, "amqp10: bad message payload");
+                        debug!(err = %e, "amqp10: bad message payload");
                         ParsedMessage {
                             body: Vec::new(),
                             content_type: None,
@@ -444,7 +455,7 @@ where
                         writer.lock().await.flush().await?;
                     }
                     if let Err(e) = publish_result {
-                        tracing::debug!(err = %e, "amqp10: transfer rejected");
+                        debug!(err = %e, "amqp10: transfer rejected");
                     }
                 }
             }
@@ -506,7 +517,7 @@ where
         frame = match read_frame(&mut reader).await {
             Ok(f) => f,
             Err(e) => {
-                tracing::debug!(err = %e, "amqp10: frame read failed; closing connection");
+                debug!(err = %e, "amqp10: frame read failed; closing connection");
                 break;
             }
         };
@@ -523,9 +534,9 @@ where
     {
         use tokio::io::AsyncReadExt;
         let mut scratch = [0u8; 8192];
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, reader.read(&mut scratch)).await {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match timeout_at(deadline, reader.read(&mut scratch)).await {
                 Ok(Ok(0)) | Err(_) => break,
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => break,
@@ -536,9 +547,7 @@ where
 }
 
 /// Read one transport frame; `Ok(None)` on EOF.
-async fn read_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Option<frames::Frame>> {
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> IoResult<Option<frames::Frame>> {
     use tokio::io::AsyncReadExt;
     let mut head = [0u8; 8];
     if reader.read_exact(&mut head).await? == 0 {
@@ -549,26 +558,26 @@ async fn read_frame<R: AsyncRead + Unpin>(
     // The wire size is peer-controlled (up to 4 GiB) and the frame may
     // still precede SASL authentication: cap it before the body
     // allocation instead of trusting it (code-scanning alert #11).
-    if size > super::PREAUTH_MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+    if size > PREAUTH_MAX_FRAME_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             format!(
                 "amqp1: frame size {size} exceeds the pre-auth frame cap {}",
-                super::PREAUTH_MAX_FRAME_BYTES
+                PREAUTH_MAX_FRAME_BYTES
             ),
         ));
     }
     let doff = head[4] as usize;
     if doff < 2 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             "amqp1: bad frame offset",
         ));
     }
     let header_len = doff * 4;
     if size < header_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             "amqp1: frame smaller than fixed header",
         ));
     }
@@ -590,7 +599,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
     match frames::decode_frame(&full) {
         Ok((f, _)) if f.frame_type == 0xFF => Ok(None), // "need more" sentinel
         Ok((f, _)) => Ok(Some(f)),
-        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Err(e) => Err(Error::new(ErrorKind::InvalidData, e)),
     }
 }
 
@@ -598,11 +607,11 @@ async fn read_frame<R: AsyncRead + Unpin>(
 async fn ensure_destination(
     ctx: &Arc<BridgeContext>,
     dest: &Dest,
-) -> Result<(String, switchboard_core::topology::GroupId), BrokerError> {
+) -> Result<(String, GroupId), BrokerError> {
     match dest {
         Dest::Topic { exchange, rk } => {
             shared::ensure_exchange(ctx, exchange).await?;
-            let queue = switchboard_core::model::generate_queue_name();
+            let queue = generate_queue_name();
             let shard = shared::declare_queue(ctx, &queue, false, false, true).await?;
             shared::bind(ctx, exchange, &queue, rk).await?;
             Ok((queue, shard))
@@ -671,15 +680,8 @@ async fn start_link_consumer<W>(
     writer: SharedWriter<W>,
     delivery_counter: Arc<AtomicU32>,
     unsettled: bool,
-    pending_settlements: Arc<tokio::sync::Mutex<HashMap<u32, (Arc<BridgeConsumer>, u64)>>>,
-) -> Result<
-    (
-        Arc<BridgeConsumer>,
-        Arc<AtomicI64>,
-        Arc<tokio::sync::Notify>,
-    ),
-    BrokerError,
->
+    pending_settlements: Arc<Mutex<HashMap<u32, (Arc<BridgeConsumer>, u64)>>>,
+) -> Result<(Arc<BridgeConsumer>, Arc<AtomicI64>, Arc<Notify>), BrokerError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -696,7 +698,7 @@ where
     )
     .await?;
     let credit_counter = Arc::new(AtomicI64::new(0));
-    let notify = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::new(Notify::new());
     let task_consumer = consumer.clone();
     let task_credit = credit_counter.clone();
     let task_notify = notify.clone();
@@ -705,7 +707,7 @@ where
     let task_delivery = delivery_counter.clone();
     let task_unsettled = unsettled;
     let task_pending = pending_settlements.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         let consumer = task_consumer;
         let credit_counter = task_credit;
         let notify = task_notify;
@@ -751,7 +753,7 @@ where
 }
 
 /// Stop a link's consumer and drop its bridge queue.
-async fn teardown_link(ctx: &Arc<BridgeContext>, link: &Arc<tokio::sync::Mutex<Link>>) {
+async fn teardown_link(ctx: &Arc<BridgeContext>, link: &Arc<Mutex<Link>>) {
     let mut l = link.lock().await;
     if let Some(consumer) = l.consumer.take() {
         consumer.stop(&ctx.node).await;
@@ -762,6 +764,7 @@ async fn teardown_link(ctx: &Arc<BridgeContext>, link: &Arc<tokio::sync::Mutex<L
 #[cfg(test)]
 mod read_frame_tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[tokio::test]
     async fn read_frame_rejects_oversized_wire_size_before_allocating() {
@@ -769,13 +772,13 @@ mod read_frame_tests {
         // fail fast with InvalidData before the body vector is created.
         let mut stream: &[u8] = &[0xFF, 0xFF, 0xF0, 0x00, 2, 0x00, 0x00, 0x00];
         let err = read_frame(&mut stream).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("pre-auth frame cap"));
     }
 
     #[tokio::test]
     async fn read_frame_rejects_size_just_above_the_cap() {
-        let cap = super::super::PREAUTH_MAX_FRAME_BYTES;
+        let cap = PREAUTH_MAX_FRAME_BYTES;
         let mut stream: &[u8] = &[
             ((cap + 1) >> 24) as u8,
             ((cap + 1) >> 16) as u8,
@@ -787,7 +790,7 @@ mod read_frame_tests {
             0x00,
         ];
         let err = read_frame(&mut stream).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]

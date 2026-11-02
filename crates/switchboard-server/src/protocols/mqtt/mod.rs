@@ -16,17 +16,34 @@
 
 pub mod packet;
 use std::collections::HashMap;
+use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
+use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::Delivery;
+use switchboard_cluster::META_GROUP;
+use switchboard_core::error::BrokerError;
 use switchboard_core::model::StoredMessage;
+use switchboard_core::model::generate_queue_name;
+use switchboard_core::topic::matches;
+use switchboard_core::topology::MetaCmd;
 use switchboard_wire::properties::BasicProperties;
+use tokio::io::split;
+use tokio::select;
+use tokio::spawn;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::Instant;
+use tokio::time::sleep_until;
+use tracing::debug;
 
 use crate::protocols::shared;
 use crate::protocols::shared::BridgeConsumer;
@@ -34,6 +51,8 @@ use crate::protocols::shared::BridgeContext;
 
 use self::packet::Out;
 use self::packet::Packet;
+use self::packet::read_packet;
+use crate::channel::ConnectionLimits;
 
 /// Store (or clear) a retained message through meta — raft-replicated, so
 /// every node serves the same retained state.
@@ -41,14 +60,12 @@ async fn set_retained(ctx: &Arc<BridgeContext>, topic: &str, message: Option<Sto
     let _ = ctx
         .node
         .write(
-            switchboard_cluster::META_GROUP,
-            switchboard_cluster::BrokerCommand::Meta(
-                switchboard_core::topology::MetaCmd::SetRetained {
-                    vhost: ctx.vhost.clone(),
-                    topic: topic.to_string(),
-                    message,
-                },
-            ),
+            META_GROUP,
+            BrokerCommand::Meta(MetaCmd::SetRetained {
+                vhost: ctx.vhost.clone(),
+                topic: topic.to_string(),
+                message,
+            }),
         )
         .await;
     ctx.node.refresh_topology().await;
@@ -125,19 +142,15 @@ fn amqp_to_mqtt_topic(rk: &str) -> String {
 /// Does the (MQTT) topic match the (MQTT) filter? Uses the AMQP topic
 /// matcher after wildcard conversion.
 fn topic_matches(filter: &str, topic: &str) -> bool {
-    switchboard_core::topic::matches(&mqtt_to_amqp_filter(filter), topic)
+    matches(&mqtt_to_amqp_filter(filter), topic)
 }
 
 /// Serve one MQTT connection to completion.
-pub async fn serve<S>(
-    io: S,
-    node: Arc<ClusterNode>,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+pub async fn serve<S>(io: S, node: Arc<ClusterNode>, limits: ConnectionLimits) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(io);
+    let (mut reader, mut writer) = split(io);
 
     // ---- CONNECT (must be the first packet) ----
     let Some(Packet::Connect {
@@ -146,7 +159,7 @@ where
         username,
         password,
         client_id,
-    }) = self::packet::read_packet(&mut reader).await?
+    }) = read_packet(&mut reader).await?
     else {
         return Ok(()); // hung up, or spoke before CONNECT
     };
@@ -170,7 +183,7 @@ where
         };
         let _ = writer.write_all(&nack.encode()).await;
         let _ = writer.flush().await;
-        tracing::debug!(err = %e, "mqtt: auth failed");
+        debug!(err = %e, "mqtt: auth failed");
         return Ok(());
     }
 
@@ -224,41 +237,37 @@ where
     // Outbound at PUBCOMP stage: pid → (consumer, seq).
     let mut outbound_comp: HashMap<u16, (Arc<BridgeConsumer>, u64)> = HashMap::new();
     // Merged deliveries from every consumer: (local sub id, delivery).
-    let (merged_tx, mut merged_rx) = tokio::sync::mpsc::unbounded_channel::<(
-        shared::SubscriptionId2,
-        switchboard_cluster::Delivery,
-    )>();
+    let (merged_tx, mut merged_rx) = unbounded_channel::<(shared::SubscriptionId2, Delivery)>();
     // Pending qos1 outbound deliveries awaiting PUBACK: pid → (consumer, seq).
     let mut awaiting_puback: HashMap<u16, (Arc<BridgeConsumer>, u64)> = HashMap::new();
 
     let keepalive = if keep_alive > 0 {
-        std::time::Duration::from_millis(u64::from(keep_alive) * 1500)
+        Duration::from_millis(u64::from(keep_alive) * 1500)
     } else {
-        std::time::Duration::MAX
+        Duration::MAX
     };
 
     let result = loop {
         // `Instant + Duration::MAX` (keep-alive 0 = disabled) overflows
         // and panics the session task; far_future() is the safe "never".
         // Ten years: effectively "never", with no Instant overflow.
-        const KEEPALIVE_OFF: std::time::Duration =
-            std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+        const KEEPALIVE_OFF: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
         let deadline = if keep_alive > 0 {
-            tokio::time::Instant::now() + keepalive
+            Instant::now() + keepalive
         } else {
-            tokio::time::Instant::now() + KEEPALIVE_OFF
+            Instant::now() + KEEPALIVE_OFF
         };
-        let packet = tokio::select! {
-            p = self::packet::read_packet(&mut reader) => match p {
+        let packet = select! {
+            p = read_packet(&mut reader) => match p {
                 Ok(Some(p)) => p,
                 Ok(None) => break Ok(()),
                 Err(e) => {
-                    tracing::debug!(err = %e, "mqtt: packet error");
+                    debug!(err = %e, "mqtt: packet error");
                     break Err(e);
                 }
             },
-            _ = tokio::time::sleep_until(deadline) => {
-                tracing::debug!("mqtt: keepalive expired");
+            _ = sleep_until(deadline) => {
+                debug!("mqtt: keepalive expired");
                 break Ok(());
             }
             Some((local, d)) = merged_rx.recv() => {
@@ -346,7 +355,7 @@ where
                         persistent: false,
                     };
                     if let Err(e) = shared::publish(&ctx, "amq.topic", &amqp_rk, message).await {
-                        tracing::debug!(err = %e, "mqtt: publish failed");
+                        debug!(err = %e, "mqtt: publish failed");
                     }
                 }
                 if retain {
@@ -399,7 +408,7 @@ where
                     {
                         Ok(()) => codes.push((*qos).min(2)),
                         Err(e) => {
-                            tracing::debug!(err = %e, filter, "mqtt: subscribe failed");
+                            debug!(err = %e, filter, "mqtt: subscribe failed");
                             codes.push(0x80);
                         }
                     }
@@ -462,11 +471,8 @@ async fn subscribe_one(
     qos: u8,
     session_queue: Option<&str>,
     subs: &mut HashMap<u64, SubEntry>,
-    merged_tx: &tokio::sync::mpsc::UnboundedSender<(
-        shared::SubscriptionId2,
-        switchboard_cluster::Delivery,
-    )>,
-) -> Result<(), switchboard_core::error::BrokerError> {
+    merged_tx: &UnboundedSender<(shared::SubscriptionId2, Delivery)>,
+) -> Result<(), BrokerError> {
     let local = ctx.next_sub();
     let queue = match session_queue {
         Some(q) => {
@@ -483,7 +489,7 @@ async fn subscribe_one(
             }
             q.to_string()
         }
-        None => switchboard_core::model::generate_queue_name(),
+        None => generate_queue_name(),
     };
     let shard = match session_queue {
         Some(q) => {
@@ -502,7 +508,7 @@ async fn subscribe_one(
     // Forward deliveries into the merged channel.
     let forward_tx = merged_tx.clone();
     let forward_local = local;
-    tokio::spawn(async move {
+    spawn(async move {
         while let Some(d) = rx.recv().await {
             if forward_tx.send((forward_local, d)).is_err() {
                 break;
@@ -537,6 +543,7 @@ pub fn convert_filter(filter: &str) -> String {
 #[cfg(test)]
 mod session_name_tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// The alert's exact collision: `a/b` and `a_b` must be distinct.
     #[test]
@@ -595,7 +602,7 @@ mod session_name_tests {
             "a#b",
             "a#b/",
         ];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for id in ids {
             assert!(seen.insert(session_queue_name(id)), "collision on {id:?}");
         }

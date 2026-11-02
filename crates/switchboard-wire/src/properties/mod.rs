@@ -449,7 +449,7 @@ mod flag_tests {
         bytes.extend_from_slice(&0x8001u16.to_be_bytes());
         bytes.extend_from_slice(&4u8.to_be_bytes());
         bytes.extend_from_slice(b"text");
-        let mut d = crate::wireio::Decoder::new(&bytes);
+        let mut d = Decoder::new(&bytes);
         let result = ContentHeader::decode(60, &mut d);
         assert!(matches!(result, Err(CodecError::PropertyFlagsOverflow)));
     }

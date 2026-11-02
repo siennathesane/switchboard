@@ -12,6 +12,9 @@
 //! or a mistyped integer width fails here.
 
 use serde_json::Value;
+use std::collections::HashMap;
+use std::fs::read_to_string;
+use std::iter::repeat;
 use switchboard_wire::CodecError;
 use switchboard_wire::method::Method;
 
@@ -25,12 +28,12 @@ fn registry() -> Value {
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/amqp-rabbitmq-0.9.1.json"
     );
-    let raw = std::fs::read_to_string(path).expect("registry json present");
+    let raw = read_to_string(path).expect("registry json present");
     serde_json::from_str(&raw).expect("registry parses")
 }
 
-fn domain_map(root: &Value) -> std::collections::HashMap<String, String> {
-    let mut m = std::collections::HashMap::new();
+fn domain_map(root: &Value) -> HashMap<String, String> {
+    let mut m = HashMap::new();
     for pair in root["domains"].as_array().expect("domains") {
         let name = pair[0].as_str().unwrap();
         let ty = pair[1].as_str().unwrap();
@@ -74,10 +77,7 @@ fn filler(base: &str) -> Vec<u8> {
 }
 
 /// Build a method payload exactly as the registry dictates.
-fn synthetic_payload(
-    domains: &std::collections::HashMap<String, String>,
-    args: &[Value],
-) -> Vec<u8> {
+fn synthetic_payload(domains: &HashMap<String, String>, args: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut bit_run = 0usize;
     for arg in args {
@@ -99,14 +99,14 @@ fn synthetic_payload(
         } else {
             // A non-bit argument flushes the running bit octet.
             if bit_run > 0 {
-                out.extend(std::iter::repeat(0u8).take((bit_run + 7) / 8));
+                out.extend(repeat(0u8).take((bit_run + 7) / 8));
                 bit_run = 0;
             }
             out.extend_from_slice(&filler(&base));
         }
     }
     if bit_run > 0 {
-        out.extend(std::iter::repeat(0u8).take((bit_run + 7) / 8));
+        out.extend(repeat(0u8).take((bit_run + 7) / 8));
     }
     out
 }

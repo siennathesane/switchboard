@@ -9,6 +9,7 @@
 mod support;
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use switchboard_wire::BasicProperties;
 
@@ -19,9 +20,13 @@ use support::declare_queue_everywhere;
 use support::publish;
 use support::start_cluster;
 use support::teardown_cluster;
+use switchboard_cluster::MAX_VOTERS;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 /// Serializes the nine size scenarios (see module docs).
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn size_scenario(n: u64) {
     let _guard = LOCK.lock().await;
@@ -30,10 +35,10 @@ async fn size_scenario(n: u64) {
     // Invariant: no group ever exceeds the voter cap.
     for (g, members) in &nodes[0].topology().groups {
         assert!(
-            members.len() <= switchboard_cluster::MAX_VOTERS,
+            members.len() <= MAX_VOTERS,
             "group {g} has {} members (cap {})",
             members.len(),
-            switchboard_cluster::MAX_VOTERS
+            MAX_VOTERS
         );
     }
 
@@ -61,18 +66,18 @@ async fn size_scenario(n: u64) {
 
     // Drain everything through node 0 and check the exact total: every
     // node's write must have landed exactly once.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen: Vec<Vec<u8>> = Vec::new();
     while seen.len() < n as usize {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "n={n}: only {} of {n} messages arrived: {seen:?}",
             seen.len()
         );
         match basic_get(&mut clients[0], 1, "mm", true).await {
             Ok(Some((_, body))) => seen.push(body),
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             Err(e) => panic!("n={n}: get failed: {e}"),
         }

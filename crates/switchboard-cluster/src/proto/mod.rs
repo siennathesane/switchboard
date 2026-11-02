@@ -27,6 +27,7 @@ use openraft::raft::VoteResponse;
 use serde::Deserialize;
 use serde::Serialize;
 
+use switchboard_core::error::BrokerError;
 use switchboard_core::model::ConnectionId;
 use switchboard_core::model::StoredMessage;
 use switchboard_core::model::SubscriptionId;
@@ -35,9 +36,11 @@ use switchboard_core::topology::GroupId;
 use switchboard_core::topology::MetaState;
 use switchboard_core::topology::NodeInfo;
 
+use crate::node::ClusterError;
 use crate::typ::BrokerCommand;
 use crate::typ::BrokerReply;
 use crate::typ::NodeId;
+use crate::typ::SwitchboardTypeConfig;
 
 /// One request-response exchange on the internal network.
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,17 +107,17 @@ pub enum ForwardError {
     Unreachable,
     NotJoined,
     /// The group's state machine rejected the command.
-    Broker(switchboard_core::error::BrokerError),
+    Broker(BrokerError),
     Other(String),
 }
 
-impl From<&crate::node::ClusterError> for ForwardError {
-    fn from(e: &crate::node::ClusterError) -> Self {
+impl From<&ClusterError> for ForwardError {
+    fn from(e: &ClusterError) -> Self {
         match e {
-            crate::node::ClusterError::Transient => ForwardError::Transient,
-            crate::node::ClusterError::Unreachable { .. } => ForwardError::Unreachable,
-            crate::node::ClusterError::NotJoined => ForwardError::NotJoined,
-            crate::node::ClusterError::Broker(b) => ForwardError::Broker(b.clone()),
+            ClusterError::Transient => ForwardError::Transient,
+            ClusterError::Unreachable { .. } => ForwardError::Unreachable,
+            ClusterError::NotJoined => ForwardError::NotJoined,
+            ClusterError::Broker(b) => ForwardError::Broker(b.clone()),
             other => ForwardError::Other(other.to_string()),
         }
     }
@@ -123,9 +126,9 @@ impl From<&crate::node::ClusterError> for ForwardError {
 /// The three openraft RPCs, verbatim.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RaftPayload {
-    AppendEntries(Box<AppendEntriesRequest<crate::typ::SwitchboardTypeConfig>>),
+    AppendEntries(Box<AppendEntriesRequest<SwitchboardTypeConfig>>),
     Vote(Box<VoteRequest<NodeId>>),
-    InstallSnapshot(Box<InstallSnapshotRequest<crate::typ::SwitchboardTypeConfig>>),
+    InstallSnapshot(Box<InstallSnapshotRequest<SwitchboardTypeConfig>>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -229,12 +232,15 @@ pub struct TopologySnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::deserialize;
+    use bincode::serialize;
+    use switchboard_core::auth::hash_password;
 
     #[test]
     fn messages_roundtrip_through_bincode() {
         let msg = InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping));
-        let bytes = bincode::serialize(&msg).unwrap();
-        let back: InternalMessage = bincode::deserialize(&bytes).unwrap();
+        let bytes = serialize(&msg).unwrap();
+        let back: InternalMessage = deserialize(&bytes).unwrap();
         assert!(matches!(
             back,
             InternalMessage::Request(InternalRequest::Admin(AdminRequest::Ping))
@@ -245,8 +251,8 @@ mod tests {
             nonce: vec![1, 2, 3],
             proof: vec![4, 5, 6],
         });
-        let bytes = bincode::serialize(&msg).unwrap();
-        let back: InternalMessage = bincode::deserialize(&bytes).unwrap();
+        let bytes = serialize(&msg).unwrap();
+        let back: InternalMessage = deserialize(&bytes).unwrap();
         assert!(matches!(
             back,
             InternalMessage::Request(InternalRequest::Auth { .. })
@@ -257,11 +263,11 @@ mod tests {
             command: BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "u".into(),
-                password_hash: switchboard_core::auth::hash_password("u", "p"),
+                password_hash: hash_password("u", "p"),
             },
         });
-        let bytes = bincode::serialize(&msg).unwrap();
-        let back: InternalMessage = bincode::deserialize(&bytes).unwrap();
+        let bytes = serialize(&msg).unwrap();
+        let back: InternalMessage = deserialize(&bytes).unwrap();
         assert!(matches!(
             back,
             InternalMessage::Request(InternalRequest::Forward { group: 2, .. })

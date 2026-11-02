@@ -7,11 +7,15 @@
 //! and browses the same service type, forwarding every resolved peer to
 //! the join loop.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use mdns_sd::ServiceDaemon;
 use mdns_sd::ServiceEvent;
 use mdns_sd::ServiceInfo;
+use tokio::spawn as tokio_spawn;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -29,7 +33,7 @@ pub struct MdnsHandle {
 }
 
 /// Pick a non-loopback IPv4 for advertisement (falling back to loopback).
-fn advertise_ip() -> std::net::IpAddr {
+fn advertise_ip() -> IpAddr {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
@@ -37,7 +41,7 @@ fn advertise_ip() -> std::net::IpAddr {
             let ip = i.ip();
             if !ip.is_loopback() { Some(ip) } else { None }
         })
-        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]))
+        .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]))
 }
 
 fn instance_name(cfg: &DiscoveryConfig, node_id: u64) -> String {
@@ -62,7 +66,7 @@ fn host_name(cfg: &DiscoveryConfig, node_id: u64) -> String {
 pub fn spawn(
     node: &Arc<ClusterNode>,
     cfg: &DiscoveryConfig,
-    tx: tokio::sync::mpsc::UnboundedSender<DiscoveredPeer>,
+    tx: UnboundedSender<DiscoveredPeer>,
 ) -> Result<MdnsHandle, String> {
     let daemon = ServiceDaemon::new().map_err(|e| format!("mdns daemon: {e}"))?;
 
@@ -83,7 +87,7 @@ pub fn spawn(
                 ("client".to_string(), node.cfg.client_addr.clone()),
             ]
             .into_iter()
-            .collect::<std::collections::HashMap<String, String>>(),
+            .collect::<HashMap<String, String>>(),
         ),
     )
     .map_err(|e| format!("service info: {e}"))?;
@@ -96,7 +100,7 @@ pub fn spawn(
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|e| format!("mdns browse: {e}"))?;
-    tokio::spawn(async move {
+    tokio_spawn(async move {
         while let Ok(event) = receiver.recv_async().await {
             if let ServiceEvent::ServiceResolved(info) = event {
                 let peer_id = info

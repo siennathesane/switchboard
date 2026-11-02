@@ -11,10 +11,22 @@
 //!   (the mismatched-deployment compatibility direction);
 //! * the shared secret never appears in captured log output.
 
+use std::env::temp_dir;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
+use std::io::Write;
+use std::net::TcpListener;
+use std::process::id as process_id;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Once;
 use std::time::Duration;
 
+use bincode::deserialize;
+use bincode::serialize;
+use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::META_GROUP;
 use switchboard_cluster::NodeConfig;
 use switchboard_cluster::proto::AdminRequest;
 use switchboard_cluster::proto::AdminResponse;
@@ -23,22 +35,29 @@ use switchboard_cluster::proto::InternalMessage;
 use switchboard_cluster::proto::InternalRequest;
 use switchboard_cluster::proto::InternalResponse;
 use switchboard_cluster::transport::PeerChannel;
+use switchboard_cluster::transport::PeerConn;
+use switchboard_core::topology::MetaCmd;
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
+use tokio::net::TcpStream;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 // ---------------------------------------------------------------------
 // Log capture: one process-global buffer behind a tracing writer, so
 // every test can assert its secret never leaked into any log line.
 // ---------------------------------------------------------------------
 
-static LOG_BUF: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static LOG_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 struct CapturedWriter;
 
-impl std::io::Write for CapturedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
         LOG_BUF.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> IoResult<()> {
         Ok(())
     }
 }
@@ -53,7 +72,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureMaker {
 }
 
 fn init_capture() {
-    static INIT: std::sync::Once = std::sync::Once::new();
+    static INIT: Once = Once::new();
     INIT.call_once(|| {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
@@ -83,7 +102,7 @@ fn assert_secret_never_logged(secret: &str, because: &str) {
 // ---------------------------------------------------------------------
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -116,11 +135,7 @@ async fn start_node_n(
 ) -> Arc<ClusterNode> {
     let cfg = NodeConfig {
         id,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-iauth-{tag}-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-iauth-{tag}-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal,
         seeds,
@@ -128,8 +143,8 @@ async fn start_node_n(
         expected_nodes,
         peers,
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: (!secret.is_empty()).then(|| secret.to_string()),
     };
     ClusterNode::start(cfg).await.unwrap()
@@ -163,7 +178,7 @@ async fn start_secret_cluster(secret: &str) -> [Arc<ClusterNode>; 3] {
         );
     }
     // Full formation everywhere: bootstrap entities + shard layout.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let ready = nodes.iter().all(|n| {
             let t = n.topology();
@@ -173,24 +188,21 @@ async fn start_secret_cluster(secret: &str) -> [Arc<ClusterNode>; 3] {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "three-node formation with shared secrets never completed"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
     // A beat for shard-group elections, like the server harness.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
     [nodes.remove(0), nodes.remove(0), nodes.remove(0)]
 }
 
 /// Exchange one envelope with the node's internal listener.
-async fn roundtrip(
-    conn: &mut switchboard_cluster::transport::PeerConn,
-    env: &Envelope,
-) -> Option<InternalResponse> {
-    conn.send(&bincode::serialize(env).unwrap()).await.ok()?;
+async fn roundtrip(conn: &mut PeerConn, env: &Envelope) -> Option<InternalResponse> {
+    conn.send(&serialize(env).unwrap()).await.ok()?;
     let back = conn.recv().await.ok()?;
-    let InternalMessage::Response(resp) = bincode::deserialize(&back).ok()? else {
+    let InternalMessage::Response(resp) = deserialize(&back).ok()? else {
         return None;
     };
     Some(resp)
@@ -205,10 +217,8 @@ fn ping(from: u64) -> Envelope {
 
 async fn declare_vhost(node: &Arc<ClusterNode>, name: &str) {
     node.write(
-        switchboard_cluster::META_GROUP,
-        switchboard_cluster::BrokerCommand::Meta(
-            switchboard_core::topology::MetaCmd::DeclareVhost { name: name.into() },
-        ),
+        META_GROUP,
+        BrokerCommand::Meta(MetaCmd::DeclareVhost { name: name.into() }),
     )
     .await
     .expect("meta write over the authenticated internal transport");
@@ -224,27 +234,25 @@ async fn declare_vhost(node: &Arc<ClusterNode>, name: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_secret_cluster_forms_and_refuses_strangers() {
     init_capture();
-    let secret = format!("iauth-form-{}-{}", std::process::id(), free_port());
+    let secret = format!("iauth-form-{}-{}", process_id(), free_port());
     let [n1, n2, n3] = start_secret_cluster(&secret).await;
 
     // Multi-master over authenticated internal connections: a meta write
     // through node 3 (forwarded to the meta leader and replicated back)
     // becomes visible on node 1.
     declare_vhost(&n3, "iauth-vh").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !n1.topology().vhosts.contains_key("iauth-vh") {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "cross-node write visibility never landed"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 
     // ---- Stranger A: no proof at all ----
-    let mut raw = tokio::net::TcpStream::connect(&n1.cfg.internal_addr)
-        .await
-        .unwrap();
-    let bytes = bincode::serialize(&ping(99)).unwrap();
+    let mut raw = TcpStream::connect(&n1.cfg.internal_addr).await.unwrap();
+    let bytes = serialize(&ping(99)).unwrap();
     let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
     framed.extend_from_slice(&bytes);
     use tokio::io::AsyncReadExt;
@@ -264,15 +272,11 @@ async fn shared_secret_cluster_forms_and_refuses_strangers() {
         Some(format!("wrong-{secret}")),
     );
     let err = wrong
-        .rpc(
-            &n1.cfg.internal_addr,
-            &bincode::serialize(&ping(99)).unwrap(),
-        )
+        .rpc(&n1.cfg.internal_addr, &serialize(&ping(99)).unwrap())
         .await
         .expect_err("a wrong proof must be refused");
     assert!(
-        err.kind() == std::io::ErrorKind::UnexpectedEof
-            || err.kind() == std::io::ErrorKind::ConnectionReset,
+        err.kind() == ErrorKind::UnexpectedEof || err.kind() == ErrorKind::ConnectionReset,
         "refusal should manifest as the server closing: {err:?}"
     );
 
@@ -291,13 +295,13 @@ async fn shared_secret_cluster_forms_and_refuses_strangers() {
 
     // And the members still serve each other (a write from node 2 lands).
     declare_vhost(&n2, "iauth-vh-2").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !n3.topology().vhosts.contains_key("iauth-vh-2") {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "cluster health after refused strangers never recovered"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 
     assert_secret_never_logged(&secret, "three-node formation scenario");
@@ -313,20 +317,20 @@ async fn shared_secret_cluster_forms_and_refuses_strangers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn authless_node_still_serves_a_secret_configured_dialer() {
     init_capture();
-    let secret = format!("iauth-mix-{}-{}", std::process::id(), free_port());
+    let secret = format!("iauth-mix-{}-{}", process_id(), free_port());
     let internal = format!("127.0.0.1:{}", free_port());
     let plain = start_node_n("plain", 1, internal, Vec::new(), Vec::new(), "", 1).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let t = plain.topology();
         if !t.vhosts.is_empty() && !t.groups.is_empty() {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "authless node never finished formation"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 
     let chan = PeerChannel::with_internal_auth(

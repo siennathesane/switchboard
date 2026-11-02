@@ -10,14 +10,21 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::interval;
+use tokio::time::sleep_until;
 
 use crate::soak::Ctx;
 
 pub async fn run(ctx: Arc<Ctx>) {
-    let mut tick = tokio::time::interval(ctx.cfg.health_every);
+    let mut tick = interval(ctx.cfg.health_every);
     tick.reset();
     loop {
-        tokio::select! {
+        select! {
             _ = ctx.token.cancelled() => return,
             _ = tick.tick() => {
                 let hosts = ctx.endpoints.snapshot().await;
@@ -29,7 +36,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                 for h in &hosts {
                     let ctx = ctx.clone();
                     let h = h.clone();
-                    jobs.push(tokio::spawn(async move { probe(&ctx, &h).await }));
+                    jobs.push(spawn(async move { probe(&ctx, &h).await }));
                 }
                 for j in jobs {
                     let _ = j.await;
@@ -58,17 +65,17 @@ async fn probe(ctx: &Arc<Ctx>, host: &str) {
 }
 
 async fn get_health(host: &str) -> Option<bool> {
-    let mut s = tokio::net::TcpStream::connect(host).await.ok()?;
+    let mut s = TcpStream::connect(host).await.ok()?;
     s.set_nodelay(true).ok();
     let req = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.ok()?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut raw = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
-        let n = tokio::select! {
+        let n = select! {
             r = s.read(&mut buf) => r.ok()?,
-            _ = tokio::time::sleep_until(deadline) => return None,
+            _ = sleep_until(deadline) => return None,
         };
         if n == 0 {
             break;
@@ -83,6 +90,6 @@ async fn get_health(host: &str) -> Option<bool> {
     Some(ok_status && ok_body)
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
-    vec![tokio::spawn(run(ctx.clone()))]
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
+    vec![spawn(run(ctx.clone()))]
 }

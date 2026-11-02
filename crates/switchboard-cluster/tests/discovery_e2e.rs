@@ -8,14 +8,31 @@
 //! differs): a real multicast round-trip assembles two zero-configuration
 //! nodes through `_switchboard._tcp.local.`.
 
+use std::env::set_var;
+use std::env::temp_dir;
+use std::future::Future;
+use std::net::TcpListener;
+use std::process::id as process_id;
+use std::thread::sleep as std_sleep;
 use std::time::Duration;
+use std::time::Instant as StdInstant;
 
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::MAX_VOTERS;
+use switchboard_cluster::NodeConfig;
 use switchboard_cluster::discovery::DiscoveryConfig;
 use switchboard_cluster::discovery::{self};
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
+use tokio::runtime::Builder;
+use tokio::spawn;
+use tokio::sync::watch::channel;
+use tokio::task::block_in_place;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -24,17 +41,17 @@ fn free_port() -> u16 {
 
 fn set_test_tempo() {
     unsafe {
-        std::env::set_var("SB_TIME_SCALE", "10");
+        set_var("SB_TIME_SCALE", "10");
     }
 }
 
 fn wait_until(mut check: impl FnMut() -> bool, secs: u64, what: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
         if check() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std_sleep(Duration::from_millis(100));
     }
     panic!("timed out waiting for {what}");
 }
@@ -45,13 +62,9 @@ async fn dns_seed_discovery_joins_a_pending_node() {
     // ---- node 1: the bootstrap cluster ----
     let internal1 = format!("127.0.0.1:{}", free_port());
     let client1 = format!("127.0.0.1:{}", free_port());
-    let cfg1 = switchboard_cluster::NodeConfig {
+    let cfg1 = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-disc1-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-disc1-{}-{}", process_id(), free_port())),
         client_addr: client1.clone(),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -59,8 +72,8 @@ async fn dns_seed_discovery_joins_a_pending_node() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
@@ -69,13 +82,9 @@ async fn dns_seed_discovery_joins_a_pending_node() {
     // ---- node 2: pending; discovers node 1 via a DNS seed ----
     let internal2 = format!("127.0.0.1:{}", free_port());
     let client2 = format!("127.0.0.1:{}", free_port());
-    let cfg2 = switchboard_cluster::NodeConfig {
+    let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-disc2-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-disc2-{}-{}", process_id(), free_port())),
         client_addr: client2.clone(),
         internal_addr: internal2.clone(),
         seeds: vec![],
@@ -83,19 +92,19 @@ async fn dns_seed_discovery_joins_a_pending_node() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
-    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let (_tx, rx) = channel(false);
     {
         let node2 = node2.clone();
         let cfg = DiscoveryConfig {
             dns_seeds: vec![format!("127.0.0.1:{port1}")],
             ..Default::default()
         };
-        tokio::spawn(async move { discovery::run(node2, cfg, rx).await });
+        spawn(async move { discovery::run(node2, cfg, rx).await });
     }
 
     // The joiner registers itself on node 1 through the discovered seed.
@@ -119,13 +128,13 @@ async fn dns_seed_discovery_joins_a_pending_node() {
     // Voter cap invariant still holds.
     for (g, members) in &node1.topology().groups {
         assert!(
-            members.len() <= switchboard_cluster::MAX_VOTERS,
+            members.len() <= MAX_VOTERS,
             "group {g} exceeds the voter cap"
         );
     }
 
     // Multi-master through the discovered node.
-    let (_tx2, rx2) = tokio::sync::watch::channel(false);
+    let (_tx2, rx2) = channel(false);
     let _ = rx2;
     wait_until(
         || !node2.topology().groups.is_empty(),
@@ -148,13 +157,9 @@ async fn dns_seed_discovery_joins_a_pending_node() {
 async fn mdns_discovery_assembles_two_nodes() {
     set_test_tempo();
     let internal1 = format!("127.0.0.1:{}", free_port());
-    let cfg1 = switchboard_cluster::NodeConfig {
+    let cfg1 = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-mdns1-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-mdns1-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -162,20 +167,16 @@ async fn mdns_discovery_assembles_two_nodes() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
 
     let internal2 = format!("127.0.0.1:{}", free_port());
-    let cfg2 = switchboard_cluster::NodeConfig {
+    let cfg2 = NodeConfig {
         id: 2,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-mdns2-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-mdns2-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal2.clone(),
         seeds: vec![],
@@ -183,15 +184,15 @@ async fn mdns_discovery_assembles_two_nodes() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node2 = ClusterNode::start(cfg2).await.unwrap();
 
     // Both advertise and browse.
-    let (_tx1, rx1) = tokio::sync::watch::channel(false);
-    let (_tx2, rx2) = tokio::sync::watch::channel(false);
+    let (_tx1, rx1) = channel(false);
+    let (_tx2, rx2) = channel(false);
     {
         let cfg = DiscoveryConfig {
             mdns: true,
@@ -199,7 +200,7 @@ async fn mdns_discovery_assembles_two_nodes() {
             ..Default::default()
         };
         let node = node1.clone();
-        tokio::spawn(async move { discovery::run(node, cfg, rx1).await });
+        spawn(async move { discovery::run(node, cfg, rx1).await });
     }
     {
         let cfg = DiscoveryConfig {
@@ -208,7 +209,7 @@ async fn mdns_discovery_assembles_two_nodes() {
             ..Default::default()
         };
         let node = node2.clone();
-        tokio::spawn(async move { discovery::run(node, cfg, rx2).await });
+        spawn(async move { discovery::run(node, cfg, rx2).await });
     }
 
     wait_until(
@@ -231,11 +232,7 @@ async fn meta_voters_grow_to_first_three_nodes() {
     let internal1 = format!("127.0.0.1:{}", free_port());
     let cfg1 = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-meta1-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-meta1-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: internal1.clone(),
         seeds: vec![],
@@ -243,8 +240,8 @@ async fn meta_voters_grow_to_first_three_nodes() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node1 = ClusterNode::start(cfg1).await.unwrap();
@@ -257,11 +254,7 @@ async fn meta_voters_grow_to_first_three_nodes() {
     for id in [2u64, 3u64] {
         let cfg = NodeConfig {
             id,
-            data_dir: std::env::temp_dir().join(format!(
-                "sb-meta{id}-{}-{}",
-                std::process::id(),
-                free_port()
-            )),
+            data_dir: temp_dir().join(format!("sb-meta{id}-{}-{}", process_id(), free_port())),
             client_addr: format!("127.0.0.1:{}", free_port()),
             internal_addr: format!("127.0.0.1:{}", free_port()),
             seeds: vec![internal1.clone()],
@@ -269,8 +262,8 @@ async fn meta_voters_grow_to_first_three_nodes() {
             expected_nodes: 1,
             peers: vec![],
             timeouts: Default::default(),
-            bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-            bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+            bootstrap_user: DEFAULT_USER.into(),
+            bootstrap_password: DEFAULT_PASSWORD.into(),
             internal_auth_secret: None,
         };
         let node = ClusterNode::start(cfg).await.unwrap();
@@ -285,7 +278,7 @@ async fn meta_voters_grow_to_first_three_nodes() {
     // The controller grows meta to {1,2,3} within a few ticks.
     wait_until(
         || {
-            tokio::task::block_in_place(|| {
+            block_in_place(|| {
                 futures_block_on(node1.meta_voters())
                     .as_ref()
                     .map(|v| v.len() == 3)
@@ -300,8 +293,8 @@ async fn meta_voters_grow_to_first_three_nodes() {
 }
 
 /// Tiny bridge: run a future on a nested current-thread runtime.
-fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
+fn futures_block_on<F: Future>(fut: F) -> F::Output {
+    Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
@@ -317,11 +310,7 @@ async fn discovery_with_unreachable_seeds_keeps_node_pending() {
 
     let cfg = NodeConfig {
         id: 9,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-pending-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-pending-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -329,25 +318,25 @@ async fn discovery_with_unreachable_seeds_keeps_node_pending() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node = ClusterNode::start(cfg).await.unwrap();
-    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let (_tx, rx) = channel(false);
     let disc = DiscoveryConfig {
         dns_seeds: vec!["127.0.0.1:1".to_string()], // port 1: nothing listens
         ..Default::default()
     };
     {
         let node = node.clone();
-        tokio::spawn(async move { discovery::run(node, disc, rx).await });
+        spawn(async move { discovery::run(node, disc, rx).await });
     }
 
     // The node stays pending: no cluster forms, nothing registers. The
     // dead seed fails fast (connection refused), so a short beat is
     // enough to be confident no bootstrap crept in.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
     assert!(
         node.topology().vhosts.is_empty(),
         "pending node must not self-bootstrap"
@@ -364,11 +353,7 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
     // full budget, then surfaces NotJoined and remains pending.
     let cfg = NodeConfig {
         id: 7,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-deadseed-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-deadseed-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![format!("127.0.0.1:{}", free_port())], // nothing listens
@@ -376,11 +361,11 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
-    let started = std::time::Instant::now();
+    let started = StdInstant::now();
     let node = ClusterNode::start(cfg).await; // must NOT error: pending mode
     let elapsed = started.elapsed();
     let node = match node {
@@ -391,10 +376,7 @@ async fn join_to_dead_seeds_times_out_and_stays_pending() {
     // refuses instantly each round; budget exhausted at 60s) then pending.
     // Tempo-scaled: the broker's 60 s join budget runs in ~1.2 s; only
     // assert it actually retried for a while rather than failing fast.
-    assert!(
-        elapsed >= std::time::Duration::from_millis(500),
-        "join must retry"
-    );
+    assert!(elapsed >= Duration::from_millis(500), "join must retry");
     assert!(node.topology().vhosts.is_empty());
     node.shutdown().await;
 }
@@ -408,11 +390,7 @@ async fn janitor_sweep_on_idle_node_is_harmless() {
     // seconds it must still serve writes (sweeps don't corrupt state).
     let cfg = NodeConfig {
         id: 1,
-        data_dir: std::env::temp_dir().join(format!(
-            "sb-jan-{}-{}",
-            std::process::id(),
-            free_port()
-        )),
+        data_dir: temp_dir().join(format!("sb-jan-{}-{}", process_id(), free_port())),
         client_addr: format!("127.0.0.1:{}", free_port()),
         internal_addr: format!("127.0.0.1:{}", free_port()),
         seeds: vec![],
@@ -420,20 +398,20 @@ async fn janitor_sweep_on_idle_node_is_harmless() {
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     let node = ClusterNode::start(cfg).await.unwrap();
     // Bootstrap entities are applied as soon as the meta raft commits
     // them; poll instead of sleeping a fixed sweep margin.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let topo = loop {
         let t = node.topology();
-        if !t.vhosts.is_empty() || tokio::time::Instant::now() >= deadline {
+        if !t.vhosts.is_empty() || Instant::now() >= deadline {
             break t;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(20)).await;
     };
     assert!(
         !topo.vhosts.is_empty(),

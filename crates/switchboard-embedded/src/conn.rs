@@ -1,10 +1,20 @@
 //! The embedded connection handle.
 
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::io::Error;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
+use switchboard_wire::method::Method;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
+use crate::broker::TrackedConn;
 use crate::channel::EmbeddedChannel;
 use crate::driver::ConnShared;
 use crate::driver::{self};
@@ -23,7 +33,7 @@ use crate::types::ReturnedMessage;
 /// until the broker stops (documented §9/R6 behavior — prefer closing).
 pub struct EmbeddedConnection {
     pub(crate) conn: Arc<ConnShared>,
-    pub(crate) registry: Arc<Mutex<std::collections::HashMap<u64, crate::broker::TrackedConn>>>,
+    pub(crate) registry: Arc<Mutex<HashMap<u64, TrackedConn>>>,
     pub(crate) key: u64,
     pub(crate) returns_rx: Mutex<Option<mpsc::UnboundedReceiver<ReturnedMessage>>>,
 }
@@ -35,15 +45,12 @@ impl EmbeddedConnection {
     /// Fails with [`ConnectError::Closed`] once the connection is gone,
     /// or when the negotiated channel-max is exhausted.
     pub async fn open_channel(&self) -> Result<EmbeddedChannel, ConnectError> {
-        if !self.conn.valid.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.conn.valid.load(Ordering::SeqCst) {
             return Err(ConnectError::Closed);
         }
-        let id = self
-            .conn
-            .next_channel
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self.conn.next_channel.fetch_add(1, Ordering::SeqCst);
         if self.conn.channel_max != 0 && id > self.conn.channel_max {
-            return Err(ConnectError::Io(std::io::Error::other(format!(
+            return Err(ConnectError::Io(Error::other(format!(
                 "channel limit {} reached on this connection",
                 self.conn.channel_max
             ))));
@@ -51,24 +58,23 @@ impl EmbeddedConnection {
         let ch = driver::ChannelShared::new(id, self.conn.clone());
         self.conn.channels.lock().unwrap().insert(id, ch.clone());
 
-        let open = switchboard_wire::method::Method::ChannelOpen {
+        let open = Method::ChannelOpen {
             out_of_band: String::new(),
         };
         let rx = driver::begin_call(&ch, &open).map_err(ConnectError::from)?;
-        let reply =
-            match tokio::time::timeout(driver::handshake_budget(), driver::await_call(rx)).await {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    return Err(ConnectError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Channel.Open-Ok did not arrive in time",
-                    )));
-                }
-            };
+        let reply = match timeout(driver::handshake_budget(), driver::await_call(rx)).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                return Err(ConnectError::Io(Error::new(
+                    ErrorKind::TimedOut,
+                    "Channel.Open-Ok did not arrive in time",
+                )));
+            }
+        };
         match reply {
-            Ok((switchboard_wire::method::Method::ChannelOpenOk { .. }, _)) => {}
+            Ok((Method::ChannelOpenOk { .. }, _)) => {}
             Ok((other, _)) => {
-                return Err(ConnectError::Io(std::io::Error::other(format!(
+                return Err(ConnectError::Io(Error::other(format!(
                     "unexpected reply {} to Channel.Open",
                     other.name()
                 ))));
@@ -108,13 +114,10 @@ impl EmbeddedConnection {
     }
 }
 
-impl std::fmt::Debug for EmbeddedConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for EmbeddedConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("EmbeddedConnection")
-            .field(
-                "open",
-                &self.conn.valid.load(std::sync::atomic::Ordering::Relaxed),
-            )
+            .field("open", &self.conn.valid.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }

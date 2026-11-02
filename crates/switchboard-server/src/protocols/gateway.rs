@@ -2,8 +2,11 @@
 //! bytes, classifies, and hands the socket (with its already-read
 //! prefix) to the right server.
 
+use std::io::Cursor;
+use std::io::Result as IoResult;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
 use std::task::Poll;
 
 use tokio::io::AsyncRead;
@@ -11,11 +14,15 @@ use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
 use switchboard_cluster::ClusterNode;
+use tokio::io::AsyncReadExt;
+use tokio::io::split;
+use tracing::debug;
 
 use crate::channel::ConnectionLimits;
 use crate::session::serve_rw;
 
 use super::amqp10;
+use super::connstats::ConnGuard;
 use super::detect::Classify;
 use super::detect::Detected;
 use super::detect::SNIFF_LEN;
@@ -29,14 +36,14 @@ use super::stomp;
 /// replayed in front of it. Reads drain the prefix first; writes pass
 /// through.
 pub struct Prefixed<S> {
-    prefix: std::io::Cursor<Vec<u8>>,
+    prefix: Cursor<Vec<u8>>,
     inner: S,
 }
 
 impl<S> Prefixed<S> {
     pub fn new(prefix: Vec<u8>, inner: S) -> Self {
         Prefixed {
-            prefix: std::io::Cursor::new(prefix),
+            prefix: Cursor::new(prefix),
             inner,
         }
     }
@@ -51,9 +58,9 @@ impl<S> Prefixed<S> {
 impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         let this = &mut *self;
         let pos = this.prefix.position() as usize;
         let data = this.prefix.get_ref();
@@ -70,21 +77,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
 impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<IoResult<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -95,7 +96,7 @@ pub async fn serve_client<S>(
     node: Arc<ClusterNode>,
     limits: ConnectionLimits,
     protocols: ProtocolConfig,
-) -> std::io::Result<()>
+) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -103,7 +104,7 @@ where
     let mut prefix: Vec<u8> = Vec::new();
     let detected = loop {
         let mut chunk = [0u8; SNIFF_LEN];
-        let n = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk).await?;
+        let n = AsyncReadExt::read(&mut socket, &mut chunk).await?;
         if n == 0 {
             return Ok(()); // client hung up during handshake
         }
@@ -112,12 +113,12 @@ where
             Classify::Yes(d) => break d,
             Classify::NeedMore => {
                 if prefix.len() >= SNIFF_LEN {
-                    tracing::debug!("gateway: unrecognized preamble; closing");
+                    debug!("gateway: unrecognized preamble; closing");
                     return Ok(());
                 }
             }
             Classify::Unknown => {
-                tracing::debug!("gateway: unrecognized protocol; closing");
+                debug!("gateway: unrecognized protocol; closing");
                 return Ok(());
             }
         }
@@ -131,7 +132,7 @@ where
         Detected::Http => protocols.http_health || protocols.websocket,
     };
     if !supported {
-        tracing::debug!(?detected, "gateway: protocol disabled by configuration");
+        debug!(?detected, "gateway: protocol disabled by configuration");
         return Ok(());
     }
 
@@ -139,10 +140,10 @@ where
     let io = Prefixed::new(prefix, socket);
     // Per-protocol connection accounting for /metrics: the gauge slot is
     // held for the connection's whole life and released on return.
-    let _conn_guard = super::connstats::ConnGuard::enter(detected);
+    let _conn_guard = ConnGuard::enter(detected);
     match detected {
         Detected::Amqp091 => {
-            let (r, w) = tokio::io::split(io);
+            let (r, w) = split(io);
             serve_rw(r, w, node, limits).await
         }
         Detected::Mqtt => mqtt::serve(io, node, limits.clone()).await,

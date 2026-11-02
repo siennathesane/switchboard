@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -133,7 +134,7 @@ struct Inner {
 pub struct Ledger {
     inner: Arc<Mutex<Inner>>,
     pub metrics: Arc<Metrics>,
-    started: Option<Arc<std::time::Instant>>,
+    started: Option<Arc<Instant>>,
 }
 
 impl Default for Ledger {
@@ -141,7 +142,7 @@ impl Default for Ledger {
         Ledger {
             inner: Default::default(),
             metrics: Default::default(),
-            started: Some(Arc::new(std::time::Instant::now())),
+            started: Some(Arc::new(Instant::now())),
         }
     }
 }
@@ -214,6 +215,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn ledger_counts_and_suppresses() {
@@ -231,7 +233,7 @@ mod tests {
 
     #[test]
     fn timestamp_format() {
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_400 * 19_723 + 3_723);
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 * 19_723 + 3_723);
         assert_eq!(humantimeish(t), "2024-01-01T01:02:03Z");
     }
 }

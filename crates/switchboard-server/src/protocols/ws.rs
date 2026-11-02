@@ -11,8 +11,14 @@
 //! 2. a `/mqtt`, `/stomp`, `/amqp10` request path,
 //! 3. sniffing the first frame's payload (same classifier as raw TCP).
 
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
+use std::mem::take;
 use std::pin::Pin;
+use std::str::from_utf8;
 use std::sync::Arc;
+use std::task::Context;
 use std::task::Poll;
 
 use base64::Engine;
@@ -24,12 +30,17 @@ use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 
 use switchboard_cluster::ClusterNode;
+use tokio::io::AsyncReadExt;
 
+use super::amqp10::serve as serve_amqp10;
 use super::detect::Classify;
 use super::detect::Detected;
 use super::detect::classify;
 use super::gateway::Prefixed;
+use super::mqtt::serve as serve_mqtt;
 use super::shared::ProtocolConfig;
+use super::stomp::serve as serve_stomp;
+use crate::channel::ConnectionLimits;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Refuse absurd frames (protection against runaway peers).
@@ -74,7 +85,7 @@ struct Handshake {
 }
 
 fn parse_handshake(head: &[u8]) -> Option<Handshake> {
-    let text = std::str::from_utf8(head).ok()?;
+    let text = from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     let request = lines.next()?;
     let path = request.split_whitespace().nth(1)?.to_string();
@@ -190,17 +201,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
     }
 }
 
-fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> {
+fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, Error> {
     if raw.len() < 2 {
         return Ok(None);
     }
     let b0 = raw[0];
     let b1 = raw[1];
     let opcode = Opcode::from_u8(b0 & 0x0F)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ws: bad opcode"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "ws: bad opcode"))?;
     if b1 & 0x80 == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             "ws: client frames must be masked",
         ));
     }
@@ -218,16 +229,12 @@ fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> 
         }
         let mut b = [0u8; 8];
         b.copy_from_slice(&raw[offset..offset + 8]);
-        len = usize::try_from(u64::from_be_bytes(b)).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "ws: frame too large")
-        })?;
+        len = usize::try_from(u64::from_be_bytes(b))
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "ws: frame too large"))?;
         offset += 8;
     }
     if len > MAX_FRAME {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ws: frame too large",
-        ));
+        return Err(Error::new(ErrorKind::InvalidData, "ws: frame too large"));
     }
     if raw.len() < offset + 4 + len {
         return Ok(None);
@@ -250,7 +257,7 @@ fn parse_frame_free(raw: &mut Vec<u8>) -> Result<Option<Frame>, std::io::Error> 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
     /// Drain complete frames from `raw`, updating inbox/queue state.
     /// Returns true when the connection should be treated as EOF.
-    fn absorb_frames(&mut self) -> Result<bool, std::io::Error> {
+    fn absorb_frames(&mut self) -> Result<bool, Error> {
         loop {
             let Some(frame) = parse_frame_free(&mut self.raw)? else {
                 return Ok(false);
@@ -295,9 +302,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         let this = &mut *self;
         loop {
             if !this.inbox_bytes().is_empty() {
@@ -345,24 +352,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
 impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<IoResult<usize>> {
         // Coalesce; bytes hit the wire on flush (protocols flush per
         // message, so latency is bounded by the protocol itself).
         self.out_frames.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         let this = &mut *self;
         // Any buffered-but-unwritten payload must be turned into exactly
         // one binary frame before it touches the wire.
         if this.out_written < this.out_frames.len() {
-            let payload = std::mem::take(&mut this.out_frames);
+            let payload = take(&mut this.out_frames);
             let mut framed = Vec::with_capacity(payload.len() + 10);
             encode_frame(Opcode::Binary, &payload, &mut framed);
             this.out_frames = framed;
@@ -375,10 +379,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         while this.out_written < this.out_frames.len() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.out_frames[this.out_written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "ws: inner wrote 0",
-                    )));
+                    return Poll::Ready(Err(Error::new(ErrorKind::WriteZero, "ws: inner wrote 0")));
                 }
                 Poll::Ready(Ok(n)) => this.out_written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -390,10 +391,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         let this = &mut *self;
         if !this.close_sent {
             this.close_sent = true;
@@ -415,8 +413,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
             while written < close.len() {
                 match Pin::new(&mut this.inner).poll_write(cx, &close[written..]) {
                     Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::WriteZero,
                             "ws: inner wrote 0",
                         )));
                     }
@@ -443,15 +441,15 @@ pub async fn serve_with_head<S>(
     head: &[u8],
     node: Arc<ClusterNode>,
     protocols: ProtocolConfig,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+    limits: ConnectionLimits,
+) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut io = io;
     let Some(handshake) = parse_handshake(head) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             "ws: malformed upgrade request",
         ));
     };
@@ -474,7 +472,7 @@ where
             // protocol reads its stream from byte 0.
             loop {
                 let mut one = [0u8; 256];
-                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut one).await?;
+                let n = AsyncReadExt::read(&mut stream, &mut one).await?;
                 if n == 0 {
                     return Ok(());
                 }
@@ -492,9 +490,9 @@ where
     };
     stream.unconsume(&sniff_buffer);
     match selected {
-        Some(Inner::Mqtt) if protocols.mqtt => super::mqtt::serve(stream, node, limits).await,
-        Some(Inner::Stomp) if protocols.stomp => super::stomp::serve(stream, node, limits).await,
-        Some(Inner::Amqp10) if protocols.amqp10 => super::amqp10::serve(stream, node, limits).await,
+        Some(Inner::Mqtt) if protocols.mqtt => serve_mqtt(stream, node, limits).await,
+        Some(Inner::Stomp) if protocols.stomp => serve_stomp(stream, node, limits).await,
+        Some(Inner::Amqp10) if protocols.amqp10 => serve_amqp10(stream, node, limits).await,
         _ => Ok(()), // unrecognized or disabled inner protocol
     }
 }
@@ -545,10 +543,13 @@ mod tests {
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::DuplexStream;
     use tokio::io::duplex;
+    use tokio::runtime::Builder;
 
     /// In-memory duplex satisfying the WsStream bounds.
-    async fn test_stream() -> WsStream<tokio::io::DuplexStream> {
+    async fn test_stream() -> WsStream<DuplexStream> {
         let (a, _b) = duplex(1024);
         WsStream::new(a)
     }
@@ -578,7 +579,7 @@ mod frame_tests {
 
     #[test]
     fn absorb_frames_queues_ping_and_close() {
-        let mut s = tokio::runtime::Builder::new_current_thread()
+        let mut s = Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -689,10 +690,7 @@ mod frame_tests {
 
     #[test]
     fn peer_vanish_surfaces_as_a_write_error() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async move {
             let (a, b) = duplex(64);
             let mut ws = WsStream::new(a);
@@ -730,7 +728,7 @@ mod frame_tests {
 
     #[test]
     fn ping_is_answered_with_pong_and_pong_is_ignored() {
-        let mut s = tokio::runtime::Builder::new_current_thread()
+        let mut s = Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -748,10 +746,7 @@ mod frame_tests {
 
     #[test]
     fn shutdown_sends_a_close_frame_then_shuts_the_inner_stream() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async move {
             let (a, mut b) = duplex(4096);
             let mut ws = WsStream::new(a);
@@ -760,9 +755,7 @@ mod frame_tests {
             // The peer sees a close frame (retry reads: the flush may
             // need a couple of polls to move the queued frame).
             let mut buf = vec![0u8; 64];
-            let n = tokio::io::AsyncReadExt::read(&mut b, &mut buf)
-                .await
-                .unwrap_or(0);
+            let n = AsyncReadExt::read(&mut b, &mut buf).await.unwrap_or(0);
             assert!(
                 n > 0 && buf[0] & 0x0F == 0x8,
                 "close frame written (n={n}, buf={:?})",
@@ -775,6 +768,8 @@ mod frame_tests {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use tokio::io::duplex;
 
     #[allow(dead_code)] // frame-construction helper kept for further ws conformance tests
@@ -801,9 +796,7 @@ mod stream_tests {
         use tokio::io::AsyncWriteExt;
         client.write_all(&frame).await.unwrap();
         let mut buf = [0u8; 32];
-        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
-            .await
-            .unwrap();
+        let n = AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
 
@@ -811,13 +804,11 @@ mod stream_tests {
     async fn ws_stream_writes_are_framed_for_the_peer() {
         let (mut client, server) = duplex(4096);
         let mut ws = WsStream::new(server);
-        tokio::io::AsyncWriteExt::write_all(&mut ws, b"payload")
-            .await
-            .unwrap();
-        tokio::io::AsyncWriteExt::flush(&mut ws).await.unwrap();
+        AsyncWriteExt::write_all(&mut ws, b"payload").await.unwrap();
+        AsyncWriteExt::flush(&mut ws).await.unwrap();
         // The peer sees a framed binary message.
         let mut hdr = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut client, &mut hdr)
+        AsyncReadExt::read_exact(&mut client, &mut hdr)
             .await
             .unwrap();
         assert_eq!(hdr[0] & 0x80, 0x80, "FIN set");
@@ -825,7 +816,7 @@ mod stream_tests {
         assert_eq!(hdr[1] & 0x80, 0, "server frames are unmasked");
         let len = (hdr[1] & 0x7F) as usize;
         let mut payload = vec![0u8; len];
-        tokio::io::AsyncReadExt::read_exact(&mut client, &mut payload)
+        AsyncReadExt::read_exact(&mut client, &mut payload)
             .await
             .unwrap();
         assert_eq!(payload, b"payload");
@@ -836,7 +827,7 @@ mod stream_tests {
         let (mut client, server) = duplex(4096);
         let mut ws = WsStream::new(server);
         // Close frame with a two-byte status (masked by the client).
-        tokio::io::AsyncWriteExt::write_all(
+        AsyncWriteExt::write_all(
             &mut client,
             &[0x88, 0x82, 9, 9, 9, 9, 0x03, 0xE8 ^ 9 ^ 9 ^ 9 ^ 9],
         )
@@ -845,9 +836,7 @@ mod stream_tests {
         let mut buf = [0u8; 32];
         // First read may see queued data; the loop must terminate.
         loop {
-            let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
-                .await
-                .unwrap();
+            let n = AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
             if n == 0 {
                 break;
             }
@@ -859,22 +848,20 @@ mod stream_tests {
         let (mut client, server) = duplex(4096);
         let mut ws = WsStream::new(server);
         // FIN=0 text fragment + FIN=1 continuation, each masked.
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x01, 0x83, 1, 2, 3, 4])
+        AsyncWriteExt::write_all(&mut client, &[0x01, 0x83, 1, 2, 3, 4])
             .await
             .unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[b'a' ^ 1, b'b' ^ 2, b'c' ^ 3])
+        AsyncWriteExt::write_all(&mut client, &[b'a' ^ 1, b'b' ^ 2, b'c' ^ 3])
             .await
             .unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[0x80, 0x82, 5, 6, 7, 8])
+        AsyncWriteExt::write_all(&mut client, &[0x80, 0x82, 5, 6, 7, 8])
             .await
             .unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut client, &[b'd' ^ 5, b'e' ^ 6])
+        AsyncWriteExt::write_all(&mut client, &[b'd' ^ 5, b'e' ^ 6])
             .await
             .unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::io::AsyncReadExt::read(&mut ws, &mut buf)
-            .await
-            .unwrap();
+        let n = AsyncReadExt::read(&mut ws, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"abcde");
     }
 

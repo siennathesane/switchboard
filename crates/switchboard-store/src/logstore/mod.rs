@@ -6,6 +6,8 @@
 //! * `log/{index:020}` — log entries, ordered by zero-padded index so
 //!   RocksDB prefix iteration yields log order.
 
+use bincode::deserialize;
+use bincode::serialize;
 use openraft::AnyError;
 use openraft::LogId;
 use openraft::RaftLogReader;
@@ -15,11 +17,18 @@ use openraft::Vote;
 use openraft::storage::LogFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogStorage;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::kv::RocksKv;
 use crate::typ::NodeId;
 use crate::typ::SwitchboardTypeConfig;
+use std::error::Error;
+use std::fmt::Debug;
+use std::io::Error as IoError;
+use std::ops::Bound;
+use std::ops::RangeBounds;
+use std::str::from_utf8;
 
 fn log_key(prefix: &[u8], index: u64) -> Vec<u8> {
     let mut k = logs_prefix(prefix);
@@ -47,23 +56,23 @@ fn last_purged_key(prefix: &[u8]) -> Vec<u8> {
 }
 
 fn msg_err(msg: &str) -> AnyError {
-    AnyError::new(&std::io::Error::other(msg.to_string()))
+    AnyError::new(&IoError::other(msg.to_string()))
 }
 
-fn any_err(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
+fn any_err(e: impl Error + Send + Sync + 'static) -> AnyError {
     AnyError::new(&e)
 }
 
 fn io_fail(
     subject: openraft::ErrorSubject<NodeId>,
     verb: openraft::ErrorVerb,
-    e: impl std::error::Error + Send + Sync + 'static,
+    e: impl Error + Send + Sync + 'static,
 ) -> StorageError<NodeId> {
     StorageIOError::new(subject, verb, AnyError::new(&e)).into()
 }
 
-fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
-    bincode::serialize(v).map_err(|e| {
+fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
+    serialize(v).map_err(|e| {
         StorageIOError::new(
             openraft::ErrorSubject::Store,
             openraft::ErrorVerb::Write,
@@ -74,7 +83,7 @@ fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
 }
 
 fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<NodeId>> {
-    bincode::deserialize(bytes).map_err(|e| {
+    deserialize(bytes).map_err(|e| {
         StorageIOError::new(
             openraft::ErrorSubject::Store,
             openraft::ErrorVerb::Read,
@@ -140,28 +149,26 @@ impl LogStore {
             .ok()?
             .pop()
             .and_then(|(k, _)| {
-                let s = std::str::from_utf8(&k).ok()?;
+                let s = from_utf8(&k).ok()?;
                 s.rsplit('/').next()?.parse().ok()
             })
     }
 }
 
 impl RaftLogReader<SwitchboardTypeConfig> for LogStore {
-    async fn try_get_log_entries<
-        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend,
-    >(
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<SwitchboardTypeConfig>>, StorageError<NodeId>> {
         let start = match range.start_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => i + 1,
-            std::ops::Bound::Unbounded => 0,
+            Bound::Included(i) => *i,
+            Bound::Excluded(i) => i + 1,
+            Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(i) => i + 1,
-            std::ops::Bound::Excluded(i) => *i,
-            std::ops::Bound::Unbounded => u64::MAX,
+            Bound::Included(i) => i + 1,
+            Bound::Excluded(i) => *i,
+            Bound::Unbounded => u64::MAX,
         };
         // Seek to the start index (zero-padded keys keep order) and scan
         // while keys remain under the group's log/ namespace.
@@ -171,7 +178,7 @@ impl RaftLogReader<SwitchboardTypeConfig> for LogStore {
             .map_err(|e| io_fail(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e))?;
         let mut out = Vec::new();
         for (k, v) in pairs {
-            let parsed = std::str::from_utf8(&k)
+            let parsed = from_utf8(&k)
                 .ok()
                 .and_then(|s| s.rsplit('/').next()?.parse::<u64>().ok());
             let idx = match parsed {
@@ -274,7 +281,7 @@ impl RaftLogStorage<SwitchboardTypeConfig> for LogStore {
             .map_err(|e| io_fail(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Delete, e))?
             .into_iter()
             .take_while(|(k, _)| {
-                std::str::from_utf8(k)
+                from_utf8(k)
                     .ok()
                     .and_then(|s| s.rsplit('/').next()?.parse::<u64>().ok())
                     .map(|i| i <= log_id.index)
@@ -385,6 +392,7 @@ mod bounds_tests {
     use openraft::CommittedLeaderId;
     use openraft::Entry;
     use openraft::EntryPayload;
+    use std::ops::Bound;
 
     fn store(name: &str) -> LogStore {
         LogStore::new(RocksKv::open_temp(name), 7)
@@ -409,19 +417,19 @@ mod bounds_tests {
         assert_eq!(all.len(), 4);
         // Excluded start skips the boundary index.
         let excl = st
-            .try_get_log_entries((std::ops::Bound::Excluded(1), std::ops::Bound::Unbounded))
+            .try_get_log_entries((Bound::Excluded(1), Bound::Unbounded))
             .await
             .unwrap();
         assert_eq!(excl.len(), 2, "indices 2 and 3");
         // Included end is inclusive.
         let incl = st
-            .try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Included(1)))
+            .try_get_log_entries((Bound::Unbounded, Bound::Included(1)))
             .await
             .unwrap();
         assert_eq!(incl.len(), 2, "indices 0 and 1");
         // Excluded end is exclusive.
         let excl_end = st
-            .try_get_log_entries((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(2)))
+            .try_get_log_entries((Bound::Unbounded, Bound::Excluded(2)))
             .await
             .unwrap();
         assert_eq!(excl_end.len(), 2, "indices 0 and 1");

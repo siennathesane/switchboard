@@ -9,6 +9,8 @@
 mod support;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use switchboard_wire::BasicProperties;
 
@@ -23,6 +25,10 @@ use support::start_broker_node;
 use support::start_cluster;
 use support::teardown_cluster;
 use support::wait_until;
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::MAX_VOTERS;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_autoscales_up_from_3_to_9_nodes() {
@@ -95,13 +101,13 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
         // Voter-cap invariant after the reconfiguration.
         for (g, members) in &nodes[0].topology().groups {
             assert!(
-                members.len() <= switchboard_cluster::MAX_VOTERS,
+                members.len() <= MAX_VOTERS,
                 "join {id}: group {g} has {} members",
                 members.len()
             );
         }
         // A beat for the new group's raft to elect through the joiner.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        sleep(Duration::from_millis(900)).await;
 
         // Multi-master through the freshest node: it declares its own
         // queue, publishes, and the message is retrievable from node 1.
@@ -158,10 +164,10 @@ async fn cluster_autoscales_up_from_3_to_9_nodes() {
 /// Publishes are asynchronous across connections, so a single immediate
 /// get would race the enqueue's raft write.
 async fn get_eventually(c: &mut TestClient, queue: &str, want: &[u8]) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "message {want:?} never arrived on {queue:?}"
         );
         match basic_get(c, 1, queue, true).await {
@@ -170,7 +176,7 @@ async fn get_eventually(c: &mut TestClient, queue: &str, want: &[u8]) {
                 return;
             }
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             Err(e) => panic!("get on {queue:?} failed: {e}"),
         }
@@ -178,6 +184,6 @@ async fn get_eventually(c: &mut TestClient, queue: &str, want: &[u8]) {
 }
 
 /// The internal addresses of `nodes`, in list order (from NodeConfig).
-fn addrs_nodes_internal(nodes: &[std::sync::Arc<switchboard_cluster::ClusterNode>]) -> Vec<String> {
+fn addrs_nodes_internal(nodes: &[Arc<ClusterNode>]) -> Vec<String> {
     nodes.iter().map(|n| n.cfg.internal_addr.clone()).collect()
 }

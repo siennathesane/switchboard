@@ -5,10 +5,24 @@
 //! Frame layout: `u32` little-endian length (excluding itself), then that
 //! many bytes of bincode-encoded [`Envelope`](crate::proto::Envelope).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::internal_auth::auth_frame;
+use switchboard_core::tempo::scale;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -23,26 +37,26 @@ pub enum Accepted {
 }
 
 impl Accepted {
-    fn as_read(&mut self) -> &mut (dyn tokio::io::AsyncRead + Unpin + Send) {
+    fn as_read(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
         match self {
             Accepted::Plain(s) => s,
             Accepted::Tls(s) => s,
         }
     }
 
-    fn as_write(&mut self) -> &mut (dyn tokio::io::AsyncWrite + Unpin + Send) {
+    fn as_write(&mut self) -> &mut (dyn AsyncWrite + Unpin + Send) {
         match self {
             Accepted::Plain(s) => s,
             Accepted::Tls(s) => s,
         }
     }
 
-    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::write_all(self.as_write(), data).await
+    async fn write_all(&mut self, data: &[u8]) -> IoResult<()> {
+        AsyncWriteExt::write_all(self.as_write(), data).await
     }
 
-    async fn flush(&mut self) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::flush(self.as_write()).await
+    async fn flush(&mut self) -> IoResult<()> {
+        AsyncWriteExt::flush(self.as_write()).await
     }
 }
 
@@ -56,14 +70,14 @@ pub struct PeerChannel {
     connector: Option<TlsConnector>,
     pub server_name: String,
     /// One RPC's reply wait. Configurable via `Timeouts`.
-    pub reply_budget: std::time::Duration,
+    pub reply_budget: Duration,
     /// Shared secret for the internal-transport handshake (code-scanning
     /// alert #5). When set, every FRESH connection this channel dials
     /// presents an auth proof frame first; pooled (already-authenticated)
     /// connections are reused without re-proving. `None` keeps the
     /// historical unauthenticated dial.
     internal_auth_secret: Option<String>,
-    idle: tokio::sync::Mutex<std::collections::HashMap<String, Vec<PeerConn>>>,
+    idle: Mutex<HashMap<String, Vec<PeerConn>>>,
 }
 
 /// Idle connections parked per peer address. Under a replication burst
@@ -79,7 +93,7 @@ const IDLE_CAP: usize = 32;
 /// not park the caller forever. Test tempo scales this like every other
 /// fixed delay. Default 5 s — a realtime budget; override through
 /// `Timeouts::rpc_reply_budget`.
-const REPLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const REPLY_BUDGET: Duration = Duration::from_secs(5);
 
 impl PeerChannel {
     pub fn new(connector: Option<TlsConnector>, server_name: String) -> Self {
@@ -88,7 +102,7 @@ impl PeerChannel {
             server_name,
             reply_budget: REPLY_BUDGET,
             internal_auth_secret: None,
-            idle: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            idle: Mutex::new(HashMap::new()),
         }
     }
 
@@ -96,7 +110,7 @@ impl PeerChannel {
     pub fn with_reply_budget(
         connector: Option<TlsConnector>,
         server_name: String,
-        reply_budget: std::time::Duration,
+        reply_budget: Duration,
     ) -> Self {
         PeerChannel {
             reply_budget,
@@ -113,7 +127,7 @@ impl PeerChannel {
     pub fn with_internal_auth(
         connector: Option<TlsConnector>,
         server_name: String,
-        reply_budget: std::time::Duration,
+        reply_budget: Duration,
         secret: Option<String>,
     ) -> Self {
         PeerChannel {
@@ -122,13 +136,13 @@ impl PeerChannel {
         }
     }
 
-    pub async fn connect(&self, addr: &str) -> std::io::Result<PeerConn> {
+    pub async fn connect(&self, addr: &str) -> IoResult<PeerConn> {
         let tcp = TcpStream::connect(addr).await?;
         tcp.set_nodelay(true).ok();
         let mut conn = match &self.connector {
             Some(c) => {
                 let name = rustls::pki_types::ServerName::try_from(self.server_name.clone())
-                    .map_err(|e| std::io::Error::other(format!("bad server name: {e}")))?;
+                    .map_err(|e| Error::other(format!("bad server name: {e}")))?;
                 let tls = c.connect(name, tcp).await?;
                 PeerConn::Tls(tls)
             }
@@ -140,7 +154,7 @@ impl PeerChannel {
         // (secret-here, none-there) deployment still lines up requests
         // with replies.
         if let Some(secret) = &self.internal_auth_secret {
-            conn.send(&crate::internal_auth::auth_frame(secret)).await?;
+            conn.send(&auth_frame(secret)).await?;
         }
         Ok(conn)
     }
@@ -150,7 +164,7 @@ impl PeerChannel {
     /// (possibly stale) connection retries once over a fresh dial.
     /// Requests are idempotent one-shot RPCs; at-least-once is
     /// acceptable for that retry.
-    pub async fn rpc(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
+    pub async fn rpc(&self, addr: &str, req: &[u8]) -> IoResult<Vec<u8>> {
         self.rpc_inner(addr, req, None).await
     }
 
@@ -168,8 +182,8 @@ impl PeerChannel {
         &self,
         addr: &str,
         req: &[u8],
-        deadline: tokio::time::Instant,
-    ) -> std::io::Result<Vec<u8>> {
+        deadline: Instant,
+    ) -> IoResult<Vec<u8>> {
         self.rpc_inner(addr, req, Some(deadline)).await
     }
 
@@ -180,8 +194,8 @@ impl PeerChannel {
         &self,
         addr: &str,
         req: &[u8],
-        deadline: Option<tokio::time::Instant>,
-    ) -> std::io::Result<Vec<u8>> {
+        deadline: Option<Instant>,
+    ) -> IoResult<Vec<u8>> {
         let mut over_reused_conn = true;
         let mut conn = match self.take_idle(addr).await {
             Some(c) => c,
@@ -196,25 +210,22 @@ impl PeerChannel {
                 // is the cap; a caller whose budget is already spent
                 // fails fast instead of parking for a full reply_budget.
                 Some(d) => {
-                    let remaining = d.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = d.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
+                        return Err(Error::new(
+                            ErrorKind::TimedOut,
                             "no reply from peer (caller budget exhausted)",
                         ));
                     }
-                    switchboard_core::tempo::scale(self.reply_budget).min(remaining)
+                    scale(self.reply_budget).min(remaining)
                 }
-                None => switchboard_core::tempo::scale(self.reply_budget),
+                None => scale(self.reply_budget),
             };
             let outcome = async {
                 conn.send(req).await?;
-                match tokio::time::timeout(budget, conn.recv()).await {
+                match timeout(budget, conn.recv()).await {
                     Ok(r) => r,
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "no reply from peer",
-                    )),
+                    Err(_) => Err(Error::new(ErrorKind::TimedOut, "no reply from peer")),
                 }
             }
             .await;
@@ -258,34 +269,34 @@ pub enum PeerConn {
 }
 
 impl PeerConn {
-    fn as_read(&mut self) -> &mut (dyn tokio::io::AsyncRead + Unpin + Send) {
+    fn as_read(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
         match self {
             PeerConn::Plain(s) => s,
             PeerConn::Tls(s) => s,
         }
     }
 
-    fn as_write(&mut self) -> &mut (dyn tokio::io::AsyncWrite + Unpin + Send) {
+    fn as_write(&mut self) -> &mut (dyn AsyncWrite + Unpin + Send) {
         match self {
             PeerConn::Plain(s) => s,
             PeerConn::Tls(s) => s,
         }
     }
 
-    pub async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    pub async fn send(&mut self, bytes: &[u8]) -> IoResult<()> {
         let len = (bytes.len() as u32).to_le_bytes();
         self.write_all(&len).await?;
         self.write_all(bytes).await?;
         self.flush().await
     }
 
-    pub async fn recv(&mut self) -> std::io::Result<Vec<u8>> {
+    pub async fn recv(&mut self) -> IoResult<Vec<u8>> {
         let mut len_buf = [0u8; 4];
         Self::read_exact_into(self.as_read(), &mut len_buf).await?;
         let len = u32::from_le_bytes(len_buf);
         if len > MAX_FRAME {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(Error::new(
+                ErrorKind::InvalidData,
                 format!("frame of {len} bytes exceeds internal limit"),
             ));
         }
@@ -296,15 +307,15 @@ impl PeerConn {
 
     /// Read exactly `buf.len()` bytes across partial reads.
     async fn read_exact_into(
-        read: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        read: &mut (dyn AsyncRead + Unpin + Send),
         buf: &mut [u8],
-    ) -> std::io::Result<()> {
+    ) -> IoResult<()> {
         let mut done = 0usize;
         while done < buf.len() {
-            let n = tokio::io::AsyncReadExt::read(read, &mut buf[done..]).await?;
+            let n = AsyncReadExt::read(read, &mut buf[done..]).await?;
             if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
                     "peer closed mid-frame",
                 ));
             }
@@ -313,17 +324,17 @@ impl PeerConn {
         Ok(())
     }
 
-    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::write_all(self.as_write(), data).await
+    async fn write_all(&mut self, data: &[u8]) -> IoResult<()> {
+        AsyncWriteExt::write_all(self.as_write(), data).await
     }
 
-    async fn flush(&mut self) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::flush(self.as_write()).await
+    async fn flush(&mut self) -> IoResult<()> {
+        AsyncWriteExt::flush(self.as_write()).await
     }
 }
 
 /// Accept one internal connection (TLS wrapped when configured).
-pub async fn accept(tcp: TcpStream, tls: Option<&TlsAcceptor>) -> std::io::Result<Accepted> {
+pub async fn accept(tcp: TcpStream, tls: Option<&TlsAcceptor>) -> IoResult<Accepted> {
     tcp.set_nodelay(true).ok();
     match tls {
         Some(a) => Ok(Accepted::Tls(Box::new(a.accept(tcp).await?))),
@@ -333,13 +344,13 @@ pub async fn accept(tcp: TcpStream, tls: Option<&TlsAcceptor>) -> std::io::Resul
 
 impl Accepted {
     /// Read exactly `buf.len()` bytes.
-    async fn read_exact_into(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    async fn read_exact_into(&mut self, buf: &mut [u8]) -> IoResult<()> {
         let mut done = 0usize;
         while done < buf.len() {
-            let n = tokio::io::AsyncReadExt::read(self.as_read(), &mut buf[done..]).await?;
+            let n = AsyncReadExt::read(self.as_read(), &mut buf[done..]).await?;
             if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
                     "peer closed mid-frame",
                 ));
             }
@@ -349,13 +360,13 @@ impl Accepted {
     }
 
     /// Read one length-prefixed frame (respects partial reads).
-    pub async fn read_frame_full(&mut self) -> std::io::Result<Vec<u8>> {
+    pub async fn read_frame_full(&mut self) -> IoResult<Vec<u8>> {
         let mut len_buf = [0u8; 4];
         self.read_exact_into(&mut len_buf).await?;
         let len = u32::from_le_bytes(len_buf);
         if len > MAX_FRAME {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(Error::new(
+                ErrorKind::InvalidData,
                 format!("frame of {len} bytes exceeds internal limit"),
             ));
         }
@@ -365,7 +376,7 @@ impl Accepted {
     }
 
     /// Write one length-prefixed frame.
-    pub async fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    pub async fn write_frame(&mut self, bytes: &[u8]) -> IoResult<()> {
         let len = (bytes.len() as u32).to_le_bytes();
         let mut frame = Vec::with_capacity(4 + bytes.len());
         frame.extend_from_slice(&len);
@@ -427,13 +438,18 @@ pub fn tls_connector(ca_pem: &[u8]) -> Result<TlsConnector, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::pending;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::spawn;
+    use tokio::time::Instant;
 
     #[tokio::test]
     async fn plain_frames_roundtrip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut acc = accept(tcp, None).await.unwrap();
             let frame = acc.read_frame_full().await.unwrap();
@@ -450,9 +466,9 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_frames_are_rejected() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut acc = accept(tcp, None).await.unwrap();
             let _ = acc.read_frame_full().await;
@@ -478,26 +494,26 @@ mod tests {
     /// budget.
     #[tokio::test]
     async fn rpc_with_deadline_gives_up_at_the_deadline_against_a_blackhole() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         // Accept and hang forever: never read, never reply, never close.
-        let sink = tokio::spawn(async move {
+        let sink = spawn(async move {
             let (_sock, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
+            pending::<()>().await;
         });
         let chan = PeerChannel::new(None, "localhost".into());
         assert_eq!(
             chan.reply_budget,
-            std::time::Duration::from_secs(5),
+            Duration::from_secs(5),
             "default reply budget is the 5 s realtime bound"
         );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-        let start = tokio::time::Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let start = Instant::now();
         let res = chan.rpc_with_deadline(&addr, b"ping", deadline).await;
         let elapsed = start.elapsed();
         assert!(res.is_err(), "a blackhole must not produce a reply");
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < Duration::from_secs(2),
             "deadline-capped rpc returned after {elapsed:?} (reply budget 5 s)"
         );
         sink.abort();
@@ -507,13 +523,22 @@ mod tests {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+    use crate::internal_auth::verify;
+    use crate::proto::Envelope;
+    use bincode::deserialize;
+    use std::io::Error;
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::spawn;
+    use tokio::task::JoinHandle;
 
     /// Bind a loopback listener and return its address + an accept task
     /// handle that echoes one length-prefixed frame back.
-    async fn echo_server() -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn echo_server() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut accepted = accept(sock, None).await.unwrap();
             let frame = accepted.read_frame_full().await.unwrap();
@@ -535,14 +560,14 @@ mod wire_tests {
 
     #[tokio::test]
     async fn accepted_read_frame_full_rejects_oversized() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut accepted = accept(sock, None).await.unwrap();
             // A length prefix of u32::MAX exceeds MAX_FRAME.
             let err = accepted.read_frame_full().await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
         });
         // Write the raw 4-byte length prefix directly (no framing helper).
         let mut raw = TcpStream::connect(&addr).await.unwrap();
@@ -556,9 +581,9 @@ mod wire_tests {
     async fn peer_conn_recv_survives_partial_reads() {
         // Feed the length prefix and payload byte-by-byte; recv must
         // assemble across partial reads.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             use tokio::io::AsyncWriteExt;
             for b in 5u32.to_le_bytes().iter().chain(b"hello".iter()) {
@@ -575,16 +600,16 @@ mod wire_tests {
 
     #[tokio::test]
     async fn peer_conn_recv_errors_on_immediate_eof() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             drop(sock);
         });
         let channel = PeerChannel::new(None, "localhost".into());
         let mut conn = channel.connect(&addr).await.unwrap();
         let err = conn.recv().await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         server.await.unwrap();
     }
 
@@ -596,21 +621,21 @@ mod wire_tests {
         // cleartext secret.
         use crate::proto::InternalMessage;
         use crate::proto::InternalRequest;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let secret = "transport-test-secret".to_string();
         let want_secret = secret.clone();
-        let server = tokio::spawn(async move {
+        let server = spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut accepted = accept(sock, None).await.unwrap();
             let frame = accepted.read_frame_full().await.unwrap();
-            let env: crate::proto::Envelope = bincode::deserialize(&frame).unwrap();
+            let env: Envelope = deserialize(&frame).unwrap();
             let InternalMessage::Request(InternalRequest::Auth { nonce, proof }) = env.message
             else {
                 panic!("first frame must be the auth request");
             };
             assert!(
-                crate::internal_auth::verify(&want_secret, &nonce, &proof),
+                verify(&want_secret, &nonce, &proof),
                 "proof must verify against the shared secret"
             );
             assert!(
@@ -623,7 +648,7 @@ mod wire_tests {
         let channel = PeerChannel::with_internal_auth(
             None,
             "localhost".into(),
-            std::time::Duration::from_secs(5),
+            Duration::from_secs(5),
             Some(secret),
         );
         let mut conn = channel.connect(&addr).await.unwrap();
@@ -634,7 +659,7 @@ mod wire_tests {
     #[test]
     fn accepted_debug_names_variants() {
         // Compile-time surface check of the Debug naming used in logs.
-        let text = format!("{:?}", std::io::Error::new(std::io::ErrorKind::Other, "x"));
+        let text = format!("{:?}", Error::new(ErrorKind::Other, "x"));
         assert!(!text.is_empty());
     }
 }

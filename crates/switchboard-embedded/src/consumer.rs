@@ -1,10 +1,16 @@
 //! The consumer handle: a push stream of deliveries for one subscription.
 
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::io::Error;
 use std::sync::Arc;
 
+use switchboard_wire::method::Method;
 use tokio::sync::mpsc;
 
 use crate::driver::ChannelShared;
+use crate::driver::call;
 use crate::error::OpError;
 use crate::types::Delivery;
 
@@ -43,16 +49,16 @@ impl Consumer {
 
     /// Cancel this consumer (Basic.Cancel/Cancel-Ok) and drop the stream.
     pub async fn cancel(self) -> Result<(), OpError> {
-        match crate::driver::call(
+        match call(
             &self.channel,
-            &switchboard_wire::method::Method::BasicCancel {
+            &Method::BasicCancel {
                 consumer_tag: self.tag.clone(),
                 nowait: false,
             },
         )
         .await
         {
-            Ok((switchboard_wire::method::Method::BasicCancelOk { .. }, _)) => {
+            Ok((Method::BasicCancelOk { .. }, _)) => {
                 self.channel
                     .conn
                     .consumers
@@ -61,7 +67,7 @@ impl Consumer {
                     .remove(&self.tag);
                 Ok(())
             }
-            Ok((other, _)) => Err(OpError::Io(std::io::Error::other(format!(
+            Ok((other, _)) => Err(OpError::Io(Error::other(format!(
                 "unexpected reply {} to Basic.Cancel",
                 other.name()
             )))),
@@ -70,8 +76,8 @@ impl Consumer {
     }
 }
 
-impl std::fmt::Debug for Consumer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Consumer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Consumer")
             .field("tag", &self.tag)
             .finish_non_exhaustive()

@@ -101,12 +101,27 @@
 //! Bump the constant only alongside a deliberate format change, and teach
 //! the reader to accept every version it actually understands.
 
+use std::fs::DirEntry;
+use std::fs::File;
+use std::fs::create_dir_all;
+use std::fs::read_dir;
+use std::fs::remove_dir_all;
+use std::fs::rename;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Error;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::id;
+use std::str::from_utf8;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
+use crate::kv::RocksKv;
 use serde::Deserialize;
 use serde::Serialize;
 use sha1::Digest;
@@ -178,7 +193,7 @@ pub enum BackupError {
     #[error("backup archive is corrupt: {0}")]
     Corrupt(String),
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] Error),
     #[error(
         "failed to open the store at {path}: {cause} — a broker on this data dir must be \
          STOPPED first (backups require a quiesced node; the store lock is held while it runs)"
@@ -218,7 +233,7 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
     // The output's parent must exist before the checkpoint lands (RocksDB
     // stages the checkpoint as a sibling `<dest>.tmp` directory).
     if let Some(parent) = out_file.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(BackupError::Io)?;
+        create_dir_all(parent).map_err(BackupError::Io)?;
     }
     // Refuse a directory that was never a store: opening it with
     // create_if_missing would silently produce a useless backup of an
@@ -228,7 +243,7 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
             path: data_dir.to_path_buf(),
         });
     }
-    let kv = crate::kv::RocksKv::open(data_dir).map_err(|e| BackupError::SourceOpen {
+    let kv = RocksKv::open(data_dir).map_err(|e| BackupError::SourceOpen {
         path: data_dir.to_path_buf(),
         cause: e.to_string(),
     })?;
@@ -239,7 +254,7 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
     // archive itself is only written after the checkpoint is complete.
     let staging = staging_dir_for(out_file);
     if staging.exists() {
-        std::fs::remove_dir_all(&staging).map_err(BackupError::Io)?;
+        remove_dir_all(&staging).map_err(BackupError::Io)?;
     }
     kv.create_checkpoint(&staging)
         .map_err(|e| BackupError::Checkpoint {
@@ -253,8 +268,8 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
     let files = walk_regular_files(&staging)?;
     let header = BackupHeader {
         format_version: BACKUP_FORMAT_VERSION,
-        created_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        created_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
         writer: format!("switchboard-store {}", env!("CARGO_PKG_VERSION")),
@@ -282,9 +297,9 @@ pub fn backup_store(data_dir: &Path, out_file: &Path) -> Result<BackupHeader, Ba
     // leaves a half-written file at the requested path.
     let tmp_out = tmp_sibling(out_file);
     write_archive(&tmp_out, &header_json, &staging, &files)?;
-    std::fs::rename(&tmp_out, out_file).map_err(BackupError::Io)?;
+    rename(&tmp_out, out_file).map_err(BackupError::Io)?;
 
-    let _ = std::fs::remove_dir_all(&staging);
+    let _ = remove_dir_all(&staging);
     Ok(header)
 }
 
@@ -299,12 +314,12 @@ pub fn restore_store(backup_file: &Path, target_dir: &Path) -> Result<BackupHead
 
     // Target must be absent or empty — a restore never clobbers.
     if target_dir.exists() {
-        let mut entries = std::fs::read_dir(target_dir).map_err(BackupError::Io)?;
+        let mut entries = read_dir(target_dir).map_err(BackupError::Io)?;
         if entries.next().is_some() {
             return Err(BackupError::TargetNotEmpty(target_dir.to_path_buf()));
         }
     }
-    std::fs::create_dir_all(target_dir).map_err(BackupError::Io)?;
+    create_dir_all(target_dir).map_err(BackupError::Io)?;
 
     let file_len = body.get_ref().metadata().map_err(BackupError::Io)?.len();
     let mut consumed = body.stream_position().map_err(BackupError::Io)?;
@@ -317,7 +332,7 @@ pub fn restore_store(backup_file: &Path, target_dir: &Path) -> Result<BackupHead
         }
         let mut path_bytes = vec![0u8; path as usize];
         read_exact_bounded(&mut body, &mut path_bytes, file_len, &mut consumed)?;
-        let rel = std::str::from_utf8(&path_bytes)
+        let rel = from_utf8(&path_bytes)
             .map_err(|_| BackupError::Corrupt("record path is not UTF-8".into()))?
             .to_string();
         if rel != want.path {
@@ -336,9 +351,9 @@ pub fn restore_store(backup_file: &Path, target_dir: &Path) -> Result<BackupHead
 
         let dest = safe_join(target_dir, &rel)?;
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(BackupError::Io)?;
+            create_dir_all(parent).map_err(BackupError::Io)?;
         }
-        let mut out = std::fs::File::create(&dest).map_err(BackupError::Io)?;
+        let mut out = File::create(&dest).map_err(BackupError::Io)?;
         let mut hasher = sha1::Sha1::new();
         let mut remaining = data_len;
         let mut chunk = vec![0u8; CHUNK];
@@ -378,12 +393,10 @@ pub fn read_backup_header(backup_file: &Path) -> Result<BackupHeader, BackupErro
 
 /// Open an archive, validate magic + version (the gate), and parse the
 /// header. Returns the header positioned at the first file record.
-fn open_archive(
-    backup_file: &Path,
-) -> Result<(BackupHeader, std::io::BufReader<std::fs::File>), BackupError> {
-    let f = std::fs::File::open(backup_file).map_err(BackupError::Io)?;
+fn open_archive(backup_file: &Path) -> Result<(BackupHeader, BufReader<File>), BackupError> {
+    let f = File::open(backup_file).map_err(BackupError::Io)?;
     let file_len = f.metadata().map_err(BackupError::Io)?.len();
-    let mut r = std::io::BufReader::new(f);
+    let mut r = BufReader::new(f);
 
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).map_err(BackupError::Io)?;
@@ -471,7 +484,7 @@ fn read_exact_bounded(
 fn safe_join(target_dir: &Path, rel: &str) -> Result<PathBuf, BackupError> {
     let rel_path = Path::new(rel);
     for comp in rel_path.components() {
-        if !matches!(comp, std::path::Component::Normal(_)) {
+        if !matches!(comp, Component::Normal(_)) {
             return Err(BackupError::Corrupt(format!(
                 "archived path {rel:?} contains a non-normal component"
             )));
@@ -493,8 +506,8 @@ fn write_archive(
     staging: &Path,
     files: &[WalkedFile],
 ) -> Result<(), BackupError> {
-    let f = std::fs::File::create(out_path).map_err(BackupError::Io)?;
-    let mut w = std::io::BufWriter::new(f);
+    let f = File::create(out_path).map_err(BackupError::Io)?;
+    let mut w = BufWriter::new(f);
     w.write_all(&BACKUP_MAGIC).map_err(BackupError::Io)?;
     w.write_all(&BACKUP_FORMAT_VERSION.to_le_bytes())
         .map_err(BackupError::Io)?;
@@ -508,7 +521,7 @@ fn write_archive(
         w.write_all(bytes).map_err(BackupError::Io)?;
         w.write_all(&file.len.to_le_bytes())
             .map_err(BackupError::Io)?;
-        let mut src = std::fs::File::open(staging.join(&file.rel)).map_err(BackupError::Io)?;
+        let mut src = File::open(staging.join(&file.rel)).map_err(BackupError::Io)?;
         let mut chunk = vec![0u8; CHUNK];
         loop {
             let n = src.read(&mut chunk).map_err(BackupError::Io)?;
@@ -543,7 +556,7 @@ fn walk_regular_files(dir: &Path) -> Result<Vec<WalkedFile>, BackupError> {
 }
 
 fn walk_into(root: &Path, dir: &Path, out: &mut Vec<WalkedFile>) -> Result<(), BackupError> {
-    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+    let mut entries: Vec<DirEntry> = read_dir(dir)
         .map_err(BackupError::Io)?
         .collect::<Result<_, _>>()
         .map_err(BackupError::Io)?;
@@ -561,7 +574,7 @@ fn walk_into(root: &Path, dir: &Path, out: &mut Vec<WalkedFile>) -> Result<(), B
             // faithfully.
             continue;
         }
-        let mut f = std::fs::File::open(&path).map_err(BackupError::Io)?;
+        let mut f = File::open(&path).map_err(BackupError::Io)?;
         let mut hasher = sha1::Sha1::new();
         let mut chunk = vec![0u8; CHUNK];
         let mut len = 0u64;
@@ -602,7 +615,7 @@ fn staging_dir_for(out_file: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(".staging-{}", std::process::id()));
+    name.push(format!(".staging-{}", id()));
     out_file.with_file_name(name)
 }
 
@@ -613,13 +626,13 @@ fn tmp_sibling(out_file: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(".tmp-{}", std::process::id()));
+    name.push(format!(".tmp-{}", id()));
     out_file.with_file_name(name)
 }
 
 fn fsync_dir(dir: &Path) {
     // Best-effort durability of the new directory entries themselves.
-    if let Ok(d) = std::fs::File::open(dir) {
+    if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
 }
@@ -627,27 +640,36 @@ fn fsync_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::RocksKv;
+    use std::env::temp_dir;
+    use std::fs::create_dir_all;
+    use std::fs::read;
+    use std::fs::remove_dir_all;
+    use std::fs::write;
+    use std::process::id;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     fn tmp_dir(name: &str) -> PathBuf {
         let unique = format!(
             "{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
             name
         );
-        let dir = std::env::temp_dir().join(format!("switchboard-backup-{unique}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp_dir().join(format!("switchboard-backup-{unique}"));
+        let _ = remove_dir_all(&dir);
         dir
     }
 
     /// Seed a store that looks like a node's: a meta-group blob + log
     /// entry, a shard group's message journal, all left UNflushed so the
     /// checkpoint path must carry memtable content.
-    fn seed_node_like_store(data_dir: &Path) -> crate::kv::RocksKv {
-        let kv = crate::kv::RocksKv::open(data_dir).expect("open store");
+    fn seed_node_like_store(data_dir: &Path) -> RocksKv {
+        let kv = RocksKv::open(data_dir).expect("open store");
         kv.put(b"g0:sm", b"{\"meta\":\"topology-blob\"}").unwrap();
         kv.put(b"g0:log/00000000000000000000", b"bootstrap-entry")
             .unwrap();
@@ -703,7 +725,7 @@ mod tests {
         let restored = restore_store(&archive, &target).expect("restore");
         assert_eq!(restored, header, "restore reports the same header");
 
-        let back = crate::kv::RocksKv::open(&target).expect("open restored store");
+        let back = RocksKv::open(&target).expect("open restored store");
         for (prefix, values) in &before {
             let got: Vec<Vec<u8>> = back
                 .prefix_pairs(prefix.as_bytes())
@@ -729,11 +751,11 @@ mod tests {
         // next version, and the highest u32 (anything above the known set
         // is "newer", whatever its magnitude).
         for newer in [BACKUP_FORMAT_VERSION + 1, u32::MAX] {
-            let mut bytes = std::fs::read(&archive).unwrap();
+            let mut bytes = read(&archive).unwrap();
             bytes[4..8].copy_from_slice(&newer.to_le_bytes());
             let doctored = tmp_dir("gate-doctored").join(format!("node-{newer}.swbk"));
-            std::fs::create_dir_all(doctored.parent().unwrap()).unwrap();
-            std::fs::write(&doctored, &bytes).unwrap();
+            create_dir_all(doctored.parent().unwrap()).unwrap();
+            write(&doctored, &bytes).unwrap();
 
             let target = tmp_dir("gate-dst");
             let err = restore_store(&doctored, &target).expect_err("newer version must be refused");
@@ -758,11 +780,11 @@ mod tests {
         backup_store(&data_dir, &archive).expect("backup");
 
         for bogus in [0u32] {
-            let mut bytes = std::fs::read(&archive).unwrap();
+            let mut bytes = read(&archive).unwrap();
             bytes[4..8].copy_from_slice(&bogus.to_le_bytes());
             let doctored = tmp_dir("gateu-doctored").join(format!("node-{bogus}.swbk"));
-            std::fs::create_dir_all(doctored.parent().unwrap()).unwrap();
-            std::fs::write(&doctored, &bytes).unwrap();
+            create_dir_all(doctored.parent().unwrap()).unwrap();
+            write(&doctored, &bytes).unwrap();
 
             let target = tmp_dir("gateu-dst");
             let err = restore_store(&doctored, &target).expect_err("unknown version refused");
@@ -778,7 +800,7 @@ mod tests {
     #[test]
     fn backup_refuses_a_directory_that_is_not_a_store() {
         let empty = tmp_dir("not-a-store");
-        std::fs::create_dir_all(&empty).unwrap();
+        create_dir_all(&empty).unwrap();
         let archive = tmp_dir("not-a-store-arch").join("node.swbk");
         let err = backup_store(&empty, &archive).expect_err("non-store dir refused");
         let msg = err.to_string();
@@ -797,9 +819,9 @@ mod tests {
     #[test]
     fn restore_refuses_non_backup_files() {
         let junk = tmp_dir("junk");
-        std::fs::create_dir_all(&junk).unwrap();
+        create_dir_all(&junk).unwrap();
         let archive = junk.join("not-a-backup.swbk");
-        std::fs::write(&archive, b"NOTSWBK....").unwrap();
+        write(&archive, b"NOTSWBK....").unwrap();
         let target = junk.join("dst");
         let err = restore_store(&archive, &target).expect_err("bad magic refused");
         let msg = err.to_string();
@@ -820,11 +842,11 @@ mod tests {
         let json = serde_json::to_vec(&header).unwrap();
         let first = &header.files[0];
         let payload_start = PREFIX_LEN + json.len() as u64 + 4 + first.path.len() as u64 + 8;
-        let mut bytes = std::fs::read(&archive).unwrap();
+        let mut bytes = read(&archive).unwrap();
         let idx = payload_start as usize;
         assert!(idx < bytes.len());
         bytes[idx] ^= 0x08;
-        std::fs::write(&archive, &bytes).unwrap();
+        write(&archive, &bytes).unwrap();
 
         let target = tmp_dir("dig-dst");
         let err = restore_store(&archive, &target).expect_err("corrupt payload must be caught");
@@ -842,8 +864,8 @@ mod tests {
         backup_store(&data_dir, &archive).expect("backup");
 
         let target = tmp_dir("clob-dst");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("precious"), b"data").unwrap();
+        create_dir_all(&target).unwrap();
+        write(target.join("precious"), b"data").unwrap();
 
         let err = restore_store(&archive, &target).expect_err("non-empty target refused");
         assert!(
@@ -851,7 +873,7 @@ mod tests {
             "expected TargetNotEmpty, got: {err}"
         );
         assert_eq!(
-            std::fs::read(target.join("precious")).unwrap(),
+            read(target.join("precious")).unwrap(),
             b"data",
             "existing content must be untouched"
         );

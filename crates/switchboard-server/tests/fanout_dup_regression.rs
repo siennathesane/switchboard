@@ -11,6 +11,7 @@ use support::publish;
 use support::start_cluster;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::method::Method;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fanout_enqueues_exactly_once_per_queue() {
@@ -100,7 +101,7 @@ async fn fanout_enqueues_exactly_once_per_queue() {
 
     // Give the executor a beat, then drain each queue with basic.get
     // until empty, counting occurrences of the payload.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
     let mut total = 0u64;
     for i in 0..3u8 {
         let q = format!("dup.f.{i}");

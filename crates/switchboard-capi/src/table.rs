@@ -24,6 +24,7 @@
 //! safe even after the broker is gone.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 
 use crate::status::SB_ERR_HANDLE_DEAD;
@@ -75,11 +76,7 @@ pub(crate) fn register(ptr: usize, kind: Kind, owner: usize) {
 /// Validate `ptr` for entry-point use. `expected_kind` must match; the
 /// handle must still be alive. `arg` names the argument for the error
 /// message.
-pub(crate) fn check(
-    ptr: *mut std::ffi::c_void,
-    expected_kind: Kind,
-    arg: &str,
-) -> Result<usize, SbStatus> {
+pub(crate) fn check(ptr: *mut c_void, expected_kind: Kind, arg: &str) -> Result<usize, SbStatus> {
     if ptr.is_null() {
         return Err(fail(SB_ERR_NULL_ARG, format!("{arg} must not be NULL")));
     }
@@ -149,10 +146,11 @@ pub(crate) fn owner_of(ptr: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
 
     #[test]
     fn register_check_free_lifecycle() {
-        let fake = 0x_dead_c0_ffee_u64 as *mut std::ffi::c_void;
+        let fake = 0x_dead_c0_ffee_u64 as *mut c_void;
         // Never issued.
         assert!(check(fake, Kind::Channel, "ch").is_err());
         register(fake as usize, Kind::Channel, 7);

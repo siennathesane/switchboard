@@ -40,11 +40,27 @@
 //!   host the consumers (followers produce identical effects while
 //!   applying the same entries and drop them).
 
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::env::var;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
+use std::iter::once;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::Weak;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant as StdInstant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use openraft::Config;
 use openraft::Raft;
@@ -78,19 +94,54 @@ use crate::proto::InternalResponse;
 use crate::proto::RaftPayload;
 use crate::proto::RaftResponse;
 use crate::proto::TopologySnapshot;
+use bincode::deserialize;
+use bincode::serialize;
+use switchboard_core::auth::hash_password;
+use switchboard_core::routing::route;
+use switchboard_core::shard::SHARD_KEY_SEP;
+use switchboard_core::shard::ShardCmd;
+use switchboard_core::shard::shard_key;
+use switchboard_core::tempo::scale;
+use switchboard_core::topology::VhostView;
 use switchboard_store::LogStore;
+use switchboard_store::RocksKv;
 use switchboard_store::StateMachine;
+use switchboard_wire::constants::DEFAULT_VHOST;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::spawn;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
+use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot::Sender as OneshotSender;
+use tokio::sync::oneshot::channel as oneshot_channel;
+use tokio::sync::watch::Receiver;
+use tokio::sync::watch::Sender;
+use tokio::sync::watch::channel as watch_channel;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::interval;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
+use crate::internal_auth::verify;
+use crate::transport::PeerChannel;
+use crate::transport::accept;
 use crate::typ::BrokerCommand;
 use crate::typ::BrokerReply;
 use crate::typ::Effect;
 use crate::typ::NodeId;
+use crate::typ::RequestId;
 use crate::typ::SwitchboardTypeConfig;
 
 /// Wall-clock milliseconds (command-carried time for TTL bookkeeping).
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
@@ -219,7 +270,7 @@ pub enum ClusterError {
     #[error("transient condition; retry")]
     Transient,
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] Error),
     #[error("storage: {0}")]
     Storage(#[from] rocksdb::Error),
     #[error("codec: {0}")]
@@ -231,7 +282,7 @@ pub enum ClusterError {
 struct GroupHandle {
     raft: Raft<SwitchboardTypeConfig>,
     sm: StateMachine,
-    _effects: tokio::task::JoinHandle<()>,
+    _effects: JoinHandle<()>,
 }
 
 impl ClusterError {
@@ -267,52 +318,52 @@ pub struct Delivery {
 /// Sink set registered by the server layer for one consumer.
 #[derive(Clone)]
 pub struct ConsumerSink {
-    pub deliveries: tokio::sync::mpsc::UnboundedSender<Delivery>,
-    pub cancelled: tokio::sync::mpsc::UnboundedSender<String>,
+    pub deliveries: UnboundedSender<Delivery>,
+    pub cancelled: UnboundedSender<String>,
 }
 
 pub struct ClusterNode {
     pub id: NodeId,
     pub cfg: NodeConfig,
     pub dir: Arc<Directory>,
-    channel: Arc<crate::transport::PeerChannel>,
-    kv: switchboard_store::RocksKv,
+    channel: Arc<PeerChannel>,
+    kv: RocksKv,
     groups: RwLock<HashMap<GroupId, Arc<GroupHandle>>>,
     /// Serializes raft-group creation (which awaits).
-    creating: tokio::sync::Mutex<()>,
+    creating: TokioMutex<()>,
     /// Set when the node is shutting down: listeners and loops wind down.
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: Sender<bool>,
     /// Consecutive failed liveness probes per peer (dead-consumer
     /// detection). A single failure must not declare a peer dead:
     /// transient connect errors (ephemeral-port exhaustion, backlog)
     /// would otherwise eat live consumers.
-    peer_probe_fails: std::sync::Mutex<HashMap<NodeId, u32>>,
+    peer_probe_fails: Mutex<HashMap<NodeId, u32>>,
     /// Consecutive refused probes per registered peer (dead-node reaping
     /// in the controller). Same fail-open discipline as the consumer
     /// janitor; ECONNREFUSED is the only counting signal.
-    reap_fails: std::sync::Mutex<HashMap<NodeId, u32>>,
+    reap_fails: Mutex<HashMap<NodeId, u32>>,
     /// When this node started (uptime reporting via `GET /stats`).
-    started: std::time::Instant,
+    started: StdInstant,
     /// Node-global subscription-id counter. SubscriptionId is keyed
     /// node-global in the consumer-sink map, so this must be unique
     /// across every connection and channel on this node — a per-channel
     /// counter collides on the first consumer of every channel and
     /// delivers one session's messages into another.
-    next_sub: std::sync::atomic::AtomicU64,
+    next_sub: AtomicU64,
     /// Latest applied meta state (topology + shard map).
-    topology_tx: tokio::sync::watch::Sender<Arc<MetaState>>,
+    topology_tx: Sender<Arc<MetaState>>,
     /// Local consumers awaiting deliveries, keyed by subscription.
-    consumer_sinks: Arc<tokio::sync::RwLock<HashMap<SubscriptionId, ConsumerSink>>>,
+    consumer_sinks: Arc<TokioRwLock<HashMap<SubscriptionId, ConsumerSink>>>,
     /// Serializes fanout publishes cluster-wide: multi-destination
     /// publishes execute one at a time on the meta leader so every
     /// destination shard group receives them in one global order.
-    fanout_lock: tokio::sync::Mutex<()>,
+    fanout_lock: TokioMutex<()>,
     /// Wakes the fanout executor when a fanout becomes pending, so
     /// execution starts at once instead of on the next tick.
-    fanout_wake: Arc<tokio::sync::Notify>,
+    fanout_wake: Arc<Notify>,
     /// Per-group write coalescers (group commit on the shard groups' hot
     /// path: concurrent writes leave as one raft entry).
-    coalescers: std::sync::Mutex<HashMap<GroupId, tokio::sync::mpsc::UnboundedSender<CoalesceReq>>>,
+    coalescers: Mutex<HashMap<GroupId, UnboundedSender<CoalesceReq>>>,
 }
 
 /// One write waiting for a batched commit.
@@ -320,25 +371,25 @@ struct CoalesceReq {
     /// Already `Idempotent`-wrapped: every retry of a batch re-applies
     /// each element exactly once through the dedup log.
     command: BrokerCommand,
-    reply: tokio::sync::oneshot::Sender<Result<BrokerReply, ClusterError>>,
+    reply: OneshotSender<Result<BrokerReply, ClusterError>>,
 }
 
 impl ClusterNode {
     /// Start the node: open storage, form or join the cluster, run the
     /// internal server and the background controllers.
     pub async fn start(cfg: NodeConfig) -> Result<Arc<Self>, ClusterError> {
-        let kv = switchboard_store::RocksKv::open(&cfg.data_dir)?;
+        let kv = RocksKv::open(&cfg.data_dir)?;
         let dir = Arc::new(Directory::new());
         dir.update(cfg.id, cfg.internal_addr.clone());
-        let channel = Arc::new(crate::transport::PeerChannel::with_internal_auth(
+        let channel = Arc::new(PeerChannel::with_internal_auth(
             None,
             "switchboard-internal".into(),
             cfg.timeouts.rpc_reply_budget,
             cfg.internal_auth_secret.clone(),
         ));
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (topology_tx, _) = tokio::sync::watch::channel(Arc::new(MetaState::default()));
+        let (shutdown_tx, shutdown_rx) = watch_channel(false);
+        let (topology_tx, _) = watch_channel(Arc::new(MetaState::default()));
         for (pid, paddr) in &cfg.peers {
             dir.update(*pid, paddr.clone());
         }
@@ -348,17 +399,17 @@ impl ClusterNode {
             channel,
             kv,
             groups: RwLock::new(HashMap::new()),
-            creating: tokio::sync::Mutex::new(()),
+            creating: TokioMutex::new(()),
             shutdown_tx,
             topology_tx,
-            consumer_sinks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            peer_probe_fails: std::sync::Mutex::new(HashMap::new()),
-            reap_fails: std::sync::Mutex::new(HashMap::new()),
-            started: std::time::Instant::now(),
-            next_sub: std::sync::atomic::AtomicU64::new(1),
-            fanout_lock: tokio::sync::Mutex::new(()),
-            fanout_wake: Arc::new(tokio::sync::Notify::new()),
-            coalescers: std::sync::Mutex::new(HashMap::new()),
+            consumer_sinks: Arc::new(TokioRwLock::new(HashMap::new())),
+            peer_probe_fails: Mutex::new(HashMap::new()),
+            reap_fails: Mutex::new(HashMap::new()),
+            started: StdInstant::now(),
+            next_sub: AtomicU64::new(1),
+            fanout_lock: TokioMutex::new(()),
+            fanout_wake: Arc::new(Notify::new()),
+            coalescers: Mutex::new(HashMap::new()),
             cfg: cfg.clone(),
         });
 
@@ -366,13 +417,13 @@ impl ClusterNode {
         // voters grant each other's candidacies over it. Bind here —
         // synchronously — so peers that dial us immediately are never
         // refused; the spawned task only runs the accept loop.
-        let internal_listener = tokio::net::TcpListener::bind(&cfg.internal_addr)
+        let internal_listener = TcpListener::bind(&cfg.internal_addr)
             .await
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
         {
             let n = node.clone();
             let rx = shutdown_rx.clone();
-            tokio::spawn(async move { n.internal_server(internal_listener, rx).await });
+            spawn(async move { n.internal_server(internal_listener, rx).await });
         }
 
         // Formation vs join vs discovery-pending:
@@ -391,21 +442,21 @@ impl ClusterNode {
                 // configured seeds: a node that lists seeds must never
                 // strand as pending just because formation was busy at
                 // boot — it is useless until it joins.
-                tracing::warn!(node = node.id, err = ?e, "seed join failed; pending, retrying in background");
+                warn!(node = node.id, err = ?e, "seed join failed; pending, retrying in background");
                 let n = node.clone();
-                tokio::spawn(async move {
-                    let pause = switchboard_core::tempo::scale(n.cfg.timeouts.reconcile_interval);
+                spawn(async move {
+                    let pause = scale(n.cfg.timeouts.reconcile_interval);
                     loop {
-                        tokio::time::sleep(pause).await;
+                        sleep(pause).await;
                         if n.join_seeds().await.is_ok() {
-                            tracing::info!(node = n.id, "background seed join succeeded");
+                            info!(node = n.id, "background seed join succeeded");
                             break;
                         }
                     }
                 });
             }
         } else {
-            tracing::info!(
+            info!(
                 node = node.id,
                 "no seeds configured; node is pending until discovery introduces it"
             );
@@ -416,36 +467,36 @@ impl ClusterNode {
         {
             let n = node.clone();
             let rx = shutdown_rx.clone();
-            tokio::spawn(async move { n.reconcile_loop(rx).await });
+            spawn(async move { n.reconcile_loop(rx).await });
         }
         {
             // Total-order fanout executor: applies pending fanouts in
             // meta-log order while this node leads the meta group.
             let n = node.clone();
-            tokio::spawn(async move { n.fanout_executor_loop().await });
+            spawn(async move { n.fanout_executor_loop().await });
         }
         {
             let n = node.clone();
             let rx = shutdown_rx.clone();
-            tokio::spawn(async move { n.controller_loop(rx).await });
+            spawn(async move { n.controller_loop(rx).await });
             let n = node.clone();
             let rx = shutdown_rx.clone();
-            tokio::spawn(async move { n.meta_recovery_loop(rx).await });
+            spawn(async move { n.meta_recovery_loop(rx).await });
         }
         {
             let n = node.clone();
             let rx = shutdown_rx.clone();
-            tokio::spawn(async move { n.janitor_loop(rx).await });
+            spawn(async move { n.janitor_loop(rx).await });
         }
         Ok(node)
     }
 
     /// Allocate a connection id for a freshly accepted client connection.
     pub async fn new_connection_id(&self) -> ConnectionId {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
         ConnectionId {
             node: self.id,
-            conn: COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            conn: COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -465,7 +516,7 @@ impl ClusterNode {
             let _ = h.raft.shutdown().await;
         }
         // Give loops a beat to observe the flag.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
     }
 
     /// The meta group's current raft voter set (for admin/inspection).
@@ -489,7 +540,7 @@ impl ClusterNode {
         }
     }
 
-    pub async fn meta_voters(&self) -> Option<std::collections::BTreeSet<NodeId>> {
+    pub async fn meta_voters(&self) -> Option<BTreeSet<NodeId>> {
         let handle = self
             .groups
             .read()
@@ -522,8 +573,8 @@ impl ClusterNode {
     /// messages went — the soak's message-conservation triage tool.
     pub fn message_accounting(&self) -> serde_json::Value {
         let groups = self.groups.read().expect("groups lock");
-        let mut total: std::collections::BTreeMap<String, u64> = Default::default();
-        let mut queues: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+        let mut total: BTreeMap<String, u64> = Default::default();
+        let mut queues: BTreeMap<String, (u64, u64)> = Default::default();
         for h in groups.values() {
             let c = &h.sm.counters;
             for (k, n) in c.snapshot_u64() {
@@ -535,10 +586,7 @@ impl ClusterNode {
                 // the separator). Same-named queues in different vhosts
                 // merge into one display row — stats are a triage view,
                 // not an isolation boundary.
-                let display = name
-                    .split(switchboard_core::shard::SHARD_KEY_SEP)
-                    .next()
-                    .unwrap_or(&name);
+                let display = name.split(SHARD_KEY_SEP).next().unwrap_or(&name);
                 let e = queues.entry(display.to_string()).or_default();
                 e.0 += ready;
                 e.1 += held;
@@ -548,7 +596,7 @@ impl ClusterNode {
             .into_iter()
             .map(|(q, (ready, held))| (q, ready, held))
             .collect();
-        list.sort_by_key(|(_, r, h)| std::cmp::Reverse(r + h));
+        list.sort_by_key(|(_, r, h)| Reverse(r + h));
         list.truncate(24);
         serde_json::json!({
             "totals": total,
@@ -559,9 +607,9 @@ impl ClusterNode {
     }
 
     /// A fresh, node-unique subscription id.
-    pub fn next_subscription_id(&self) -> switchboard_core::model::SubscriptionId {
+    pub fn next_subscription_id(&self) -> SubscriptionId {
         use std::sync::atomic::Ordering;
-        switchboard_core::model::SubscriptionId {
+        SubscriptionId {
             node: self.id,
             sub: self.next_sub.fetch_add(1, Ordering::Relaxed),
         }
@@ -600,7 +648,7 @@ impl ClusterNode {
         self.topology_tx.subscribe().borrow().clone()
     }
 
-    pub fn topology_watcher(&self) -> tokio::sync::watch::Receiver<Arc<MetaState>> {
+    pub fn topology_watcher(&self) -> Receiver<Arc<MetaState>> {
         self.topology_tx.subscribe()
     }
 
@@ -634,7 +682,7 @@ impl ClusterNode {
         // `start()` returns without waiting for them.
         {
             let n = self.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 if let Err(e) = n.form_cluster_tail().await {
                     warn!(node = n.id, err = ?e, "formation tail failed");
                 }
@@ -662,7 +710,7 @@ impl ClusterNode {
         self.write(
             META_GROUP,
             BrokerCommand::Bootstrap {
-                vhost: switchboard_wire::constants::DEFAULT_VHOST.into(),
+                vhost: DEFAULT_VHOST.into(),
                 // Configurable bootstrap credentials (code-scanning alert
                 // #16): the CLI's --user/--password flow through NodeConfig
                 // so deployments are not pinned to the public dev default.
@@ -672,7 +720,7 @@ impl ClusterNode {
                 // proposing node, so the replicated log and the at-rest
                 // user map only ever carry the PHC string — and apply
                 // never hashes.
-                password_hash: switchboard_core::auth::hash_password(
+                password_hash: hash_password(
                     &self.cfg.bootstrap_user,
                     &self.cfg.bootstrap_password,
                 ),
@@ -691,8 +739,7 @@ impl ClusterNode {
         };
         // Retry until the deadline: seeds may still be forming (leader not
         // elected yet, registration write deferred) or briefly restarting.
-        let deadline = tokio::time::Instant::now()
-            + switchboard_core::tempo::scale(self.cfg.timeouts.join_budget);
+        let deadline = Instant::now() + scale(self.cfg.timeouts.join_budget);
         loop {
             for seed in &self.cfg.seeds {
                 match self.join_one_seed(seed, &info).await {
@@ -700,10 +747,10 @@ impl ClusterNode {
                     Err(e) => debug!(seed, err = ?e, "join attempt failed; will retry"),
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Err(ClusterError::NotJoined);
             }
-            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(200))).await;
+            sleep(scale(Duration::from_millis(200))).await;
         }
     }
 
@@ -733,11 +780,11 @@ impl ClusterNode {
                 bootstrap: false,
             })),
         };
-        let bytes = bincode::serialize(&req).map_err(|e| ClusterError::Codec(e.to_string()))?;
+        let bytes = serialize(&req).map_err(|e| ClusterError::Codec(e.to_string()))?;
         conn.send(&bytes).await?;
         let back = conn.recv().await?;
         let msg: InternalMessage =
-            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
+            deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
         if let InternalMessage::Response(InternalResponse::Admin(AdminResponse::Joined {
             directory,
             ..
@@ -773,11 +820,8 @@ impl ClusterNode {
         // Keyed by the RocksDB instance pointer (node identity) + group.
         //
         // NOTE: entries hold Weak handles so shutdown simply drops rafts.
-        static LIVE: std::sync::OnceLock<
-            std::sync::Mutex<
-                std::collections::HashMap<(usize, GroupId), std::sync::Weak<GroupHandle>>,
-            >,
-        > = std::sync::OnceLock::new();
+        static LIVE: OnceLock<Mutex<HashMap<(usize, GroupId), Weak<GroupHandle>>>> =
+            OnceLock::new();
 
         {
             let mut live = LIVE
@@ -785,7 +829,7 @@ impl ClusterNode {
                 .lock()
                 .expect("live lock");
             let key = (self.kv.identity(), group);
-            if let Some(h) = live.get(&key).and_then(std::sync::Weak::upgrade) {
+            if let Some(h) = live.get(&key).and_then(Weak::upgrade) {
                 self.groups
                     .write()
                     .expect("groups lock")
@@ -804,11 +848,8 @@ impl ClusterNode {
 
         // Test tempo shrinks these, but keep a floor: sub-30 ms election
         // timeouts flap under scheduler load and destabilize formation.
-        let scaled = |d: &Duration| -> u64 {
-            switchboard_core::tempo::scale(*d)
-                .max(Duration::from_millis(40))
-                .as_millis() as u64
-        };
+        let scaled =
+            |d: &Duration| -> u64 { scale(*d).max(Duration::from_millis(40)).as_millis() as u64 };
         // Openraft requires heartbeat < election_min; the floor must keep
         // that invariant at any tempo.
         let config = Config {
@@ -833,7 +874,7 @@ impl ClusterNode {
         })?);
 
         let log_store = LogStore::new(self.kv.clone(), group);
-        let (effects_tx, effects_rx) = tokio::sync::mpsc::unbounded_channel::<Effect>();
+        let (effects_tx, effects_rx) = unbounded_channel::<Effect>();
         let sm = StateMachine::new(self.kv.clone(), group, effects_tx).map_err(|e| {
             ClusterError::Raft {
                 group,
@@ -885,7 +926,7 @@ impl ClusterNode {
     ) -> Result<(), ClusterError> {
         let handle = self.ensure_group(group).await?;
         // `initialize` accepts any IntoNodes: pass the voter ids directly.
-        let voters: std::collections::BTreeSet<NodeId> = members.iter().copied().collect();
+        let voters: BTreeSet<NodeId> = members.iter().copied().collect();
         match handle.raft.initialize(voters).await {
             Ok(()) => {
                 info!(node = self.id, group, members = ?members, "initialized raft group");
@@ -903,7 +944,7 @@ impl ClusterNode {
             if let Some(l) = handle.raft.current_leader().await {
                 return Ok(l);
             }
-            tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(50))).await;
+            sleep(scale(Duration::from_millis(50))).await;
         }
         Err(ClusterError::Raft {
             group,
@@ -921,12 +962,12 @@ impl ClusterNode {
     }
 
     fn spawn_effect_pump(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
         group: GroupId,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<Effect>,
-    ) -> tokio::task::JoinHandle<()> {
+        mut rx: UnboundedReceiver<Effect>,
+    ) -> JoinHandle<()> {
         let node = Arc::downgrade(self);
-        tokio::spawn(async move {
+        spawn(async move {
             while let Some(effect) = rx.recv().await {
                 let Some(node) = node.upgrade() else { break };
                 let group_for_effect = group;
@@ -991,7 +1032,7 @@ impl ClusterNode {
                     // silence, which made consumer-stream stalls
                     // ("consumed=[]" in the go harness) undiagnosable.
                     if sink.deliveries.send(delivery).is_err() {
-                        tracing::warn!(
+                        warn!(
                             node = self.id,
                             group,
                             sub = ?sub,
@@ -1007,7 +1048,7 @@ impl ClusterNode {
                 // gone, owner unknown) releases the hold so the pump
                 // redelivers — never strand a confirmed message.
                 let target = self.owner_node_of(sub);
-                let t_del = std::time::Instant::now();
+                let t_del = StdInstant::now();
                 let response = match target {
                     Some(peer) => {
                         self.call(
@@ -1025,7 +1066,7 @@ impl ClusterNode {
                     }
                     _ => Err(ClusterError::Unreachable { group }),
                 };
-                if std::env::var("SB_TIMING").is_ok() {
+                if var("SB_TIMING").is_ok() {
                     eprintln!(
                         "[timing] deliver rpc took {:?} peer={:?}",
                         t_del.elapsed(),
@@ -1051,7 +1092,7 @@ impl ClusterNode {
                     Ok(InternalResponse::Admin(AdminResponse::NotFound)) => {
                         // Diagnostic: a zombie sub here used to spin the
                         // unregister wheel in total silence.
-                        tracing::warn!(
+                        warn!(
                             node = self.id,
                             group,
                             sub = ?sub,
@@ -1060,18 +1101,15 @@ impl ClusterNode {
                             "deliver: owner reports consumer sink gone; unregistering zombie subscription"
                         );
                         let node = self.clone();
-                        tokio::spawn(async move {
-                            let cmd = BrokerCommand::Shard(
-                                switchboard_core::shard::ShardCmd::UnregisterSubscription { sub },
-                            );
+                        spawn(async move {
+                            let cmd =
+                                BrokerCommand::Shard(ShardCmd::UnregisterSubscription { sub });
                             for _ in 0..node.cfg.timeouts.deliver_release_retries {
                                 match node.write(group, cmd.clone()).await {
                                     Ok(_) => return,
                                     Err(ClusterError::Transient) => {
-                                        tokio::time::sleep(switchboard_core::tempo::scale(
-                                            node.cfg.timeouts.deliver_release_interval,
-                                        ))
-                                        .await
+                                        sleep(scale(node.cfg.timeouts.deliver_release_interval))
+                                            .await
                                     }
                                     Err(_) => return,
                                 }
@@ -1084,7 +1122,7 @@ impl ClusterNode {
                         // looks on clients exactly like a starved
                         // consumer stream ("consumed=[]" with no
                         // broker-side error anywhere in the logs).
-                        tracing::warn!(
+                        warn!(
                             node = self.id,
                             group,
                             sub = ?sub,
@@ -1094,22 +1132,19 @@ impl ClusterNode {
                             "deliver rpc failed; releasing hold for redelivery"
                         );
                         let node = self.clone();
-                        tokio::spawn(async move {
-                            let cmd =
-                                BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Release {
-                                    queue: queue.clone(),
-                                    sub: Some(sub),
-                                    seqs: vec![seq],
-                                    dead: false,
-                                });
+                        spawn(async move {
+                            let cmd = BrokerCommand::Shard(ShardCmd::Release {
+                                queue: queue.clone(),
+                                sub: Some(sub),
+                                seqs: vec![seq],
+                                dead: false,
+                            });
                             for _ in 0..node.cfg.timeouts.deliver_release_retries {
                                 match node.write(group, cmd.clone()).await {
                                     Ok(_) => return,
                                     Err(ClusterError::Transient) => {
-                                        tokio::time::sleep(switchboard_core::tempo::scale(
-                                            node.cfg.timeouts.deliver_release_interval,
-                                        ))
-                                        .await
+                                        sleep(scale(node.cfg.timeouts.deliver_release_interval))
+                                            .await
                                     }
                                     Err(_) => return,
                                 }
@@ -1164,25 +1199,20 @@ impl ClusterNode {
         // re-resolves within a bounded window before the message is
         // treated as genuinely unroutable — one refresh raced the declare
         // in the scale test and silently dropped a confirmed message.
-        let deadline = tokio::time::Instant::now()
-            + switchboard_core::tempo::scale(std::time::Duration::from_millis(750));
+        let deadline = Instant::now() + scale(Duration::from_millis(750));
         let (vh, destinations) = loop {
             let topo = self.topology();
             let Some(vh) = topo.vhosts.get(vhost).cloned() else {
                 return;
             };
-            let view = switchboard_core::topology::VhostView { vhost: &vh };
-            let d =
-                switchboard_core::routing::route(&view, exchange, routing_key, &message.properties);
-            if !d.is_empty() || tokio::time::Instant::now() >= deadline {
+            let view = VhostView { vhost: &vh };
+            let d = route(&view, exchange, routing_key, &message.properties);
+            if !d.is_empty() || Instant::now() >= deadline {
                 break (vh, d);
             }
             drop(topo);
             self.refresh_topology().await;
-            tokio::time::sleep(switchboard_core::tempo::scale(
-                std::time::Duration::from_millis(25),
-            ))
-            .await;
+            sleep(scale(Duration::from_millis(25))).await;
         };
         for q in destinations {
             let Some(shard) = vh.queues.get(&q).map(|qi| qi.shard) else {
@@ -1191,9 +1221,9 @@ impl ClusterNode {
             let _ = self
                 .write(
                     shard,
-                    BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
+                    BrokerCommand::Shard(ShardCmd::Enqueue {
                         // Vhost-qualified shard-data key (alert #14).
-                        queue: switchboard_core::shard::shard_key(vhost, &q),
+                        queue: shard_key(vhost, &q),
                         message: message.clone(),
                         at_ms: now_ms(),
                     }),
@@ -1274,8 +1304,7 @@ impl ClusterNode {
         // saw the entry absent, confirmed the publish, and let the next
         // publish's single-destination direct write race the executor's
         // leg into the same shard group — inverting per-queue FIFO.
-        let deadline = tokio::time::Instant::now()
-            + switchboard_core::tempo::scale(self.cfg.timeouts.fanout_budget);
+        let deadline = Instant::now() + scale(self.cfg.timeouts.fanout_budget);
         let mut seen_pending = false;
         loop {
             let topo = self.topology();
@@ -1289,13 +1318,13 @@ impl ClusterNode {
                 // Appeared locally, then cleared: FanoutDone applied.
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Err(ClusterError::Unreachable { group: META_GROUP });
             }
             if self.leader_hint_of(META_GROUP).await == Some(self.id) {
                 self.execute_pending_fanouts().await?;
             } else {
-                tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(3))).await;
+                sleep(scale(Duration::from_millis(3))).await;
             }
             self.refresh_topology().await;
         }
@@ -1303,7 +1332,7 @@ impl ClusterNode {
 
     /// The per-leg request id for `fanout_id`: stable across retries and
     /// across nodes, distinct per destination.
-    fn fanout_leg_id(fanout_id: crate::typ::RequestId, leg: usize) -> crate::typ::RequestId {
+    fn fanout_leg_id(fanout_id: RequestId, leg: usize) -> RequestId {
         debug_assert!(leg < 256, "fanout leg index must fit the id tag byte");
         let mut bytes = *fanout_id.as_bytes();
         bytes[15] ^= leg as u8;
@@ -1317,14 +1346,14 @@ impl ClusterNode {
     /// the interval is only a fallback for failovers.
     async fn fanout_executor_loop(self: Arc<Self>) {
         loop {
-            tokio::select! {
+            select! {
                 _ = self.fanout_wake.notified() => {}
-                _ = tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100))) => {}
+                _ = sleep(scale(Duration::from_millis(100))) => {}
             }
             match self.leader_hint_of(META_GROUP).await {
                 Some(l) if l == self.id => {
                     if let Err(e) = self.execute_pending_fanouts().await {
-                        tracing::debug!(node = self.id, err = ?e, "fanout executor pass failed; will retry");
+                        debug!(node = self.id, err = ?e, "fanout executor pass failed; will retry");
                     }
                 }
                 _ => {}
@@ -1355,7 +1384,7 @@ impl ClusterNode {
                     // Vhost-qualified shard-data key (alert #14): the
                     // fanout's destinations are bare meta names; the
                     // enqueue addresses the vhost's own shard entry.
-                    let key = switchboard_core::shard::shard_key(&pending.vhost, q);
+                    let key = shard_key(&pending.vhost, q);
                     let message = pending.message.clone();
                     let leg_id = Self::fanout_leg_id(pending.id, leg);
                     async move {
@@ -1367,7 +1396,7 @@ impl ClusterNode {
                         };
                         self.write_idempotent(
                             group,
-                            BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Enqueue {
+                            BrokerCommand::Shard(ShardCmd::Enqueue {
                                 queue: key,
                                 message,
                                 at_ms: now_ms(),
@@ -1395,7 +1424,7 @@ impl ClusterNode {
         // await — std guards are not Send. Meta-only clone: this runs on
         // every reconcile tick and fanout poll, and the shard half holds
         // the message store.
-        let local_meta: Option<switchboard_core::topology::MetaState> = {
+        let local_meta: Option<MetaState> = {
             let groups = self.groups.read().expect("groups lock");
             groups.get(&META_GROUP).map(|h| h.sm.read_meta())
         };
@@ -1495,7 +1524,7 @@ impl ClusterNode {
         self: &Arc<Self>,
         group: GroupId,
         command: BrokerCommand,
-        id: crate::typ::RequestId,
+        id: RequestId,
     ) -> Result<BrokerReply, ClusterError> {
         let command = BrokerCommand::Idempotent {
             id,
@@ -1508,8 +1537,7 @@ impl ClusterNode {
         if group != META_GROUP && Self::commit_batch_max() > 1 {
             return self.coalesced_write(group, command).await;
         }
-        let deadline = tokio::time::Instant::now()
-            + switchboard_core::tempo::scale(self.cfg.timeouts.write_budget);
+        let deadline = Instant::now() + scale(self.cfg.timeouts.write_budget);
         loop {
             match self
                 .try_write_depth(group, &command, 0, Some(deadline))
@@ -1517,11 +1545,10 @@ impl ClusterNode {
             {
                 Ok(reply) => return Ok(reply),
                 Err(ClusterError::Transient) => {
-                    if tokio::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         return Err(ClusterError::Unreachable { group });
                     }
-                    tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(100)))
-                        .await;
+                    sleep(scale(Duration::from_millis(100))).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1531,9 +1558,9 @@ impl ClusterNode {
     /// Env-tunable batch ceiling for group commit; `0` or `1` disables
     /// coalescing (every write commits alone).
     fn commit_batch_max() -> usize {
-        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        static MAX: OnceLock<usize> = OnceLock::new();
         *MAX.get_or_init(|| {
-            std::env::var("SWITCHBOARD_COMMIT_BATCH_MAX")
+            var("SWITCHBOARD_COMMIT_BATCH_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256)
@@ -1548,7 +1575,7 @@ impl ClusterNode {
         command: BrokerCommand,
     ) -> Result<BrokerReply, ClusterError> {
         let tx = self.coalescer_for(group).await;
-        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        let (rtx, rrx) = oneshot_channel();
         tx.send(CoalesceReq {
             command,
             reply: rtx,
@@ -1558,14 +1585,11 @@ impl ClusterNode {
     }
 
     /// The group's coalescer channel, spawning its loop on first use.
-    async fn coalescer_for(
-        self: &Arc<Self>,
-        group: GroupId,
-    ) -> tokio::sync::mpsc::UnboundedSender<CoalesceReq> {
+    async fn coalescer_for(self: &Arc<Self>, group: GroupId) -> UnboundedSender<CoalesceReq> {
         if let Some(tx) = self.coalescers.lock().expect("coalescers lock").get(&group) {
             return tx.clone();
         }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = unbounded_channel();
         {
             let mut m = self.coalescers.lock().expect("coalescers lock");
             if let Some(existing) = m.get(&group) {
@@ -1574,7 +1598,7 @@ impl ClusterNode {
             m.insert(group, tx.clone());
         }
         let weak = Arc::downgrade(self);
-        tokio::spawn(Self::coalescer_loop(weak, group, rx));
+        spawn(Self::coalescer_loop(weak, group, rx));
         tx
     }
 
@@ -1585,9 +1609,9 @@ impl ClusterNode {
     /// Holds only a `Weak` back-reference so a dropped node (tests) is
     /// never kept alive by its own coalescers.
     async fn coalescer_loop(
-        weak: std::sync::Weak<ClusterNode>,
+        weak: Weak<ClusterNode>,
         group: GroupId,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<CoalesceReq>,
+        mut rx: UnboundedReceiver<CoalesceReq>,
     ) {
         let max = Self::commit_batch_max().max(1);
         while let Some(first) = rx.recv().await {
@@ -1599,8 +1623,7 @@ impl ClusterNode {
                     Err(_) => break,
                 }
             }
-            let deadline = tokio::time::Instant::now()
-                + switchboard_core::tempo::scale(node.cfg.timeouts.write_budget);
+            let deadline = Instant::now() + scale(node.cfg.timeouts.write_budget);
             loop {
                 let commands = BrokerCommand::Batch {
                     commands: batch.iter().map(|r| r.command.clone()).collect(),
@@ -1624,7 +1647,7 @@ impl ClusterNode {
                         break;
                     }
                     Err(ClusterError::Transient) => {
-                        if tokio::time::Instant::now() >= deadline {
+                        if Instant::now() >= deadline {
                             for req in batch.drain(..) {
                                 let _ = req.reply.send(Err(ClusterError::Unreachable { group }));
                             }
@@ -1637,10 +1660,7 @@ impl ClusterNode {
                                 Err(_) => break,
                             }
                         }
-                        tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(
-                            100,
-                        )))
-                        .await;
+                        sleep(scale(Duration::from_millis(100))).await;
                     }
                     Err(e) => {
                         for req in batch.drain(..) {
@@ -1678,7 +1698,7 @@ impl ClusterNode {
         group: GroupId,
         command: &BrokerCommand,
         depth: u32,
-        deadline: Option<tokio::time::Instant>,
+        deadline: Option<Instant>,
     ) -> Result<BrokerReply, ClusterError> {
         // If the topology says this group is hosted here, make sure the
         // local raft handle exists before writing (handles are normally
@@ -1784,7 +1804,7 @@ impl ClusterNode {
             // this check a spent budget still dials every remaining
             // member, each leg waiting up to rpc_reply_budget (a paused
             // member's kernel accepts the connection and never replies).
-            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
             match self
@@ -1815,7 +1835,7 @@ impl ClusterNode {
         peer: NodeId,
         group: GroupId,
         command: BrokerCommand,
-        deadline: Option<tokio::time::Instant>,
+        deadline: Option<Instant>,
     ) -> Result<BrokerReply, ClusterError> {
         let req = InternalRequest::Forward { group, command };
         let replied = match deadline {
@@ -1859,7 +1879,7 @@ impl ClusterNode {
                 from: self.id,
                 message: InternalMessage::Request(req),
             };
-            bincode::serialize(&env).map_err(|e| ClusterError::Codec(e.to_string()))?
+            serialize(&env).map_err(|e| ClusterError::Codec(e.to_string()))?
         };
         // Pooled request→reply (stale-conn retry + reply budget live in
         // the channel); the reply comes back as raw bytes.
@@ -1869,7 +1889,7 @@ impl ClusterNode {
             .await
             .map_err(ClusterError::Io)?;
         let msg: InternalMessage =
-            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
+            deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
         match msg {
             InternalMessage::Response(r) => Ok(r),
             other => Err(ClusterError::Codec(format!("unexpected {other:?}"))),
@@ -1884,7 +1904,7 @@ impl ClusterNode {
         &self,
         peer: NodeId,
         req: InternalRequest,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<InternalResponse, ClusterError> {
         let Some(addr) = self.dir.addr_of(peer) else {
             return Err(ClusterError::Unreachable { group: META_GROUP });
@@ -1894,7 +1914,7 @@ impl ClusterNode {
                 from: self.id,
                 message: InternalMessage::Request(req),
             };
-            bincode::serialize(&env).map_err(|e| ClusterError::Codec(e.to_string()))?
+            serialize(&env).map_err(|e| ClusterError::Codec(e.to_string()))?
         };
         // Pooled request→reply; the reply wait never outlives the
         // caller's budget, so a paused/blackholed member cannot stretch
@@ -1905,7 +1925,7 @@ impl ClusterNode {
             .await
             .map_err(ClusterError::Io)?;
         let msg: InternalMessage =
-            bincode::deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
+            deserialize(&back).map_err(|e| ClusterError::Codec(e.to_string()))?;
         match msg {
             InternalMessage::Response(r) => Ok(r),
             other => Err(ClusterError::Codec(format!("unexpected {other:?}"))),
@@ -1916,12 +1936,10 @@ impl ClusterNode {
     // Background loops
     // ------------------------------------------------------------------
 
-    async fn reconcile_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(
-            self.cfg.timeouts.reconcile_interval,
-        ));
+    async fn reconcile_loop(self: &Arc<Self>, mut shutdown: Receiver<bool>) {
+        let mut tick = interval(scale(self.cfg.timeouts.reconcile_interval));
         loop {
-            tokio::select! {
+            select! {
                 _ = tick.tick() => {}
                 _ = shutdown.changed() => break,
             }
@@ -1981,10 +1999,10 @@ impl ClusterNode {
 
     /// Meta-leader duties: register joiners, grow meta membership toward
     /// 3, and install the initial shard-group layout.
-    async fn controller_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    async fn controller_loop(self: &Arc<Self>, mut shutdown: Receiver<bool>) {
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(switchboard_core::tempo::scale(Duration::from_millis(400))) => {}
+            select! {
+                _ = sleep(scale(Duration::from_millis(400))) => {}
                 _ = shutdown.changed() => break,
             }
             let Some(handle) = self
@@ -2036,8 +2054,7 @@ impl ClusterNode {
             //    members (round-robin over the already-covered set, keyed
             //    by the new group id for determinism). Existing groups are
             //    frozen — queue placement never moves, capacity extends.
-            let covered: std::collections::BTreeSet<NodeId> =
-                topo.groups.values().flatten().copied().collect();
+            let covered: BTreeSet<NodeId> = topo.groups.values().flatten().copied().collect();
             let missing: Vec<NodeId> = nodes
                 .iter()
                 .filter(|n| !covered.contains(n))
@@ -2052,7 +2069,7 @@ impl ClusterNode {
                     gid += 1;
                     // A single elder cluster (1-node origin) would produce
                     // duplicate members; the set dedupes them.
-                    let mut members = std::collections::BTreeSet::new();
+                    let mut members = BTreeSet::new();
                     members.insert(*m);
                     members.insert(elders[gid as usize % elders.len()]);
                     members.insert(elders[(gid as usize + 1) % elders.len()]);
@@ -2218,15 +2235,12 @@ impl ClusterNode {
     /// index (a snapshot-only single-voter group — the standard openraft
     /// shape), and let the normal learner catch-up + snapshot path bring
     /// everyone else back in.
-    async fn meta_recovery_loop(
-        self: &Arc<Self>,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let window = switchboard_core::tempo::scale(Duration::from_secs(30));
-        let mut leaderless_since: Option<tokio::time::Instant> = None;
+    async fn meta_recovery_loop(self: &Arc<Self>, mut shutdown: Receiver<bool>) {
+        let window = scale(Duration::from_secs(30));
+        let mut leaderless_since: Option<Instant> = None;
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            select! {
+                _ = sleep(Duration::from_secs(1)) => {}
                 _ = shutdown.changed() => break,
             }
             let Some(handle) = self
@@ -2246,7 +2260,7 @@ impl ClusterNode {
                 leaderless_since = None;
                 continue;
             }
-            let since = *leaderless_since.get_or_insert(tokio::time::Instant::now());
+            let since = *leaderless_since.get_or_insert(Instant::now());
             if since.elapsed() < window {
                 continue;
             }
@@ -2298,8 +2312,8 @@ impl ClusterNode {
         let old_term: u64 = self
             .kv
             .get(&vote_key)
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?
-            .and_then(|b| bincode::deserialize::<openraft::Vote<NodeId>>(&b).ok())
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?
+            .and_then(|b| deserialize::<openraft::Vote<NodeId>>(&b).ok())
             .map(|v| v.leader_id.term)
             .unwrap_or(0);
         let new_term = old_term + 100;
@@ -2310,8 +2324,8 @@ impl ClusterNode {
                 k.extend_from_slice(b"last-applied");
                 k
             })
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?
-            .and_then(|b| bincode::deserialize(&b).ok());
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?
+            .and_then(|b| deserialize(&b).ok());
         let applied_index = last_applied.as_ref().map(|l| l.index).unwrap_or(0);
         let applied_log_id =
             openraft::LogId::new(openraft::LeaderId::new(new_term, self.id), applied_index);
@@ -2330,32 +2344,32 @@ impl ClusterNode {
         // last-applied. Then write the claimed state.
         self.kv
             .delete(&vote_key)
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
         self.kv
             .delete(&purged_key)
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
         self.kv
             .delete_prefix(&logs_prefix)
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
         let new_vote = openraft::Vote::new_committed(new_term, self.id);
         self.kv
             .write_mixed(
                 [
                     (
                         vote_key.clone(),
-                        bincode::serialize(&new_vote).expect("vote serializes"),
+                        serialize(&new_vote).expect("vote serializes"),
                     ),
                     (
                         purged_key.clone(),
-                        bincode::serialize(&applied_log_id).expect("purged serializes"),
+                        serialize(&applied_log_id).expect("purged serializes"),
                     ),
                 ],
                 [],
             )
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
         // Membership {self} at the applied index.
-        let voters = std::iter::once(self.id).collect();
-        let mut members = std::collections::BTreeMap::new();
+        let voters = once(self.id).collect();
+        let mut members = BTreeMap::new();
         members.insert(self.id, openraft::impls::BasicNode::default());
         let stored_membership = openraft::Membership::new(vec![voters], members);
         let stored = openraft::StoredMembership::new(Some(applied_log_id), stored_membership);
@@ -2365,11 +2379,11 @@ impl ClusterNode {
             .write_mixed(
                 [(
                     membership_key,
-                    bincode::serialize(&stored).expect("membership serializes"),
+                    serialize(&stored).expect("membership serializes"),
                 )],
                 [],
             )
-            .map_err(|e| ClusterError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| ClusterError::Io(Error::other(e.to_string())))?;
 
         // Fresh handle over the rebuilt state; it elects itself (sole
         // voter) and serves meta writes immediately.
@@ -2405,18 +2419,14 @@ impl ClusterNode {
             else {
                 continue;
             };
-            let refused = match tokio::time::timeout(
-                switchboard_core::tempo::scale(Duration::from_millis(800)),
-                tokio::net::TcpStream::connect(&addr),
-            )
-            .await
-            {
-                // Anything that connects (or times out / unreachable)
-                // fails open; only a live refusal counts.
-                Ok(Ok(_)) => false,
-                Ok(Err(e)) => e.kind() == std::io::ErrorKind::ConnectionRefused,
-                Err(_) => false,
-            };
+            let refused =
+                match timeout(scale(Duration::from_millis(800)), TcpStream::connect(&addr)).await {
+                    // Anything that connects (or times out / unreachable)
+                    // fails open; only a live refusal counts.
+                    Ok(Ok(_)) => false,
+                    Ok(Err(e)) => e.kind() == ErrorKind::ConnectionRefused,
+                    Err(_) => false,
+                };
             let mut fails = self.reap_fails.lock().expect("reap lock");
             if !refused {
                 fails.remove(&id);
@@ -2446,12 +2456,10 @@ impl ClusterNode {
     /// Janitor: periodically sweeps every shard group this node leads —
     /// expiring per-message/queue TTLs (dead-lettering as configured) and
     /// abandoning stale prepared transactions.
-    async fn janitor_loop(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(switchboard_core::tempo::scale(
-            self.cfg.timeouts.janitor_interval,
-        ));
+    async fn janitor_loop(self: &Arc<Self>, mut shutdown: Receiver<bool>) {
+        let mut tick = interval(scale(self.cfg.timeouts.janitor_interval));
         loop {
-            tokio::select! {
+            select! {
                 _ = tick.tick() => {}
                 _ = shutdown.changed() => break,
             }
@@ -2501,11 +2509,10 @@ impl ClusterNode {
                     .nodes
                     .iter()
                     .map(|(id, info)| (*id, info.internal_addr.clone()))
-                    .chain(std::iter::once((self.id, self.cfg.internal_addr.clone())))
+                    .chain(once((self.id, self.cfg.internal_addr.clone())))
                     .collect();
                 let mut fails = self.peer_probe_fails.lock().expect("probe lock").clone();
-                let mut live: std::collections::BTreeSet<NodeId> =
-                    std::collections::BTreeSet::new();
+                let mut live: BTreeSet<NodeId> = BTreeSet::new();
                 for (id, addr) in peers {
                     if id == self.id {
                         fails.remove(&id);
@@ -2516,7 +2523,7 @@ impl ClusterNode {
                         .channel
                         .rpc(
                             &addr,
-                            &bincode::serialize(&Envelope {
+                            &serialize(&Envelope {
                                 from: self.id,
                                 message: InternalMessage::Request(InternalRequest::Admin(
                                     AdminRequest::Ping,
@@ -2535,7 +2542,7 @@ impl ClusterNode {
                         // EADDRNOTAVAIL = local ephemeral-port exhaustion,
                         // load) says nothing about the peer — fail OPEN,
                         // or a loaded node would eat its live consumers.
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
                             let n = fails.entry(id).or_insert(0);
                             *n += 1;
                             let dead = *n >= dead_after;
@@ -2557,9 +2564,7 @@ impl ClusterNode {
                 let _ = self
                     .write(
                         group,
-                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::RequeueOrphaned {
-                            live_nodes: live,
-                        }),
+                        BrokerCommand::Shard(ShardCmd::RequeueOrphaned { live_nodes: live }),
                     )
                     .await;
                 // One wall-clock stamp for both sweeps below. The tx
@@ -2570,17 +2575,13 @@ impl ClusterNode {
                 let _ = self
                     .write(
                         group,
-                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::ExpirePrepared {
-                            at_ms: sweep_at_ms,
-                        }),
+                        BrokerCommand::Shard(ShardCmd::ExpirePrepared { at_ms: sweep_at_ms }),
                     )
                     .await;
                 let _ = self
                     .write(
                         group,
-                        BrokerCommand::Shard(switchboard_core::shard::ShardCmd::Sweep {
-                            at_ms: sweep_at_ms,
-                        }),
+                        BrokerCommand::Shard(ShardCmd::Sweep { at_ms: sweep_at_ms }),
                     )
                     .await;
             }
@@ -2593,12 +2594,12 @@ impl ClusterNode {
 
     async fn internal_server(
         self: &Arc<Self>,
-        listener: tokio::net::TcpListener,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        listener: TcpListener,
+        mut shutdown: Receiver<bool>,
     ) {
         info!(addr = %self.cfg.internal_addr, node = self.id, "internal listener up");
         loop {
-            let accepted = tokio::select! {
+            let accepted = select! {
                 accepted = listener.accept() => accepted,
                 _ = shutdown.changed() => break,
             };
@@ -2606,7 +2607,7 @@ impl ClusterNode {
                 continue;
             };
             let node = self.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 if let Err(e) = node.serve_conn(tcp).await {
                     debug!(err = ?e, "internal connection ended");
                 }
@@ -2614,8 +2615,8 @@ impl ClusterNode {
         }
     }
 
-    async fn serve_conn(self: &Arc<Self>, tcp: tokio::net::TcpStream) -> std::io::Result<()> {
-        let mut conn = crate::transport::accept(tcp, None).await?;
+    async fn serve_conn(self: &Arc<Self>, tcp: TcpStream) -> IoResult<()> {
+        let mut conn = accept(tcp, None).await?;
         // Shared-secret gate (code-scanning alert #5): when configured,
         // the connection must first prove knowledge of the secret before
         // ANY Raft/Forward/Admin envelope is dispatched. The secret
@@ -2625,27 +2626,26 @@ impl ClusterNode {
         let mut authenticated = required_secret.is_none();
         loop {
             let frame = conn.read_frame_full().await?;
-            let env: Envelope = match bincode::deserialize(&frame) {
+            let env: Envelope = match deserialize(&frame) {
                 Ok(e) => e,
                 Err(e) => {
                     if !authenticated {
                         // Undecodable garbage from an unproven peer: close
                         // rather than answer (the codec-error reply is a
                         // post-auth courtesy).
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
                             "unauthenticated connection sent an undecodable frame",
                         ));
                     }
                     let resp = InternalMessage::Response(InternalResponse::Error(e.to_string()));
-                    conn.write_frame(&bincode::serialize(&resp).unwrap())
-                        .await?;
+                    conn.write_frame(&serialize(&resp).unwrap()).await?;
                     continue;
                 }
             };
             if let InternalMessage::Request(InternalRequest::Auth { nonce, proof }) = &env.message {
                 match &required_secret {
-                    Some(secret) if crate::internal_auth::verify(secret, nonce, proof) => {
+                    Some(secret) if verify(secret, nonce, proof) => {
                         debug!(from = env.from, "internal connection authenticated");
                         authenticated = true;
                         // No reply of its own: the peer pipelines its
@@ -2657,8 +2657,8 @@ impl ClusterNode {
                             from = env.from,
                             "internal auth proof rejected; closing connection"
                         );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
+                        return Err(Error::new(
+                            ErrorKind::PermissionDenied,
                             "internal auth failed",
                         ));
                     }
@@ -2680,14 +2680,14 @@ impl ClusterNode {
                     from = env.from,
                     "internal connection without a valid auth proof; closing"
                 );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
                     "internal auth required",
                 ));
             }
             let resp = self.handle_request(env.message).await;
             let out = InternalMessage::Response(resp);
-            conn.write_frame(&bincode::serialize(&out).unwrap()).await?;
+            conn.write_frame(&serialize(&out).unwrap()).await?;
         }
     }
 
@@ -2867,9 +2867,9 @@ impl ClusterNode {
         // that can never happen — e.g. a voter whose address is unknown —
         // the openraft call would park forever. Bound it: the controller
         // retries on its next tick, so surfacing a timeout keeps liveness.
-        let change_budget = switchboard_core::tempo::scale(self.cfg.timeouts.reconfigure_budget);
-        let target: std::collections::BTreeSet<NodeId> = voters.into_iter().collect();
-        let current: std::collections::BTreeSet<NodeId> = handle
+        let change_budget = scale(self.cfg.timeouts.reconfigure_budget);
+        let target: BTreeSet<NodeId> = voters.into_iter().collect();
+        let current: BTreeSet<NodeId> = handle
             .raft
             .metrics()
             .borrow()
@@ -2881,7 +2881,7 @@ impl ClusterNode {
         // this call is what introduces it to replication.
         for l in &learners {
             if !target.contains(l) {
-                let _ = tokio::time::timeout(
+                let _ = timeout(
                     change_budget,
                     handle
                         .raft
@@ -2909,10 +2909,10 @@ impl ClusterNode {
         // that can never happen — e.g. a voter whose address is unknown —
         // the openraft call would park forever. Bound it: the controller
         // retries on its next tick, so surfacing a timeout keeps liveness.
-        let change_budget = switchboard_core::tempo::scale(self.cfg.timeouts.reconfigure_budget);
+        let change_budget = scale(self.cfg.timeouts.reconfigure_budget);
         for n in &target {
             if !current.contains(n) {
-                let _ = tokio::time::timeout(
+                let _ = timeout(
                     change_budget,
                     handle
                         .raft
@@ -2923,7 +2923,7 @@ impl ClusterNode {
         }
         for l in &learners {
             if !target.contains(l) {
-                let _ = tokio::time::timeout(
+                let _ = timeout(
                     change_budget,
                     handle
                         .raft
@@ -2932,7 +2932,7 @@ impl ClusterNode {
                 .await;
             }
         }
-        let change = tokio::time::timeout(
+        let change = timeout(
             change_budget,
             handle
                 .raft

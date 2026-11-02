@@ -7,6 +7,10 @@
 //! and refreshed by the reconciliation loop).
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -26,6 +30,8 @@ use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 
+use bincode::deserialize;
+use bincode::serialize;
 use switchboard_core::topology::GroupId;
 
 use crate::proto::Envelope;
@@ -138,7 +144,7 @@ impl RaftNetClient {
                 payload,
             }),
         };
-        let bytes = bincode::serialize(&req).map_err(|e| {
+        let bytes = serialize(&req).map_err(|e| {
             RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string())))
         })?;
         // Pooled request→reply: the raft heartbeat cadence must not churn
@@ -148,7 +154,7 @@ impl RaftNetClient {
                 "rpc {addr}: {e}"
             ))))
         })?;
-        let msg: InternalMessage = bincode::deserialize(&back).map_err(|e| {
+        let msg: InternalMessage = deserialize(&back).map_err(|e| {
             RPCError::Network(NetworkError::new(&ConnectionError::new(e.to_string())))
         })?;
         match msg {
@@ -171,13 +177,13 @@ impl RaftNetClient {
 #[derive(Debug)]
 pub struct PeerError(pub String);
 
-impl std::fmt::Display for PeerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for PeerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for PeerError {}
+impl Error for PeerError {}
 
 /// A displayable wrapper so io/errors fit openraft's `AnyError`-shaped
 /// constructors.
@@ -192,13 +198,13 @@ impl ConnectionError {
     }
 }
 
-impl std::fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ConnectionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(&self.msg)
     }
 }
 
-impl std::error::Error for ConnectionError {}
+impl Error for ConnectionError {}
 
 impl RaftNetwork<SwitchboardTypeConfig> for RaftNetClient {
     async fn append_entries(
@@ -283,9 +289,14 @@ fn mismatched(other: RaftResponse, rpc: &'static str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::AdminResponse;
+    use crate::transport::accept;
     use crate::typ::NodeId;
+    use bincode::serialize;
     use openraft::Vote;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::spawn;
 
     fn client(dir: Arc<Directory>, target: NodeId) -> RaftNetClient {
         RaftNetClient {
@@ -305,15 +316,13 @@ mod tests {
     }
 
     async fn fake_peer(reply: InternalMessage) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        tokio::spawn(async move {
+        spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut conn = crate::transport::accept(tcp, None).await.unwrap();
+            let mut conn = accept(tcp, None).await.unwrap();
             let _frame = conn.read_frame_full().await.unwrap();
-            conn.write_frame(&bincode::serialize(&reply).unwrap())
-                .await
-                .unwrap();
+            conn.write_frame(&serialize(&reply).unwrap()).await.unwrap();
         });
         addr
     }
@@ -352,7 +361,7 @@ mod tests {
         // A peer that answers a vote with something that is not a raft
         // response at all.
         let peer = fake_peer(InternalMessage::Response(InternalResponse::Admin(
-            crate::proto::AdminResponse::Pong,
+            AdminResponse::Pong,
         )))
         .await;
         dir.update(9, peer);

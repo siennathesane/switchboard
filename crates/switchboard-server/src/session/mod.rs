@@ -13,6 +13,9 @@
 //! interval"; two silent intervals close the connection).
 
 use std::collections::HashMap;
+use std::future::poll_fn;
+use std::io::Error;
+use std::io::Result as IoResult;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -25,30 +28,53 @@ use switchboard_core::auth;
 use switchboard_core::error::BrokerError;
 use switchboard_core::error::Level;
 use switchboard_core::model::ConnectionId;
+use switchboard_core::tempo::scale;
+use switchboard_wire::BasicProperties;
+use switchboard_wire::CodecError;
+use switchboard_wire::Frame;
 use switchboard_wire::FrameReader;
+use switchboard_wire::FrameType;
+use switchboard_wire::PROTOCOL_HEADER;
+use switchboard_wire::VERSION_MAJOR;
+use switchboard_wire::VERSION_MINOR;
+use switchboard_wire::constants::PRODUCT_NAME;
+use switchboard_wire::constants::PRODUCT_VERSION;
 use switchboard_wire::constants::reply;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::field::FieldValue;
 use switchboard_wire::method::Method;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
+use tokio::net::TcpStream;
+use tokio::pin;
+use tokio::select;
+use tokio::spawn;
 use tokio::sync::mpsc;
+use tokio::time::Instant as TokioInstant;
+use tokio::time::MissedTickBehavior;
+use tokio::time::interval;
+use tokio::time::sleep_until;
 use tracing::debug;
 use tracing::warn;
 
 use crate::channel::Channel;
 use crate::channel::ConnectionLimits;
+use crate::channel::channel_already_open;
 use crate::channel::close_for;
+use crate::channel::method_allowed_on_channel_zero;
 use crate::channel::unexpected_content;
+use crate::channel::unknown_channel;
 use crate::outbound::OutboundFrame;
+use crate::outbound::encode;
 
 /// Serve one accepted plain-TCP client connection.
 pub async fn serve(
-    socket: tokio::net::TcpStream,
+    socket: TcpStream,
     node: Arc<ClusterNode>,
     limits: ConnectionLimits,
-) -> std::io::Result<()> {
+) -> IoResult<()> {
     socket.set_nodelay(true).ok();
     let (r, w) = socket.into_split();
     serve_rw(r, w, node, limits).await
@@ -60,7 +86,7 @@ pub async fn serve_rw<R, W>(
     mut writer: W,
     node: Arc<ClusterNode>,
     limits: ConnectionLimits,
-) -> std::io::Result<()>
+) -> IoResult<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -70,7 +96,7 @@ where
     // ---- protocol header (§4.2.2) ----
     loop {
         let mut buf = [0u8; 512];
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+        let n = AsyncReadExt::read(&mut reader, &mut buf).await?;
         if n == 0 {
             return Ok(());
         }
@@ -81,7 +107,7 @@ where
             Err(_) => {
                 // Reject: write a valid protocol header, flush, close (§4.2.2).
                 use tokio::io::AsyncWriteExt as _;
-                let _ = writer.write_all(&switchboard_wire::PROTOCOL_HEADER).await;
+                let _ = writer.write_all(&PROTOCOL_HEADER).await;
                 let _ = writer.flush().await;
                 return Ok(());
             }
@@ -106,17 +132,17 @@ where
     let heartbeat = if limits.heartbeat == 0 {
         Duration::ZERO
     } else {
-        switchboard_core::tempo::scale(Duration::from_secs(limits.heartbeat as u64))
+        scale(Duration::from_secs(limits.heartbeat as u64))
     };
 
-    let writer_task = tokio::spawn(async move {
+    let writer_task = spawn(async move {
         use tokio::io::AsyncWriteExt as _;
         let mut buf = BytesMut::new();
         let mut last_write = Instant::now();
-        let mut ticker = tokio::time::interval(Duration::from_millis(200));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticker = interval(Duration::from_millis(200));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            let msg = tokio::select! {
+            let msg = select! {
                 m = rx.recv() => match m {
                     Some(m) => m,
                     None => break,
@@ -132,7 +158,7 @@ where
                 }
             };
             let shutdown = matches!(msg, OutboundFrame::Shutdown);
-            crate::outbound::encode(&msg, &mut buf);
+            encode(&msg, &mut buf);
             if writer.write_all(&buf).await.is_err() || shutdown {
                 let _ = writer.shutdown().await;
                 break;
@@ -150,12 +176,12 @@ where
 
 #[derive(Debug)]
 enum HandshakeError {
-    Io(std::io::Error),
+    Io(Error),
     Rejected,
 }
 
-impl From<std::io::Error> for HandshakeError {
-    fn from(e: std::io::Error) -> Self {
+impl From<Error> for HandshakeError {
+    fn from(e: Error) -> Self {
         HandshakeError::Io(e)
     }
 }
@@ -179,17 +205,17 @@ async fn read_method<R: AsyncRead + Unpin>(
     reader: &mut R,
     fr: &mut FrameReader,
     frame_max: u32,
-) -> std::io::Result<Option<Method>> {
+) -> IoResult<Option<Method>> {
     loop {
         if let Some(f) = fr.next_frame(frame_max).map_err(io_err)? {
-            if matches!(f.frame_type, switchboard_wire::FrameType::Method) {
+            if matches!(f.frame_type, FrameType::Method) {
                 let m = f.decode_method().map_err(io_err)?;
                 return Ok(Some(m));
             }
             continue;
         }
         let mut buf = [0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(reader, &mut buf).await?;
+        let n = AsyncReadExt::read(reader, &mut buf).await?;
         if n == 0 {
             return Ok(None);
         }
@@ -197,9 +223,9 @@ async fn read_method<R: AsyncRead + Unpin>(
     }
 }
 
-async fn send_method<W: AsyncWrite + Unpin>(writer: &mut W, m: &Method) -> std::io::Result<()> {
+async fn send_method<W: AsyncWrite + Unpin>(writer: &mut W, m: &Method) -> IoResult<()> {
     use tokio::io::AsyncWriteExt as _;
-    let bytes = switchboard_wire::Frame::method(0, m).to_bytes();
+    let bytes = Frame::method(0, m).to_bytes();
     writer.write_all(&bytes).await?;
     writer.flush().await
 }
@@ -220,19 +246,11 @@ where
     let mut server_properties = FieldTable::new();
     server_properties.insert(
         "product",
-        FieldValue::LongString(
-            switchboard_wire::constants::PRODUCT_NAME
-                .as_bytes()
-                .to_vec(),
-        ),
+        FieldValue::LongString(PRODUCT_NAME.as_bytes().to_vec()),
     );
     server_properties.insert(
         "version",
-        FieldValue::LongString(
-            switchboard_wire::constants::PRODUCT_VERSION
-                .as_bytes()
-                .to_vec(),
-        ),
+        FieldValue::LongString(PRODUCT_VERSION.as_bytes().to_vec()),
     );
     let mut capabilities = FieldTable::new();
     capabilities.insert("publisher_confirms", FieldValue::Boolean(true));
@@ -244,8 +262,8 @@ where
     send_method(
         writer,
         &Method::ConnectionStart {
-            version_major: switchboard_wire::VERSION_MAJOR,
-            version_minor: switchboard_wire::VERSION_MINOR,
+            version_major: VERSION_MAJOR,
+            version_minor: VERSION_MINOR,
             server_properties,
             mechanisms: auth::MECHANISMS.as_bytes().to_vec(),
             locales: auth::LOCALES.as_bytes().to_vec(),
@@ -281,7 +299,7 @@ where
         && !limits.allow_remote_guest
         && limits.peer_ip.map_or(false, |ip| !ip.is_loopback())
     {
-        tracing::warn!(peer = ?limits.peer_ip, "refusing remote `guest` login (loopback-only; set allow-remote-guest to override)");
+        warn!(peer = ?limits.peer_ip, "refusing remote `guest` login (loopback-only; set allow-remote-guest to override)");
         return Err(HandshakeError::Rejected);
     }
     // §2.2.4: authentication is a read against the replicated user
@@ -399,7 +417,7 @@ impl Session {
         let heartbeat_timeout = if self.limits.heartbeat == 0 {
             Duration::from_secs(u64::MAX)
         } else {
-            switchboard_core::tempo::scale(Duration::from_secs(self.limits.heartbeat as u64 * 2))
+            scale(Duration::from_secs(self.limits.heartbeat as u64 * 2))
         };
         let mut last_octets = Instant::now();
         loop {
@@ -447,19 +465,16 @@ impl Session {
             //    With heartbeats disabled (0) the deadline is "never":
             //    checked_add instead of `+`, which overflows Instant and
             //    panics the session task.
-            let deadline =
-                match tokio::time::Instant::from_std(last_octets).checked_add(heartbeat_timeout) {
-                    Some(d) => d,
-                    None => {
-                        tokio::time::Instant::now()
-                            + std::time::Duration::from_secs(10 * 365 * 24 * 3600)
-                    }
-                };
+            let deadline = match TokioInstant::from_std(last_octets).checked_add(heartbeat_timeout)
+            {
+                Some(d) => d,
+                None => TokioInstant::now() + Duration::from_secs(10 * 365 * 24 * 3600),
+            };
             let mut chunk = [0u8; 4096];
             let mut read_buf = ReadBuf::new(&mut chunk);
-            let sleep = tokio::time::sleep_until(deadline);
-            tokio::pin!(sleep);
-            let read_result = std::future::poll_fn(|cx| {
+            let sleep = sleep_until(deadline);
+            pin!(sleep);
+            let read_result = poll_fn(|cx| {
                 loop {
                     // Client octets win whenever they are ready.
                     match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
@@ -515,7 +530,7 @@ impl Session {
     // Frame dispatch
     // ------------------------------------------------------------------
 
-    async fn handle_frame(&mut self, frame: switchboard_wire::Frame) -> Flow {
+    async fn handle_frame(&mut self, frame: Frame) -> Flow {
         use switchboard_wire::FrameType;
         match frame.frame_type {
             FrameType::Heartbeat => {
@@ -532,7 +547,7 @@ impl Session {
                         .connection_exception(BrokerError::syntax_error("malformed method"));
                 };
                 if frame.channel == 0 {
-                    if !crate::channel::method_allowed_on_channel_zero(&method) {
+                    if !method_allowed_on_channel_zero(&method) {
                         return self.connection_exception(BrokerError::command_invalid(
                             "non-connection method on channel 0",
                         ));
@@ -547,8 +562,7 @@ impl Session {
                         .connection_exception(BrokerError::channel_error("content on channel 0"));
                 }
                 let Some(ch) = self.channels.get(&frame.channel).cloned() else {
-                    return self
-                        .connection_exception(crate::channel::unknown_channel(frame.channel));
+                    return self.connection_exception(unknown_channel(frame.channel));
                 };
                 let expected = {
                     let inner = ch.inner.lock().unwrap();
@@ -607,8 +621,7 @@ impl Session {
                         .connection_exception(BrokerError::channel_error("content on channel 0"));
                 }
                 let Some(ch) = self.channels.get(&frame.channel).cloned() else {
-                    return self
-                        .connection_exception(crate::channel::unknown_channel(frame.channel));
+                    return self.connection_exception(unknown_channel(frame.channel));
                 };
                 let (done, complete) = {
                     let mut inner = ch.inner.lock().unwrap();
@@ -710,7 +723,7 @@ impl Session {
         match &m {
             Method::ChannelOpen { .. } => {
                 if self.channels.contains_key(&id) {
-                    return self.connection_exception(crate::channel::channel_already_open(id));
+                    return self.connection_exception(channel_already_open(id));
                 }
                 if self.limits.channel_max != 0 && id > self.limits.channel_max {
                     return self.connection_exception(BrokerError::channel_error(format!(
@@ -752,7 +765,7 @@ impl Session {
         }
 
         let Some(ch) = self.channels.get(&id).cloned() else {
-            return self.connection_exception(crate::channel::unknown_channel(id));
+            return self.connection_exception(unknown_channel(id));
         };
         match ch.handle(&self.node, m).await {
             Ok(()) => Flow::Continue,
@@ -769,11 +782,11 @@ impl Session {
         &mut self,
         channel: u16,
         method: Method,
-        props: switchboard_wire::BasicProperties,
+        props: BasicProperties,
         body: Vec<u8>,
     ) -> Flow {
         let Some(ch) = self.channels.get(&channel).cloned() else {
-            return self.connection_exception(crate::channel::unknown_channel(channel));
+            return self.connection_exception(unknown_channel(channel));
         };
         match ch.publish(&self.node, method, props, body).await {
             Ok(()) => Flow::Continue,
@@ -788,8 +801,8 @@ enum Flow {
     Close,
 }
 
-fn io_err(e: switchboard_wire::CodecError) -> std::io::Error {
-    std::io::Error::other(e.to_string())
+fn io_err(e: CodecError) -> Error {
+    Error::other(e.to_string())
 }
 
 /// Silence the unused-import lint for the reply constants module used by

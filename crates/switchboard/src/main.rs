@@ -17,11 +17,31 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![cfg_attr(coverage_nightly, coverage(off))]
 
+use std::fs::read;
 use std::path::PathBuf;
+use std::process::exit;
+use std::time::Duration;
 
+use anyhow::Result;
+use anyhow::anyhow;
 use clap::Parser;
+use switchboard_cluster::ClusterNode;
 use switchboard_cluster::NodeConfig;
+use switchboard_cluster::discovery::DiscoveryConfig;
+use switchboard_cluster::discovery::run;
+use switchboard_cluster::node::Timeouts;
 use switchboard_server::ConnectionLimits;
+use switchboard_server::ProtocolConfig;
+use switchboard_server::listener::run as run_listener;
+use switchboard_server::tls::TlsIdentity;
+use tokio::select;
+#[cfg(not(unix))]
+use tokio::signal::ctrl_c;
+use tokio::spawn;
+use tokio::sync::watch::channel;
+use tokio::time::timeout;
+use tracing::info;
+use tracing::warn;
 
 mod backup_cmd;
 
@@ -231,7 +251,7 @@ pub struct Cli {
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cli.log).unwrap_or_default())
@@ -261,21 +281,21 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
     }
-    let timeouts = switchboard_cluster::node::Timeouts {
-        write_budget: std::time::Duration::from_millis(cli.write_budget_ms),
-        fanout_budget: std::time::Duration::from_millis(cli.fanout_budget_ms),
-        rpc_reply_budget: std::time::Duration::from_millis(cli.rpc_reply_budget_ms),
-        reconfigure_budget: std::time::Duration::from_millis(cli.reconfigure_budget_ms),
-        join_budget: std::time::Duration::from_millis(cli.join_budget_ms),
-        raft_heartbeat: std::time::Duration::from_millis(cli.raft_heartbeat_ms),
-        raft_election_min: std::time::Duration::from_millis(cli.raft_election_min_ms),
-        raft_election_max: std::time::Duration::from_millis(cli.raft_election_max_ms),
-        reconcile_interval: std::time::Duration::from_millis(cli.reconcile_interval_ms),
-        janitor_interval: std::time::Duration::from_millis(cli.janitor_interval_ms),
+    let timeouts = Timeouts {
+        write_budget: Duration::from_millis(cli.write_budget_ms),
+        fanout_budget: Duration::from_millis(cli.fanout_budget_ms),
+        rpc_reply_budget: Duration::from_millis(cli.rpc_reply_budget_ms),
+        reconfigure_budget: Duration::from_millis(cli.reconfigure_budget_ms),
+        join_budget: Duration::from_millis(cli.join_budget_ms),
+        raft_heartbeat: Duration::from_millis(cli.raft_heartbeat_ms),
+        raft_election_min: Duration::from_millis(cli.raft_election_min_ms),
+        raft_election_max: Duration::from_millis(cli.raft_election_max_ms),
+        reconcile_interval: Duration::from_millis(cli.reconcile_interval_ms),
+        janitor_interval: Duration::from_millis(cli.janitor_interval_ms),
         janitor_dead_after: cli.janitor_dead_after,
         reap_dead_after: cli.reap_dead_after,
         deliver_release_retries: cli.deliver_release_retries,
-        deliver_release_interval: std::time::Duration::from_millis(cli.deliver_release_interval_ms),
+        deliver_release_interval: Duration::from_millis(cli.deliver_release_interval_ms),
     };
     let cfg = NodeConfig {
         id: cli.node_id,
@@ -298,9 +318,9 @@ async fn main() -> anyhow::Result<()> {
         timeouts,
     };
 
-    let node = switchboard_cluster::ClusterNode::start(cfg)
+    let node = ClusterNode::start(cfg)
         .await
-        .map_err(|e| anyhow::anyhow!("cluster start failed: {e}"))?;
+        .map_err(|e| anyhow!("cluster start failed: {e}"))?;
 
     // Graceful departure on SIGTERM/SIGINT: announce ForgetNode through
     // meta so the directory, meta voter set, and group member lists
@@ -310,8 +330,8 @@ async fn main() -> anyhow::Result<()> {
     // the membership on its own.
     {
         let node2 = node.clone();
-        let leave_budget = std::time::Duration::from_secs(cli.leave_timeout_secs);
-        tokio::spawn(async move {
+        let leave_budget = Duration::from_secs(cli.leave_timeout_secs);
+        spawn(async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::SignalKind;
@@ -324,48 +344,48 @@ async fn main() -> anyhow::Result<()> {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                tokio::select! {
-                    _ = term.recv() => tracing::info!("SIGTERM: leaving cluster"),
-                    _ = int.recv() => tracing::info!("SIGINT: leaving cluster"),
+                select! {
+                    _ = term.recv() => info!("SIGTERM: leaving cluster"),
+                    _ = int.recv() => info!("SIGINT: leaving cluster"),
                 }
             }
             #[cfg(not(unix))]
-            tokio::signal::ctrl_c().await.ok();
+            ctrl_c().await.ok();
             // Bounded graceful leave: announcing ForgetNode needs a meta
             // quorum, and a node that IS part of that quorum leaving
             // simultaneously with its peers can wait out the entire
             // election budget. The controller's dead-node reaper heals
             // membership regardless, so cap the ceremony and exit.
-            match tokio::time::timeout(leave_budget, node2.leave()).await {
-                Ok(Ok(())) => tracing::info!("left the cluster cleanly"),
-                Ok(Err(e)) => tracing::warn!("leave errored: {e}; exiting anyway"),
-                Err(_) => tracing::warn!(
+            match timeout(leave_budget, node2.leave()).await {
+                Ok(Ok(())) => info!("left the cluster cleanly"),
+                Ok(Err(e)) => warn!("leave errored: {e}; exiting anyway"),
+                Err(_) => warn!(
                     "leave exceeded {leave_budget:?} (meta quorum unreachable?); exiting anyway"
                 ),
             }
-            std::process::exit(0);
+            exit(0);
         });
     }
 
     // Self-discovery: DNS seeds / SRV records / mDNS all feed the join
     // protocol, so clusters assemble without listing every peer by hand.
-    let discovery_cfg = switchboard_cluster::discovery::DiscoveryConfig {
+    let discovery_cfg = DiscoveryConfig {
         dns_seeds: cli.dns_seed.clone(),
         dns_srv_domains: cli.dns_srv.clone(),
         mdns: cli.mdns,
         mdns_instance: cli.mdns_instance.clone(),
-        interval: std::time::Duration::from_secs(cli.discovery_interval.max(1)),
+        interval: Duration::from_secs(cli.discovery_interval.max(1)),
     };
     {
         let node2 = node.clone();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx) = channel(false);
+        spawn(async move {
             // The sender MUST live as long as discovery: a dropped
             // sender resolves `changed()` immediately, which ended the
             // discovery loop on its first poll — every --dns-seed /
             // mDNS deployment silently never discovered anything.
             let _keep_alive = shutdown_tx;
-            switchboard_cluster::discovery::run(node2, discovery_cfg, shutdown_rx).await;
+            run(node2, discovery_cfg, shutdown_rx).await;
         });
     }
 
@@ -374,21 +394,21 @@ async fn main() -> anyhow::Result<()> {
         allow_remote_guest: cli.allow_remote_guest,
         ..ConnectionLimits::default()
     };
-    let protocols = switchboard_server::ProtocolConfig::from_list(&cli.protocols)
-        .map_err(|e| anyhow::anyhow!("bad --protocols: {e}"))?;
+    let protocols =
+        ProtocolConfig::from_list(&cli.protocols).map_err(|e| anyhow!("bad --protocols: {e}"))?;
 
     let tls = match (cli.tls_cert.clone(), cli.tls_key.clone()) {
         (Some(cert), Some(key)) => {
-            let id = switchboard_server::tls::TlsIdentity {
-                cert_pem: std::fs::read(&cert)?,
-                key_pem: std::fs::read(&key)?,
+            let id = TlsIdentity {
+                cert_pem: read(&cert)?,
+                key_pem: read(&key)?,
             };
             Some(id)
         }
         _ => None,
     };
 
-    tracing::info!(node = cli.node_id, listen = %cli.listen, "switchboard up");
-    switchboard_server::listener::run(node, &cli.listen, limits, tls, protocols).await?;
+    info!(node = cli.node_id, listen = %cli.listen, "switchboard up");
+    run_listener(node, &cli.listen, limits, tls, protocols).await?;
     Ok(())
 }

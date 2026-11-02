@@ -6,6 +6,8 @@
 //! topology) or the shard state machine (queues), so group 0 and shard
 //! groups differ only in their configuration, not their code.
 
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::Cursor;
 
 use openraft::Entry;
@@ -15,12 +17,15 @@ use openraft::impls::BasicNode;
 use serde::Deserialize;
 use serde::Serialize;
 
+use switchboard_core::error::BrokerError;
 use switchboard_core::shard::ShardCmd;
 use switchboard_core::shard::ShardEffect;
 use switchboard_core::shard::ShardReply;
+use switchboard_core::shard::ShardState;
 use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaEffect;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::MetaState;
 
 /// Node identity across the cluster: small dense integers assigned at join
 /// time. `Default` must be deterministic, so it is `u64::MAX` sentinel use
@@ -97,8 +102,8 @@ const DEDUP_CAPACITY: usize = 8192;
 /// Bounded insertion-ordered map of recently applied request ids.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DedupLog {
-    map: std::collections::HashMap<RequestId, BrokerReply>,
-    order: std::collections::VecDeque<RequestId>,
+    map: HashMap<RequestId, BrokerReply>,
+    order: VecDeque<RequestId>,
 }
 
 impl DedupLog {
@@ -126,7 +131,7 @@ pub enum BrokerReply {
     Bootstrapped,
     /// The command was applied but the model rejected it (404/406/...).
     /// These still consume the log entry: replicated state advances.
-    Error(switchboard_core::error::BrokerError),
+    Error(BrokerError),
     Meta(MetaReply),
     Shard(ShardReply),
     /// Per-command replies for a [`BrokerCommand::Batch`], in order.
@@ -147,8 +152,8 @@ pub enum Effect {
 /// shard groups, but sharing one struct keeps the raft plumbing uniform.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BrokerState {
-    pub meta: switchboard_core::topology::MetaState,
-    pub shard: switchboard_core::shard::ShardState,
+    pub meta: MetaState,
+    pub shard: ShardState,
     /// True once a `Bootstrap` command has been applied.
     pub bootstrapped: bool,
     /// Replies for recently applied idempotent requests, so a re-issued
@@ -161,7 +166,7 @@ impl BrokerState {
     pub fn apply(
         &mut self,
         cmd: &BrokerCommand,
-    ) -> Result<(BrokerReply, Vec<Effect>), switchboard_core::error::BrokerError> {
+    ) -> Result<(BrokerReply, Vec<Effect>), BrokerError> {
         match cmd {
             BrokerCommand::Idempotent { id, command } => {
                 if let Some(reply) = self.dedup.lookup(id) {
@@ -230,8 +235,14 @@ impl BrokerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::deserialize;
+    use bincode::serialize;
+    use switchboard_core::auth::hash_password;
+    use switchboard_core::model::ExchangeKind;
+    use switchboard_core::model::StoredMessage;
     use switchboard_core::shard::ShardCmd;
     use switchboard_core::topology::MetaCmd;
+    use switchboard_wire::BasicProperties;
 
     #[test]
     fn bootstrap_is_idempotent_and_wires_defaults() {
@@ -242,7 +253,7 @@ mod tests {
                 user: "guest".into(),
                 // Propose-side contract (alert #15): the command is built
                 // with the PHC string, never the plaintext password.
-                password_hash: switchboard_core::auth::hash_password("guest", "guest"),
+                password_hash: hash_password("guest", "guest"),
             })
             .unwrap();
         assert_eq!(r, BrokerReply::Bootstrapped);
@@ -254,7 +265,7 @@ mod tests {
             .apply(&BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "guest".into(),
-                password_hash: switchboard_core::auth::hash_password("guest", "guest"),
+                password_hash: hash_password("guest", "guest"),
             })
             .unwrap();
         assert_eq!(r2, BrokerReply::Bootstrapped);
@@ -266,14 +277,14 @@ mod tests {
         st.apply(&BrokerCommand::Bootstrap {
             vhost: "/".into(),
             user: "guest".into(),
-            password_hash: switchboard_core::auth::hash_password("guest", "guest"),
+            password_hash: hash_password("guest", "guest"),
         })
         .unwrap();
         let (BrokerReply::Meta(MetaReply::ExchangeDeclared { existed }), _) = st
             .apply(&BrokerCommand::Meta(MetaCmd::DeclareExchange {
                 vhost: "/".into(),
                 name: "ex".into(),
-                kind: switchboard_core::model::ExchangeKind::Direct,
+                kind: ExchangeKind::Direct,
                 passive: false,
                 durable: true,
                 auto_delete: false,
@@ -296,8 +307,8 @@ mod tests {
             .apply(&BrokerCommand::Shard(ShardCmd::Enqueue {
                 at_ms: 100,
                 queue: "q".into(),
-                message: switchboard_core::model::StoredMessage {
-                    properties: switchboard_wire::BasicProperties::new(),
+                message: StoredMessage {
+                    properties: BasicProperties::new(),
                     body: b"m".to_vec(),
                     exchange: "ex".into(),
                     routing_key: "k".into(),
@@ -318,14 +329,14 @@ mod tests {
             BrokerCommand::Bootstrap {
                 vhost: "/".into(),
                 user: "u".into(),
-                password_hash: switchboard_core::auth::hash_password("u", "p"),
+                password_hash: hash_password("u", "p"),
             },
             BrokerCommand::Meta(MetaCmd::DeclareVhost { name: "vh".into() }),
             BrokerCommand::Shard(ShardCmd::ExpirePrepared { at_ms: 1 }),
         ];
         for c in cmds {
-            let bytes = bincode::serialize(&c).unwrap();
-            let back: BrokerCommand = bincode::deserialize(&bytes).unwrap();
+            let bytes = serialize(&c).unwrap();
+            let back: BrokerCommand = deserialize(&bytes).unwrap();
             assert_eq!(back, c);
         }
     }
@@ -337,10 +348,10 @@ mod tests {
         // at propose, outside raft), a captured Bootstrap entry and a
         // captured CreateUser entry carry an `$argon2` PHC string — and
         // never the plaintext password.
-        let bootstrap = bincode::serialize(&BrokerCommand::Bootstrap {
+        let bootstrap = serialize(&BrokerCommand::Bootstrap {
             vhost: "/".into(),
             user: "alice".into(),
-            password_hash: switchboard_core::auth::hash_password("alice", "hunter2-propose-side"),
+            password_hash: hash_password("alice", "hunter2-propose-side"),
         })
         .unwrap();
         assert!(
@@ -352,9 +363,9 @@ mod tests {
             "the serialized Bootstrap entry must not carry the plaintext"
         );
 
-        let create = bincode::serialize(&BrokerCommand::Meta(MetaCmd::CreateUser {
+        let create = serialize(&BrokerCommand::Meta(MetaCmd::CreateUser {
             name: "bob".into(),
-            password_hash: switchboard_core::auth::hash_password("bob", "hunter2-propose-side"),
+            password_hash: hash_password("bob", "hunter2-propose-side"),
         }))
         .unwrap();
         assert!(
@@ -376,8 +387,8 @@ mod tests {
             command: Box::new(BrokerCommand::Shard(ShardCmd::Enqueue {
                 at_ms: 0,
                 queue: "q".into(),
-                message: switchboard_core::model::StoredMessage {
-                    properties: switchboard_wire::BasicProperties::new(),
+                message: StoredMessage {
+                    properties: BasicProperties::new(),
                     body: b"m".to_vec(),
                     exchange: "ex".into(),
                     routing_key: "k".into(),

@@ -15,6 +15,10 @@ use tokio::io::AsyncWriteExt;
 
 use support::TestClient;
 use support::start_broker;
+use switchboard_wire::ContentHeader;
+use switchboard_wire::properties::ContentHeader as PropertiesContentHeader;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// Handshake steps with control over each exchange.
 async fn read_start(c: &mut TestClient) -> Method {
@@ -54,7 +58,7 @@ async fn read_tune(c: &mut TestClient) -> Method {
 /// promptly and no session must survive.
 async fn expect_closed(c: &mut TestClient) {
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
+    let n = timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
     match n {
         Ok(Ok(0)) => {}
         Ok(Ok(_)) => {} // e.g. a Connection.Close 403 — equally valid
@@ -70,7 +74,7 @@ async fn client_that_connects_and_vanishes_is_fine() {
     // frame boundary and exits.
     let c = TestClient::connect(&addr).await.unwrap();
     drop(c);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    sleep(Duration::from_millis(150)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -258,7 +262,7 @@ async fn silent_client_with_heartbeat_is_timed_out() {
     .unwrap();
     let _ = c.expect(0).await.unwrap();
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
+    let n = timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
     match n {
         Ok(Ok(0)) => {}
         Ok(Ok(_)) => {} // a close frame is also acceptable
@@ -282,7 +286,7 @@ async fn garbage_method_payload_yields_syntax_error_close() {
     c.writer.flush().await.unwrap();
     // The session must terminate (any reply or EOF proves no hang).
     let mut buf = [0u8; 128];
-    let _ = tokio::time::timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
+    let _ = timeout(Duration::from_secs(15), c.read_half.read(&mut buf)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -306,7 +310,7 @@ async fn method_on_unopened_channel_is_a_connection_exception() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -326,7 +330,7 @@ async fn channel_beyond_negotiated_max_is_rejected() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -352,7 +356,7 @@ async fn queue_declare_on_channel_zero_is_command_invalid() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -365,13 +369,10 @@ async fn content_header_on_channel_zero_is_fatal() {
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
     // connect_and_open already opened channel 1; a content HEADER on
     // channel 0 is a connection exception (§4.2.3).
-    let f = Frame::header(
-        0,
-        &switchboard_wire::ContentHeader::new(0, BasicProperties::new()),
-    );
+    let f = Frame::header(0, &ContentHeader::new(0, BasicProperties::new()));
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -385,7 +386,7 @@ async fn content_body_on_channel_zero_is_fatal() {
     let f = Frame::body(0, b"x");
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -398,13 +399,10 @@ async fn content_header_without_a_pending_method_is_unexpected() {
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
     // Channel 1 is open but no Basic.Publish is pending: a bare content
     // header is unexpected content.
-    let f = Frame::header(
-        1,
-        &switchboard_wire::ContentHeader::new(0, BasicProperties::new()),
-    );
+    let f = Frame::header(1, &ContentHeader::new(0, BasicProperties::new()));
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -418,7 +416,7 @@ async fn content_body_without_a_header_is_unexpected() {
     let f = Frame::body(1, b"orphan");
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -441,7 +439,7 @@ async fn channel_level_error_sends_channel_close() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(1))
+    let m = timeout(Duration::from_secs(15), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -468,13 +466,10 @@ async fn content_without_a_publish_is_a_connection_error() {
     // violation the session answers with a connection-level close.
     let (_node, addr) = start_broker("sa-nopub").await;
     let mut c = support::connect_and_open(&addr, "/").await.unwrap();
-    let f = Frame::header(
-        1,
-        &switchboard_wire::ContentHeader::new(0, BasicProperties::new()),
-    );
+    let f = Frame::header(1, &ContentHeader::new(0, BasicProperties::new()));
     c.writer.write_all(&f.to_bytes()).await.unwrap();
     c.writer.flush().await.unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0)).await;
+    let m = timeout(Duration::from_secs(15), c.expect(0)).await;
     assert!(
         matches!(m, Ok(Ok(Method::ConnectionClose { .. }))),
         "session must react to orphan content header: {m:?}"
@@ -496,7 +491,7 @@ async fn connection_close_gets_close_ok_then_the_socket_ends() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let m = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -506,7 +501,7 @@ async fn connection_close_gets_close_ok_then_the_socket_ends() {
         .await
         .unwrap();
     let mut buf = [0u8; 32];
-    let _ = tokio::time::timeout(Duration::from_secs(10), c.read_half.read(&mut buf)).await;
+    let _ = timeout(Duration::from_secs(10), c.read_half.read(&mut buf)).await;
 }
 
 /// After a server-initiated Connection.Close, the client's Close-Ok is
@@ -531,7 +526,7 @@ async fn client_close_ok_after_server_close_is_accepted() {
     )
     .await
     .unwrap();
-    let close = tokio::time::timeout(Duration::from_secs(15), c.expect(0))
+    let close = timeout(Duration::from_secs(15), c.expect(0))
         .await
         .unwrap()
         .unwrap();
@@ -543,7 +538,7 @@ async fn client_close_ok_after_server_close_is_accepted() {
         .await
         .unwrap();
     let mut buf = [0u8; 32];
-    let n = tokio::time::timeout(Duration::from_secs(10), c.read_half.read(&mut buf)).await;
+    let n = timeout(Duration::from_secs(10), c.read_half.read(&mut buf)).await;
     assert!(n.is_ok(), "server must end the connection after Close-Ok");
 }
 
@@ -573,11 +568,11 @@ async fn split_frames_are_reassembled() {
     let (head, tail) = bytes.split_at(bytes.len() / 2);
     c.writer.write_all(head).await.unwrap();
     c.writer.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
     c.writer.write_all(tail).await.unwrap();
     c.writer.flush().await.unwrap();
     // The handshake proceeds: Tune arrives.
-    let m = tokio::time::timeout(Duration::from_secs(15), read_tune(&mut c))
+    let m = timeout(Duration::from_secs(15), read_tune(&mut c))
         .await
         .unwrap();
     assert!(matches!(m, Method::ConnectionTune { .. }), "got {m:?}");
@@ -624,8 +619,7 @@ async fn oversized_content_header_is_rejected_with_311() {
     .unwrap();
     // Hand-built header declaring a 200 MiB body (the header frame
     // itself is tiny — only the announced size is hostile).
-    let huge =
-        switchboard_wire::properties::ContentHeader::new(200 * 1024 * 1024, BasicProperties::new());
+    let huge = PropertiesContentHeader::new(200 * 1024 * 1024, BasicProperties::new());
     c.writer
         .write_all(&Frame::header(1, &huge).to_bytes())
         .await

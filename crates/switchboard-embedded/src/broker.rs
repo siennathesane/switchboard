@@ -2,6 +2,13 @@
 //! admin (embedded design §5, §6).
 
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::io::Result as IoResult;
+use std::net::IpAddr;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -13,12 +20,29 @@ use std::time::Instant;
 
 use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::BrokerReply;
+use switchboard_cluster::ClusterError;
 use switchboard_cluster::ClusterNode;
 use switchboard_cluster::META_GROUP;
 use switchboard_cluster::NodeConfig;
+use switchboard_core::auth::hash_password;
 use switchboard_core::topology::MetaCmd;
+use switchboard_core::topology::Permissions;
+use switchboard_server::ConnectionLimits;
+use switchboard_server::listener::run;
+use switchboard_server::session::serve_rw;
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
+use switchboard_wire::constants::DEFAULT_VHOST;
+use tokio::io::duplex;
+use tokio::io::split;
+use tokio::spawn;
 use tokio::sync::mpsc;
+use tokio::sync::watch::Sender;
+use tokio::sync::watch::channel;
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 use crate::config::BrokerConfig;
 use crate::config::EmbeddedLimits;
@@ -39,8 +63,8 @@ use crate::types::ReturnedMessage;
 /// step 2, §5.2 step 1): the close trigger and the server task whose
 /// completion proves the session (including its teardown) is gone.
 pub(crate) struct TrackedConn {
-    pub(crate) close: tokio::sync::watch::Sender<bool>,
-    pub(crate) join: JoinHandle<std::io::Result<()>>,
+    pub(crate) close: Sender<bool>,
+    pub(crate) join: JoinHandle<IoResult<()>>,
 }
 
 /// One in-process broker.
@@ -53,10 +77,10 @@ pub(crate) struct TrackedConn {
 /// [`StartError::Storage`] (embedded design §5.3).
 pub struct Broker {
     node: Arc<ClusterNode>,
-    data_dir: std::path::PathBuf,
+    data_dir: PathBuf,
     registry: Arc<Mutex<HashMap<u64, TrackedConn>>>,
     next_conn_key: AtomicU64,
-    listener: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
+    listener: Mutex<Option<JoinHandle<IoResult<()>>>>,
     limits: EmbeddedLimits,
     stopped: AtomicBool,
 }
@@ -134,18 +158,16 @@ impl Broker {
             // the embedded path configures credentials through
             // `BrokerConfig::bootstrap_credentials` (ensure-user-if-absent,
             // post-readiness), which layers on top without clobbering.
-            bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-            bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+            bootstrap_user: DEFAULT_USER.into(),
+            bootstrap_password: DEFAULT_PASSWORD.into(),
             // In-process embedded brokers have no external internal-port
             // exposure; the shared-secret gate stays off.
             internal_auth_secret: None,
             timeouts: config.timeouts,
         };
         let node = ClusterNode::start(cfg).await.map_err(|e| match e {
-            switchboard_cluster::ClusterError::Io(io) => StartError::Io(io),
-            switchboard_cluster::ClusterError::Storage(store) => {
-                StartError::Storage(store.to_string())
-            }
+            ClusterError::Io(io) => StartError::Io(io),
+            ClusterError::Storage(store) => StartError::Storage(store.to_string()),
             other => StartError::Formation(other.to_string()),
         })?;
 
@@ -170,14 +192,14 @@ impl Broker {
                     .write(
                         META_GROUP,
                         BrokerCommand::Bootstrap {
-                            vhost: switchboard_wire::constants::DEFAULT_VHOST.into(),
+                            vhost: DEFAULT_VHOST.into(),
                             user: user.clone(),
                             // Hash at propose, outside raft (code-scanning
                             // alert #15): the replicated log carries the
                             // PHC string, never the plaintext password.
                             // Keyed by user (alert #22): the memoized
                             // hash is this user's credential only.
-                            password_hash: switchboard_core::auth::hash_password(user, password),
+                            password_hash: hash_password(user, password),
                         },
                     )
                     .await;
@@ -205,16 +227,9 @@ impl Broker {
                 let node2 = node.clone();
                 let limits = default_tcp_limits();
                 let run = async move {
-                    switchboard_server::listener::run(
-                        node2,
-                        &addr.to_string(),
-                        limits,
-                        None,
-                        Default::default(),
-                    )
-                    .await
+                    run(node2, &addr.to_string(), limits, None, Default::default()).await
                 };
-                let handle = tokio::spawn(run);
+                let handle = spawn(run);
                 // Surface an immediate bind failure as StartError::Io.
                 if handle.is_finished() {
                     match handle.await {
@@ -269,27 +284,22 @@ impl Broker {
         // The in-memory duplex IS the transport: the server side runs the
         // unmodified generic `serve_rw` (session/mod.rs:62-71) that a TCP
         // socket would feed (§4.2).
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (server_read, server_write) = tokio::io::split(server_io);
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (server_read, server_write) = split(server_io);
         let node = self.node.clone();
-        let limits = switchboard_server::ConnectionLimits {
+        let limits = ConnectionLimits {
             channel_max: self.limits.channel_max,
             frame_max: self.limits.frame_max,
             heartbeat: self.limits.heartbeat,
             // Server default cap (ConnectionLimits::default); embedded
             // configs carry no separate message-size knob.
             max_message_size: 128 * 1024 * 1024,
-            peer_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            peer_ip: Some(IpAddr::from([127, 0, 0, 1])),
             allow_remote_guest: false,
         };
-        let serve_task = tokio::spawn(switchboard_server::session::serve_rw(
-            server_read,
-            server_write,
-            node,
-            limits,
-        ));
+        let serve_task = spawn(serve_rw(server_read, server_write, node, limits));
 
-        let (client_read, client_write) = tokio::io::split(client_io);
+        let (client_read, client_write) = split(client_io);
         let (agreed, client_read, client_write) = handshake(
             client_read,
             client_write,
@@ -306,9 +316,9 @@ impl Broker {
         // Writer task owns the client write half; the driver owns the
         // read half and demultiplexes inbound frames (§4.3).
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<WriteMsg>();
-        tokio::spawn(writer_task(client_write, writer_rx, agreed.heartbeat));
+        spawn(writer_task(client_write, writer_rx, agreed.heartbeat));
         let (returns_tx, returns_rx) = mpsc::unbounded_channel::<ReturnedMessage>();
-        let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+        let (close_tx, close_rx) = channel(false);
         let conn = Arc::new(ConnShared {
             writer: writer_tx,
             valid: AtomicBool::new(true),
@@ -325,7 +335,7 @@ impl Broker {
             frame_max: agreed.frame_max,
             pending: Mutex::new(HashMap::new()),
         });
-        tokio::spawn(driver_task(client_read, conn.clone(), close_rx));
+        spawn(driver_task(client_read, conn.clone(), close_rx));
 
         // Register with the broker: `stop` closes the connection through
         // the watch trigger and joins the SERVER task, whose completion
@@ -369,7 +379,7 @@ impl Broker {
                      (formation may still be pending — e.g. unreachable join seeds)"
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            sleep(Duration::from_millis(25)).await;
         }
         Ok(())
     }
@@ -399,18 +409,17 @@ impl Broker {
         for e in &entries {
             let _ = e.close.send(true);
         }
-        let deadline = tokio::time::Instant::now() + grace;
+        let deadline = TokioInstant::now() + grace;
         for e in entries {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
             if remaining.is_zero() {
                 break;
             }
-            let _ = tokio::time::timeout(remaining, e.join).await;
+            let _ = timeout(remaining, e.join).await;
         }
         // 2. Bounded leave.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let leave =
-            tokio::time::timeout(remaining.max(Duration::from_millis(1)), self.node.leave()).await;
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        let leave = timeout(remaining.max(Duration::from_millis(1)), self.node.leave()).await;
         // 3. Explicit shutdown fallback (load-bearing: `shutdown()` is the
         // LAST statement of `leave`; a dropped leave future never runs it).
         match leave {
@@ -440,7 +449,7 @@ impl Broker {
     /// The configured data directory (RocksDB location). Restarting means
     /// starting a NEW process whose `Broker::start` uses this same
     /// directory (§5.3).
-    pub fn data_dir(&self) -> &std::path::Path {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
@@ -484,7 +493,7 @@ impl Broker {
     pub async fn create_user(&self, user: &str, password: &str) -> Result<(), AdminError> {
         self.admin_write(BrokerCommand::Meta(MetaCmd::CreateUser {
             name: user.to_string(),
-            password_hash: switchboard_core::auth::hash_password(user, password),
+            password_hash: hash_password(user, password),
         }))
         .await
     }
@@ -509,7 +518,7 @@ impl Broker {
         &self,
         user: &str,
         vhost: &str,
-        p: switchboard_core::topology::Permissions,
+        p: Permissions,
     ) -> Result<(), AdminError> {
         self.admin_write(BrokerCommand::Meta(MetaCmd::SetPermissions {
             user: user.to_string(),
@@ -520,12 +529,12 @@ impl Broker {
     }
 }
 
-fn default_tcp_limits() -> switchboard_server::ConnectionLimits {
-    switchboard_server::ConnectionLimits::default()
+fn default_tcp_limits() -> ConnectionLimits {
+    ConnectionLimits::default()
 }
 
-impl std::fmt::Debug for Broker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Broker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Broker")
             .field("data_dir", &self.data_dir)
             .field("stopped", &self.stopped.load(Ordering::Relaxed))
@@ -546,7 +555,7 @@ async fn wait_until_ready(node: &Arc<ClusterNode>, budget: Duration) -> Result<(
                 "broker did not become ready within {budget:?}"
             )));
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
 }
 

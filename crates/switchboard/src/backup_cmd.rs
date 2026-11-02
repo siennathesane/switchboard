@@ -15,8 +15,12 @@
 //!   payload digest, and materializes the store into a fresh data
 //!   directory. It never overwrites a non-empty directory.
 
+use anyhow::Result;
+use anyhow::anyhow;
 use clap::Args;
 use std::path::PathBuf;
+use switchboard_store::backup_store;
+use switchboard_store::restore_store;
 
 /// Arguments for `switchboard backup`.
 #[derive(Debug, Args)]
@@ -56,9 +60,9 @@ pub enum Command {
 }
 
 /// Run `switchboard backup`.
-pub fn backup(args: &BackupArgs) -> anyhow::Result<()> {
-    let header = switchboard_store::backup_store(&args.data, &args.to)
-        .map_err(|e| anyhow::anyhow!("backup of {} failed: {e}", args.data.display()))?;
+pub fn backup(args: &BackupArgs) -> Result<()> {
+    let header = backup_store(&args.data, &args.to)
+        .map_err(|e| anyhow!("backup of {} failed: {e}", args.data.display()))?;
     println!(
         "backed up {} store files ({} bytes) from {} to {}",
         header.files.len(),
@@ -78,9 +82,9 @@ pub fn backup(args: &BackupArgs) -> anyhow::Result<()> {
 }
 
 /// Run `switchboard restore`.
-pub fn restore(args: &RestoreArgs) -> anyhow::Result<()> {
-    let header = switchboard_store::restore_store(&args.from, &args.data)
-        .map_err(|e| anyhow::anyhow!("restore of {} failed: {e}", args.from.display()))?;
+pub fn restore(args: &RestoreArgs) -> Result<()> {
+    let header = restore_store(&args.from, &args.data)
+        .map_err(|e| anyhow!("restore of {} failed: {e}", args.from.display()))?;
     println!(
         "restored {} store files from {} into {}",
         header.files.len(),

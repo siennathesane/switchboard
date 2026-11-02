@@ -11,9 +11,10 @@ pub mod stomp;
 use std::sync::Arc;
 
 use crate::soak::Ctx;
+use tokio::task::JoinHandle;
 
 /// Spawn every protocol workload its rate enables (health always runs).
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     v.extend(health::spawn_all(ctx));
     v.extend(mqtt::spawn_all(ctx));

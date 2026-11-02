@@ -180,7 +180,10 @@ pub use status::SB_ERR_STORAGE;
 pub use status::SB_ERR_TIMEOUT;
 
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::ffi::c_char;
+use std::ptr::null_mut;
+use std::ptr::slice_from_raw_parts_mut;
 
 /// The library version (the workspace version, e.g. `"1.0.0-rc.1"`), as a
 /// static NUL-terminated string that never needs freeing.
@@ -223,30 +226,29 @@ pub extern "C" fn sb_message_free(message: *mut SbMessage) -> SbStatus {
         // every field is either NULL or memory this library allocated.
         unsafe {
             if !(*message).exchange.is_null() {
-                drop(std::ffi::CString::from_raw((*message).exchange));
+                drop(CString::from_raw((*message).exchange));
             }
             if !(*message).routing_key.is_null() {
-                drop(std::ffi::CString::from_raw((*message).routing_key));
+                drop(CString::from_raw((*message).routing_key));
             }
             if !(*message).consumer_tag.is_null() {
-                drop(std::ffi::CString::from_raw((*message).consumer_tag));
+                drop(CString::from_raw((*message).consumer_tag));
             }
             if !(*message).content_type.is_null() {
-                drop(std::ffi::CString::from_raw((*message).content_type));
+                drop(CString::from_raw((*message).content_type));
             }
             if !(*message).body.is_null() {
-                let slice_ptr =
-                    std::ptr::slice_from_raw_parts_mut((*message).body, (*message).body_len);
+                let slice_ptr = slice_from_raw_parts_mut((*message).body, (*message).body_len);
                 drop(Box::from_raw(slice_ptr));
             }
             *message = SbMessage {
                 delivery_tag: 0,
                 redelivered: 0,
-                exchange: std::ptr::null_mut(),
-                routing_key: std::ptr::null_mut(),
-                consumer_tag: std::ptr::null_mut(),
-                content_type: std::ptr::null_mut(),
-                body: std::ptr::null_mut(),
+                exchange: null_mut(),
+                routing_key: null_mut(),
+                consumer_tag: null_mut(),
+                content_type: null_mut(),
+                body: null_mut(),
                 body_len: 0,
             };
         }

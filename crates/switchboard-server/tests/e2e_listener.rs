@@ -18,11 +18,11 @@ async fn listener_run_serves_amqp_clients() {
     // The production listener: full gateway on its own port (the node's
     // configured client port is already bound by the test harness).
     let gateway = format!("127.0.0.1:{}", free_port());
-    let listener = tokio::spawn({
+    let listener = spawn({
         let node = node.clone();
         let gateway = gateway.clone();
         async move {
-            switchboard_server::listener::run(
+            run(
                 node,
                 &gateway,
                 Default::default(),
@@ -34,7 +34,7 @@ async fn listener_run_serves_amqp_clients() {
     });
 
     // Wait for the bind.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
 
     // AMQP client through the listener.
     let mut c = support::connect_and_open(&gateway, "/").await.unwrap();
@@ -59,7 +59,7 @@ async fn listener_run_serves_amqp_clients() {
     ));
 
     // HTTP health through the same listener.
-    let mut sock = tokio::net::TcpStream::connect(&gateway).await.unwrap();
+    let mut sock = TcpStream::connect(&gateway).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -72,8 +72,19 @@ async fn listener_run_serves_amqp_clients() {
     listener.abort();
 }
 
+use std::net::IpAddr;
+use std::net::UdpSocket;
 use std::sync::Arc;
+use std::time::Duration;
+use switchboard_server::listener::run;
+use switchboard_server::tls::acceptor;
+use switchboard_wire::FrameReader;
+use switchboard_wire::PROTOCOL_HEADER;
 use switchboard_wire::method::Method;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::spawn;
+use tokio::time::sleep;
 
 /// Grab a free TCP port (mirrors support's helper to avoid a pub-crate
 /// dependency on test-only items).
@@ -85,9 +96,9 @@ fn _keep_import_used() {
 /// Discover a non-loopback local IP without sending any packets: a UDP
 /// `connect` only installs a default destination, and `local_addr` then
 /// reports the source IP the kernel would pick for it.
-fn non_loopback_ip() -> Option<std::net::IpAddr> {
+fn non_loopback_ip() -> Option<IpAddr> {
     for target in ["8.8.8.8:80", "1.1.1.1:53", "[2001:4860:4860::8888]:53"] {
-        let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
             continue;
         };
         if sock.connect(target).is_ok() {
@@ -125,11 +136,11 @@ async fn listener_run_stamps_peer_ip_for_guest_loopback_rule() {
     // loopback and via the host's non-loopback address.
     let port = free_port();
     let gateway = format!("0.0.0.0:{port}");
-    let listener = tokio::spawn({
+    let listener = spawn({
         let node = node.clone();
         let gateway = gateway.clone();
         async move {
-            switchboard_server::listener::run(
+            run(
                 node,
                 &gateway,
                 Default::default(),
@@ -139,7 +150,7 @@ async fn listener_run_stamps_peer_ip_for_guest_loopback_rule() {
             .await
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
 
     // Loopback half: `guest`/`guest` through the real listener succeeds.
     let loopback = format!("127.0.0.1:{port}");
@@ -215,11 +226,11 @@ async fn listener_run_serves_amqp_over_tls() {
     )
     .await;
 
-    let gateway_task = tokio::spawn({
+    let gateway_task = spawn({
         let node = node.clone();
         let gateway = gateway.clone();
         async move {
-            switchboard_server::listener::run(
+            run(
                 node,
                 &gateway,
                 Default::default(),
@@ -229,10 +240,10 @@ async fn listener_run_serves_amqp_over_tls() {
             .await
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
 
     // TLS client that trusts the listener's cert.
-    let tls = switchboard_server::tls::acceptor(&TlsIdentity {
+    let tls = acceptor(&TlsIdentity {
         cert_pem: key.cert.pem().into_bytes(),
         key_pem: key.key_pair.serialize_pem().into_bytes(),
     })
@@ -254,7 +265,7 @@ async fn listener_run_serves_amqp_over_tls() {
     .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-    let tcp = tokio::net::TcpStream::connect(&gateway).await.unwrap();
+    let tcp = TcpStream::connect(&gateway).await.unwrap();
     let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
     let mut tls_stream = connector
         .connect(server_name, tcp)
@@ -263,18 +274,13 @@ async fn listener_run_serves_amqp_over_tls() {
 
     // AMQP handshake over TLS: protocol header + read Connection.Start.
     use tokio::io::AsyncWriteExt;
-    tls_stream
-        .write_all(&switchboard_wire::PROTOCOL_HEADER)
-        .await
-        .unwrap();
+    tls_stream.write_all(&PROTOCOL_HEADER).await.unwrap();
     tls_stream.flush().await.unwrap();
     let mut buf = [0u8; 512];
-    let n = tokio::io::AsyncReadExt::read(&mut tls_stream, &mut buf)
-        .await
-        .unwrap();
+    let n = AsyncReadExt::read(&mut tls_stream, &mut buf).await.unwrap();
     assert!(n >= 11, "expected Connection.Start over TLS");
     // Decode: frame type 1 (method), channel 0 → Connection.Start.
-    let mut fr = switchboard_wire::FrameReader::new();
+    let mut fr = FrameReader::new();
     fr.feed(&buf[..n]);
     let frame = fr.next_frame(0).unwrap().expect("frame");
     let m = frame.decode_method().unwrap();

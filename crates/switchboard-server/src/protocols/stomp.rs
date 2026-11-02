@@ -15,8 +15,13 @@
 //! * ERROR frames report failures; the session survives protocol-recoverable
 //!   errors and closes on fatal ones (bad frame, auth).
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
@@ -24,11 +29,28 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
+use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::now_ms;
 use switchboard_core::error::BrokerError;
 use switchboard_core::model::StoredMessage;
+use switchboard_core::model::generate_queue_name;
+use switchboard_core::shard::ShardCmd;
+use switchboard_core::shard::TxId;
+use switchboard_core::shard::TxOp;
+use switchboard_core::shard::shard_key;
+use switchboard_core::topology::GroupId;
 use switchboard_wire::properties::BasicProperties;
+use tokio::io::BufReader;
+use tokio::io::split;
+use tokio::spawn;
+use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
+use tokio::time::interval;
+use tracing::info;
 
+use crate::channel::ConnectionLimits;
+use crate::protocols::PREAUTH_MAX_FRAME_BYTES;
 use crate::protocols::shared;
 use crate::protocols::shared::BridgeConsumer;
 use crate::protocols::shared::BridgeContext;
@@ -109,7 +131,7 @@ fn unescape(s: &str) -> String {
 }
 
 /// Read one frame; `Ok(None)` on EOF between frames.
-async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Option<Frame>> {
+async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> IoResult<Option<Frame>> {
     use tokio::io::AsyncBufReadExt;
     let mut command = String::new();
     let n = r.read_line(&mut command).await?;
@@ -149,12 +171,12 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
     // letting a bogus content-length (e.g. 999999999999) OOM the node
     // (code-scanning alert #10).
     if let Some(len) = content_length {
-        if len > super::PREAUTH_MAX_FRAME_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+        if len > PREAUTH_MAX_FRAME_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
                 format!(
                     "stomp: content-length {len} exceeds the pre-auth frame cap {}",
-                    super::PREAUTH_MAX_FRAME_BYTES
+                    PREAUTH_MAX_FRAME_BYTES
                 ),
             ));
         }
@@ -179,9 +201,9 @@ async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Optio
                 if b[0] == 0 {
                     break;
                 }
-                if body.len() >= super::PREAUTH_MAX_FRAME_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                if body.len() >= PREAUTH_MAX_FRAME_BYTES {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
                         "stomp: frame body without content-length exceeds the pre-auth frame cap",
                     ));
                 }
@@ -263,26 +285,22 @@ struct StompSub {
     bridge_private: bool,
 }
 
-type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
+type SharedWriter<W> = Arc<Mutex<W>>;
 
-async fn write_frame<W: AsyncWrite + Unpin>(w: &SharedWriter<W>, f: &Frame) -> std::io::Result<()> {
+async fn write_frame<W: AsyncWrite + Unpin>(w: &SharedWriter<W>, f: &Frame) -> IoResult<()> {
     let mut guard = w.lock().await;
     guard.write_all(&f.encode()).await?;
     guard.flush().await
 }
 
 /// Serve one STOMP connection to completion.
-pub async fn serve<S>(
-    io: S,
-    node: Arc<ClusterNode>,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+pub async fn serve<S>(io: S, node: Arc<ClusterNode>, limits: ConnectionLimits) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (reader, writer) = tokio::io::split(io);
-    let mut reader = tokio::io::BufReader::new(reader);
-    let writer: SharedWriter<_> = Arc::new(tokio::sync::Mutex::new(writer));
+    let (reader, writer) = split(io);
+    let mut reader = BufReader::new(reader);
+    let writer: SharedWriter<_> = Arc::new(Mutex::new(writer));
 
     // ---- CONNECT / STOMP ----
     let Some(hello) = read_frame(&mut reader).await? else {
@@ -299,7 +317,7 @@ where
     }
     let user = hello.header("login").unwrap_or("guest").to_string();
     let pass = hello.header("passcode").unwrap_or("guest").to_string();
-    tracing::info!("stomp: authorizing");
+    info!("stomp: authorizing");
     if let Err(e) = shared::authorize(
         &node,
         &user,
@@ -309,7 +327,7 @@ where
     )
     .await
     {
-        tracing::info!("stomp: auth failed");
+        info!("stomp: auth failed");
         let err = Frame {
             command: "ERROR".into(),
             headers: vec![("message".into(), format!("auth failed: {e}"))],
@@ -318,7 +336,7 @@ where
         write_frame(&writer, &err).await?;
         return Ok(());
     }
-    tracing::info!("stomp: authorized");
+    info!("stomp: authorized");
     // Heart-beat negotiation: cx,cy — we can send heartbeats at 10 s and
     // tolerate silence (no read-timeout enforcement in the bridge).
     let heart_beat = hello
@@ -334,7 +352,7 @@ where
             }
         })
         .unwrap_or_else(|| "0,0".into());
-    tracing::info!("stomp: writing CONNECTED");
+    info!("stomp: writing CONNECTED");
     write_frame(
         &writer,
         &Frame {
@@ -364,9 +382,9 @@ where
             .unwrap_or(0);
         if sx > 0 {
             let writer = writer.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_millis(sx));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            spawn(async move {
+                let mut tick = interval(Duration::from_millis(sx));
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
                     let mut w = writer.lock().await;
@@ -378,11 +396,10 @@ where
             });
         }
     }
-    let subscriptions: Arc<tokio::sync::Mutex<HashMap<String, StompSub>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let subscriptions: Arc<Mutex<HashMap<String, StompSub>>> = Arc::new(Mutex::new(HashMap::new()));
     // ack-id → (consumer, seq) for client/client-individual acks.
-    let pending_acks: Arc<tokio::sync::Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_acks: Arc<Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // transaction name → buffered sends.
     let mut transactions: HashMap<String, Vec<(Destination, StoredMessage)>> = HashMap::new();
 
@@ -612,13 +629,13 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
     sub_id: &str,
     ack: &str,
     writer: &SharedWriter<W>,
-    pending_acks: &Arc<tokio::sync::Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>>,
+    pending_acks: &Arc<Mutex<HashMap<String, (Arc<BridgeConsumer>, u64)>>>,
 ) -> Result<Arc<BridgeConsumer>, BrokerError> {
     let no_ack = ack == "auto";
     let (queue, shard, exchange, rk) = match dest {
         Destination::Topic { exchange, rk } => {
             shared::ensure_exchange(ctx, exchange).await?;
-            let queue = switchboard_core::model::generate_queue_name();
+            let queue = generate_queue_name();
             let shard = shared::declare_queue(ctx, &queue, false, false, true).await?;
             shared::bind(ctx, exchange, &queue, rk).await?;
             (queue, shard, exchange.clone(), rk.clone())
@@ -647,7 +664,7 @@ async fn start_subscription<W: AsyncWrite + Unpin + Send + 'static>(
     // raw NUL would truncate the STOMP frame.
     let msg_queue = queue.clone();
     let task_consumer = consumer.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         let consumer = task_consumer;
         loop {
             let Some(d) = rx.recv().await else { break };
@@ -701,11 +718,8 @@ async fn commit_transaction(
     if batch.is_empty() {
         return Ok(());
     }
-    let tx_id: switchboard_core::shard::TxId = (ctx.node.id, ctx.conn.conn);
-    let mut per_shard: std::collections::BTreeMap<
-        switchboard_core::topology::GroupId,
-        Vec<switchboard_core::shard::TxOp>,
-    > = std::collections::BTreeMap::new();
+    let tx_id: TxId = (ctx.node.id, ctx.conn.conn);
+    let mut per_shard: BTreeMap<GroupId, Vec<TxOp>> = BTreeMap::new();
     for (dest, mut message) in batch {
         match &dest {
             Destination::Topic { exchange, rk } => {
@@ -713,13 +727,11 @@ async fn commit_transaction(
                 for (queue, shard) in destinations {
                     message.exchange = exchange.clone();
                     message.routing_key = rk.clone();
-                    per_shard.entry(shard).or_default().push(
-                        switchboard_core::shard::TxOp::Enqueue {
-                            // Vhost-qualified shard-data key (alert #14).
-                            queue: switchboard_core::shard::shard_key(&ctx.vhost, &queue),
-                            message: message.clone(),
-                        },
-                    );
+                    per_shard.entry(shard).or_default().push(TxOp::Enqueue {
+                        // Vhost-qualified shard-data key (alert #14).
+                        queue: shard_key(&ctx.vhost, &queue),
+                        message: message.clone(),
+                    });
                 }
             }
             Destination::Queue(q) => {
@@ -743,14 +755,11 @@ async fn commit_transaction(
                     })?;
                 message.exchange = String::new();
                 message.routing_key = q.clone();
-                per_shard
-                    .entry(shard)
-                    .or_default()
-                    .push(switchboard_core::shard::TxOp::Enqueue {
-                        // Vhost-qualified shard-data key (alert #14).
-                        queue: switchboard_core::shard::shard_key(&ctx.vhost, q),
-                        message: message.clone(),
-                    });
+                per_shard.entry(shard).or_default().push(TxOp::Enqueue {
+                    // Vhost-qualified shard-data key (alert #14).
+                    queue: shard_key(&ctx.vhost, q),
+                    message: message.clone(),
+                });
             }
         }
     }
@@ -763,16 +772,14 @@ async fn commit_transaction(
         ctx.node
             .write(
                 *shard,
-                switchboard_cluster::BrokerCommand::Shard(
-                    switchboard_core::shard::ShardCmd::PrepareTx {
-                        tx: tx_id,
-                        // Wall-clock prepare stamp: the janitor grants
-                        // TX_GRACE_MS from here, so a sweep between
-                        // prepare and commit cannot drop the commit.
-                        at_ms: switchboard_cluster::now_ms(),
-                        ops: ops.clone(),
-                    },
-                ),
+                BrokerCommand::Shard(ShardCmd::PrepareTx {
+                    tx: tx_id,
+                    // Wall-clock prepare stamp: the janitor grants
+                    // TX_GRACE_MS from here, so a sweep between
+                    // prepare and commit cannot drop the commit.
+                    at_ms: now_ms(),
+                    ops: ops.clone(),
+                }),
             )
             .await
             .map_err(|e| BrokerError::resource_error(e.to_string()).channel_level())?;
@@ -782,9 +789,7 @@ async fn commit_transaction(
         ctx.node
             .write(
                 *shard,
-                switchboard_cluster::BrokerCommand::Shard(
-                    switchboard_core::shard::ShardCmd::CommitTx { tx: tx_id },
-                ),
+                BrokerCommand::Shard(ShardCmd::CommitTx { tx: tx_id }),
             )
             .await
             .map_err(|e| BrokerError::resource_error(e.to_string()).channel_level())?;
@@ -792,10 +797,7 @@ async fn commit_transaction(
     Ok(())
 }
 
-async fn send_error<W: AsyncWrite + Unpin>(
-    writer: &SharedWriter<W>,
-    msg: &str,
-) -> std::io::Result<()> {
+async fn send_error<W: AsyncWrite + Unpin>(writer: &SharedWriter<W>, msg: &str) -> IoResult<()> {
     write_frame(
         writer,
         &Frame {
@@ -810,6 +812,7 @@ async fn send_error<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::BufReader;
 
     #[test]
     fn escape_roundtrips_specials() {
@@ -839,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn read_frame_parses_headers_and_body() {
         let data = b"CONNECTED\nversion:1.2\n\n\0";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(f.command, "CONNECTED");
         assert!(f.body.is_empty());
@@ -848,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn read_frame_content_length_respects_nul_in_body() {
         let data = b"MESSAGE\ncontent-length:3\n\na\0b\0";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(f.command, "MESSAGE");
         assert_eq!(f.body, b"a\0b");
@@ -857,7 +860,7 @@ mod tests {
     #[tokio::test]
     async fn read_frame_heartbeats_are_empty() {
         let data = b"\n\n\0";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         // The first byte is a bare newline: empty command frame.
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert!(f.command.is_empty() || f.command == "MESSAGE");
@@ -893,11 +896,12 @@ mod tests {
 #[cfg(test)]
 mod edge_tests {
     use super::*;
+    use tokio::io::BufReader;
 
     #[tokio::test]
     async fn read_frame_by_content_length_includes_interior_nul() {
         let data = b"SEND\ndestination:/q\ncontent-length:5\n\na\0b\0c\0";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(f.command, "SEND");
         assert_eq!(f.body, b"a\0b\0c".to_vec());
@@ -914,7 +918,7 @@ mod edge_tests {
     #[tokio::test]
     async fn read_frame_heartbeats_return_empty_command() {
         let data = b"\n\n\n\0"; // first line empty → heartbeat-ish frame
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(f.command, "");
     }
@@ -922,7 +926,7 @@ mod edge_tests {
     #[tokio::test]
     async fn read_frame_returns_none_on_eof() {
         let data = b"";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         assert!(read_frame(&mut reader).await.unwrap().is_none());
     }
 
@@ -946,44 +950,47 @@ mod edge_tests {
 #[cfg(test)]
 mod preauth_cap_tests {
     use super::*;
+    use std::io::ErrorKind;
+    use std::iter::repeat;
+    use tokio::io::BufReader;
 
     #[tokio::test]
     async fn read_frame_rejects_oversized_content_length_before_allocating() {
         // A pre-auth CONNECT announcing a ~1 TiB body: must fail fast with
         // InvalidData, never reach body.resize.
         let data = b"CONNECT\ncontent-length:999999999999\n\n";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let err = read_frame(&mut reader).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("content-length"));
     }
 
     #[tokio::test]
     async fn read_frame_rejects_content_length_above_the_cap() {
-        let over = super::super::PREAUTH_MAX_FRAME_BYTES + 1;
+        let over = PREAUTH_MAX_FRAME_BYTES + 1;
         let data = format!("CONNECT\ncontent-length:{over}\n\n");
-        let mut reader = tokio::io::BufReader::new(data.as_bytes());
+        let mut reader = BufReader::new(data.as_bytes());
         let err = read_frame(&mut reader).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]
     async fn read_frame_rejects_unbounded_body_without_content_length() {
         // No content-length: the read-until-NUL loop must also stop at the
         // pre-auth cap instead of buffering a never-terminated body.
-        let cap = super::super::PREAUTH_MAX_FRAME_BYTES;
+        let cap = PREAUTH_MAX_FRAME_BYTES;
         let mut data = b"SEND\ndestination:/queue/q\n\n".to_vec();
-        data.extend(std::iter::repeat(b'x').take(cap + 1)); // no NUL anywhere
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        data.extend(repeat(b'x').take(cap + 1)); // no NUL anywhere
+        let mut reader = BufReader::new(&data[..]);
         let err = read_frame(&mut reader).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("without content-length"));
     }
 
     #[tokio::test]
     async fn read_frame_still_accepts_a_normal_content_length_frame() {
         let data = b"CONNECT\naccept-version:1.2\ncontent-length:2\n\nhi\0";
-        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut reader = BufReader::new(&data[..]);
         let f = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(f.command, "CONNECT");
         assert_eq!(f.body, b"hi");

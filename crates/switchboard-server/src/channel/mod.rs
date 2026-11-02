@@ -19,20 +19,28 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::mem::take;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Serialize;
 use switchboard_cluster::BrokerReply;
 use switchboard_core::error::BrokerError;
+use switchboard_core::error::Level;
 use switchboard_core::model::ConnectionId;
 use switchboard_core::model::StoredMessage;
 use switchboard_core::model::SubscriptionId;
 use switchboard_core::shard::ShardReply;
 use switchboard_core::topology::GroupId;
+use switchboard_core::topology::MetaReply;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::constants::reply;
+use switchboard_wire::method::CONNECTION_CLASS_ID;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
 use tokio::sync::Notify;
@@ -54,7 +62,7 @@ pub struct ConnectionLimits {
     pub max_message_size: u64,
     /// The client's IP, stamped per connection by the listener; None for
     /// transports that cannot see one. Drives the guest-loopback rule.
-    pub peer_ip: Option<std::net::IpAddr>,
+    pub peer_ip: Option<IpAddr>,
     /// Allow the well-known `guest` user from non-loopback addresses.
     pub allow_remote_guest: bool,
 }
@@ -109,7 +117,7 @@ pub struct LocalConsumer {
 /// hold release, at-least-once).
 #[derive(Debug, Default)]
 pub struct PumpGate {
-    done: std::sync::atomic::AtomicBool,
+    done: AtomicBool,
     notified: Notify,
 }
 
@@ -118,14 +126,14 @@ impl PumpGate {
     /// stores its permit when nobody is waiting, so a `wait` that starts
     /// after `finish` still returns immediately (no lost wakeup).
     pub fn finish(&self) {
-        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.done.store(true, Ordering::Release);
         self.notified.notify_one();
     }
 
     /// Return once `finish` has been called (immediately if it already
     /// has been).
     pub async fn wait(&self) {
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+        if self.done.load(Ordering::Acquire) {
             return;
         }
         self.notified.notified().await;
@@ -291,7 +299,7 @@ impl ChannelInner {
     pub fn take_content(&mut self) -> Option<(Method, BasicProperties, Vec<u8>)> {
         let method = self.pending_method.take()?;
         let header = self.pending_header.take()?;
-        let body = std::mem::take(&mut self.pending_body);
+        let body = take(&mut self.pending_body);
         let props = header.properties.clone();
         Some((method, props, body))
     }
@@ -313,7 +321,7 @@ pub struct Channel {
     pub outbound: mpsc::UnboundedSender<OutboundFrame>,
     pub inner: Arc<Mutex<ChannelInner>>,
     /// Sub-id allocation (connection-scoped monotonic).
-    pub sub_counter: Arc<std::sync::atomic::AtomicU64>,
+    pub sub_counter: Arc<AtomicU64>,
 }
 
 impl Channel {
@@ -332,7 +340,7 @@ impl Channel {
             inner: Arc::new(Mutex::new(ChannelInner::new(
                 conn, node_id, user, vhost, limits,
             ))),
-            sub_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            sub_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -355,7 +363,7 @@ impl Channel {
         }
     }
 
-    pub fn meta_reply(reply: BrokerReply) -> ChannelResult<switchboard_core::topology::MetaReply> {
+    pub fn meta_reply(reply: BrokerReply) -> ChannelResult<MetaReply> {
         match reply {
             BrokerReply::Meta(r) => Ok(r),
             BrokerReply::Error(e) => Err(e),
@@ -442,7 +450,7 @@ pub fn stored_message(
 /// Validate that a method may appear on a connection-level channel (§4.2.3:
 /// channel 0 is connection-class only).
 pub fn method_allowed_on_channel_zero(m: &Method) -> bool {
-    m.class_id() == switchboard_wire::method::CONNECTION_CLASS_ID
+    m.class_id() == CONNECTION_CLASS_ID
 }
 
 /// Is `m` one of the four content-carrying methods (§4.2.6)?
@@ -465,7 +473,7 @@ pub fn unexpected_content() -> BrokerError {
     BrokerError {
         code: reply::UNEXPECTED_FRAME,
         text: "content without a content-bearing method".into(),
-        level: switchboard_core::error::Level::Connection,
+        level: Level::Connection,
         class_id: 0,
         method_id: 0,
     }
@@ -474,6 +482,7 @@ pub fn unexpected_content() -> BrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use switchboard_core::error::Level;
 
     fn channel_for_test() -> Channel {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -597,7 +606,7 @@ mod tests {
         assert_eq!(channel_already_open(3).code, 504);
         let e = unexpected_content();
         assert_eq!(e.code, 505);
-        assert_eq!(e.level, switchboard_core::error::Level::Connection);
+        assert_eq!(e.level, Level::Connection);
     }
 
     #[test]
@@ -642,6 +651,7 @@ mod tests {
 #[cfg(test)]
 mod reply_arms {
     use super::*;
+    use switchboard_core::topology::MetaReply;
 
     #[test]
     fn shard_reply_maps_error_and_unexpected() {
@@ -656,9 +666,8 @@ mod reply_arms {
 
     #[test]
     fn meta_reply_maps_ok_and_error() {
-        let ok = Channel::meta_reply(BrokerReply::Meta(switchboard_core::topology::MetaReply::Ok))
-            .unwrap();
-        assert!(matches!(ok, switchboard_core::topology::MetaReply::Ok));
+        let ok = Channel::meta_reply(BrokerReply::Meta(MetaReply::Ok)).unwrap();
+        assert!(matches!(ok, MetaReply::Ok));
         let err = Channel::meta_reply(BrokerReply::Error(BrokerError::not_found("v"))).unwrap_err();
         assert_eq!(err.code, 404);
         let bad = Channel::meta_reply(BrokerReply::Bootstrapped).unwrap_err();

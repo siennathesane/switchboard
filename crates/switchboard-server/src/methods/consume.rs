@@ -18,12 +18,16 @@ use crate::outbound::OutboundFrame;
 use switchboard_core::topology::Perm;
 
 use crate::channel::LocalConsumer;
+use crate::channel::PumpGate;
 use crate::channel::Unacked;
 use crate::outbound::message_frames;
 use switchboard_cluster::ConsumerSink;
 use switchboard_cluster::Delivery;
 use switchboard_core::model::ConnectionId;
+use switchboard_core::shard::shard_key;
 use switchboard_core::topology::GroupId;
+use tokio::select;
+use tokio::spawn;
 
 impl Channel {
     pub(crate) async fn consume(
@@ -88,7 +92,7 @@ impl Channel {
             } else {
                 requested_tag.to_string()
             };
-            let gate = Arc::new(crate::channel::PumpGate::default());
+            let gate = Arc::new(PumpGate::default());
             inner.consumers.insert(
                 tag.clone(),
                 LocalConsumer {
@@ -120,7 +124,7 @@ impl Channel {
                     // Vhost-qualified shard-data key (alert #14): consumers
                     // attach to their own vhost's entry; deliveries carry
                     // the same key back out for ack round-trips.
-                    queue: switchboard_core::shard::shard_key(&inner_vhost(self), queue),
+                    queue: shard_key(&inner_vhost(self), queue),
                     node: node_id,
                     consumer_tag: tag.clone(),
                     no_ack,
@@ -132,7 +136,7 @@ impl Channel {
             .await?;
 
             // Initial pull window (§3.1.7): prefetch or a bounded batch.
-            let credit = crate::channel::Channel::initial_credit(prefetch);
+            let credit = Channel::initial_credit(prefetch);
             if credit > 0 {
                 shard_call(node, shard, ShardCmd::Credit { sub, count: credit }).await?;
             }
@@ -163,7 +167,7 @@ impl Channel {
         let node2 = node.clone();
         let _tag_out = tag.clone();
         let pump_tag = tag.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             delivery_pump(
                 pump_channel,
                 node2,
@@ -270,7 +274,7 @@ pub(crate) async fn delivery_pump(
     consumer: LocalConsumer,
     rx: mpsc::UnboundedReceiver<Delivery>,
     cancelled: mpsc::UnboundedReceiver<String>,
-    gate: Arc<crate::channel::PumpGate>,
+    gate: Arc<PumpGate>,
 ) {
     let sub = consumer.sub;
     pump_loop(channel.clone(), node, consumer, rx, cancelled).await;
@@ -303,7 +307,7 @@ async fn pump_loop(
         // Random arm order could otherwise exit with deliveries still
         // buffered — `recv` yields items from a closed-but-buffered
         // channel only when polled.
-        tokio::select! {
+        select! {
             biased;
             d = rx.recv() => {
                 let Some(d) = d else { break };
@@ -351,7 +355,7 @@ async fn pump_loop(
                         let node = node.clone();
                         let sub = consumer.sub;
                         let shard = consumer.shard;
-                        tokio::spawn(async move {
+                        spawn(async move {
                             let _ = shard_call(
                                 &node,
                                 shard,
@@ -385,12 +389,30 @@ mod cancel_barrier_tests {
     use super::*;
     use crate::channel::ConnectionLimits;
     use crate::channel::PumpGate;
+    use std::env::set_var;
+    use std::env::temp_dir;
+    use std::env::var;
+    use std::net::TcpListener;
+    use std::process::id;
+    use std::sync::mpsc::channel as mpsc_channel;
+    use std::thread::spawn;
+    use std::time::Duration;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    use switchboard_cluster::NodeConfig;
     use switchboard_core::model::StoredMessage;
+    use switchboard_wire::BasicProperties;
+    use switchboard_wire::constants::DEFAULT_PASSWORD;
+    use switchboard_wire::constants::DEFAULT_USER;
+    use tokio::runtime::Builder;
+    use tokio::spawn as tokio_spawn;
+    use tokio::time::sleep;
+    use tokio::time::timeout;
 
     const TAG: &str = "ct-barr";
 
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
+        TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
@@ -401,25 +423,25 @@ mod cancel_barrier_tests {
     /// group for its `UnregisterSubscription` raft write (an unknown sub
     /// round-trips fine: the shard answers `Unsubscribed{0}`).
     async fn barrier_node() -> Arc<ClusterNode> {
-        if std::env::var("SB_TIME_SCALE").is_err() {
+        if var("SB_TIME_SCALE").is_err() {
             // Same test tempo the integration support module installs.
-            unsafe { std::env::set_var("SB_TIME_SCALE", "50") };
+            unsafe { set_var("SB_TIME_SCALE", "50") };
         }
-        if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+        if var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
-                std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+                set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+                set_var("SWITCHBOARD_ARGON2_T", "1");
             }
         }
-        let dir = std::env::temp_dir().join(format!(
+        let dir = temp_dir().join(format!(
             "switchboard-cancel-barrier-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let cfg = switchboard_cluster::NodeConfig {
+        let cfg = NodeConfig {
             id: 1,
             data_dir: dir,
             client_addr: format!("127.0.0.1:{}", free_port()),
@@ -429,8 +451,8 @@ mod cancel_barrier_tests {
             expected_nodes: 1,
             peers: vec![],
             timeouts: Default::default(),
-            bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-            bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+            bootstrap_user: DEFAULT_USER.into(),
+            bootstrap_password: DEFAULT_PASSWORD.into(),
             internal_auth_secret: None,
         };
         let node = ClusterNode::start(cfg).await.unwrap();
@@ -439,12 +461,12 @@ mod cancel_barrier_tests {
             if !topo.groups.is_empty() && !topo.vhosts.is_empty() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         // A beat for the shard group's own election (same discipline as
         // tests/support): topology visibility does not mean the group's
         // raft core is ready to take the cancel's write yet.
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        sleep(Duration::from_millis(700)).await;
         assert!(
             !node.topology().groups.is_empty(),
             "bootstrap never installed the shard layout"
@@ -458,7 +480,7 @@ mod cancel_barrier_tests {
             queue: "q".into(),
             seq,
             message: StoredMessage {
-                properties: switchboard_wire::BasicProperties::new(),
+                properties: BasicProperties::new(),
                 body: body.as_bytes().to_vec(),
                 exchange: String::new(),
                 routing_key: String::new(),
@@ -489,7 +511,7 @@ mod cancel_barrier_tests {
             .expect("shard layout installed");
 
         let (otx, mut orx) = mpsc::unbounded_channel();
-        let channel = crate::channel::Channel::new(
+        let channel = Channel::new(
             1,
             ConnectionId {
                 node: node.id,
@@ -542,12 +564,12 @@ mod cancel_barrier_tests {
         dtx.send(delivery_for(sub, 2, "m2")).unwrap();
         drop(dtx);
 
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc_channel::<()>();
         let pump_channel = channel.clone();
         let pump_node = node.clone();
         let pump_gate = gate.clone();
-        let pump_thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+        let pump_thread = spawn(move || {
+            let rt = Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("pump runtime");
@@ -566,7 +588,7 @@ mod cancel_barrier_tests {
         let cancel_node = node.clone();
         let cancel_channel = channel.clone();
         let mut cancel_task =
-            tokio::spawn(async move { cancel_channel.cancel(&cancel_node, TAG).await });
+            tokio_spawn(async move { cancel_channel.cancel(&cancel_node, TAG).await });
 
         // With the barrier, cancel cannot return while the pump has not
         // drained and exited — it must still be pending here. (A broker
@@ -574,8 +596,7 @@ mod cancel_barrier_tests {
         // the branch below then reproduces the handler's immediate
         // Cancel-ok and the wire assertion catches the Deliver that
         // follows it, like amqplib's 541.)
-        let premature =
-            tokio::time::timeout(std::time::Duration::from_millis(300), &mut cancel_task).await;
+        let premature = timeout(Duration::from_millis(300), &mut cancel_task).await;
         if let Ok(joined) = premature {
             joined
                 .expect("cancel task")

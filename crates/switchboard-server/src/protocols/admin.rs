@@ -63,18 +63,28 @@
 //! GET    /api/exchanges                  → [{vhost, name, type, …}]
 //! ```
 
+use std::env::var;
+use std::io::Result as IoResult;
 use std::sync::Arc;
 
+use crate::channel::ConnectionLimits;
+use crate::protocols::gateway::Prefixed;
+use crate::protocols::shared::authorize;
 use switchboard_cluster::BrokerCommand;
 use switchboard_cluster::BrokerReply;
 use switchboard_cluster::ClusterError;
 use switchboard_cluster::ClusterNode;
 use switchboard_cluster::META_GROUP;
+use switchboard_core::auth::hash_password;
 use switchboard_core::error::BrokerError;
 use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::MetaState;
 use switchboard_core::topology::Permissions;
+use switchboard_wire::constants::DEFAULT_USER;
 use switchboard_wire::constants::reply;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 
 /// Upper bound on a request body (JSON payloads here are tiny).
 const MAX_BODY: usize = 64 * 1024;
@@ -82,13 +92,13 @@ const MAX_BODY: usize = 64 * 1024;
 /// Serve one `/api` request. `head` is the already-read request head
 /// (request line + headers); the body is read here.
 pub async fn serve<S>(
-    mut io: super::gateway::Prefixed<S>,
+    mut io: Prefixed<S>,
     head: &[u8],
     node: Arc<ClusterNode>,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+    limits: ConnectionLimits,
+) -> IoResult<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let first_line = head
         .split(|&b| b == b'\n')
@@ -197,7 +207,7 @@ where
 /// operation itself.
 async fn dispatch(
     node: &Arc<ClusterNode>,
-    limits: &crate::channel::ConnectionLimits,
+    limits: &ConnectionLimits,
     method: &str,
     segments: &[String],
     auth_header: Option<&str>,
@@ -205,7 +215,7 @@ async fn dispatch(
 ) -> Result<String, ApiError> {
     // ---- authentication (HTTP basic) ----
     let (user, pass) = parse_basic_auth(auth_header).ok_or(ApiError::Unauthorized)?;
-    super::shared::authorize(
+    authorize(
         node,
         &user,
         &pass,
@@ -277,7 +287,7 @@ async fn dispatch(
 /// to the admin API; grandfathered full-power users stop counting
 /// (code-scanning alert #19, for strict deployments).
 fn admin_strict_mode() -> bool {
-    match std::env::var("SWITCHBOARD_ADMIN_STRICT") {
+    match var("SWITCHBOARD_ADMIN_STRICT") {
         Ok(v) => !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
@@ -290,11 +300,11 @@ fn admin_strict_mode() -> bool {
 /// entry). Shared by the `/api` dispatch gate above and the
 /// `/stats` + `/metrics` access gate in [`super::http`]
 /// (code-scanning alert #21).
-pub(super) fn is_admin_user(topo: &switchboard_core::topology::MetaState, user: &str) -> bool {
+pub(super) fn is_admin_user(topo: &MetaState, user: &str) -> bool {
     let strict = admin_strict_mode();
     let flagged = topo.admins.contains(user);
     let grandfathered = !strict
-        && (user == switchboard_wire::constants::DEFAULT_USER
+        && (user == DEFAULT_USER
             || topo
                 .permissions
                 .get(user)
@@ -380,9 +390,9 @@ async fn respond<S>(
     status: &str,
     extra_header: Option<&str>,
     body: &str,
-) -> std::io::Result<()>
+) -> IoResult<()>
 where
-    S: tokio::io::AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
     let mut response = format!(
@@ -626,7 +636,7 @@ async fn put_user(node: &Arc<ClusterNode>, name: &str, body: &[u8]) -> Result<St
         node,
         MetaCmd::CreateUser {
             name: name.into(),
-            password_hash: switchboard_core::auth::hash_password(name, &password),
+            password_hash: hash_password(name, &password),
         },
     )
     .await?;

@@ -6,6 +6,7 @@
 
 mod support;
 
+use std::env::var;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,9 @@ use switchboard_bench::soak;
 use switchboard_cluster::ClusterNode;
 use switchboard_server::ProtocolConfig;
 use switchboard_server::channel::ConnectionLimits;
+use switchboard_server::listener::run;
+use tokio::spawn;
+use tokio::time::sleep;
 
 /// Start a 3-node cluster fronted by the full protocol gateway (the
 /// production listener: AMQP 0-9-1, AMQP 1.0, MQTT, STOMP, WebSocket,
@@ -60,8 +64,8 @@ async fn start_gateway_cluster() -> Vec<String> {
         };
         let node_for_listener = node.clone();
         let addr2 = addr;
-        tokio::spawn(async move {
-            if let Err(e) = switchboard_server::listener::run(
+        spawn(async move {
+            if let Err(e) = run(
                 node_for_listener,
                 addr2,
                 limits,
@@ -88,7 +92,7 @@ async fn start_gateway_cluster() -> Vec<String> {
     )
     .await;
     assert!(ok, "cluster did not form");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
     clients
 }
 
@@ -96,7 +100,7 @@ async fn start_gateway_cluster() -> Vec<String> {
 async fn soak_smoke_passes_with_zero_errors() {
     let hosts = start_gateway_cluster().await;
     // SOAK_ONLY=fanout etc. isolates one workload while debugging.
-    let only = std::env::var("SOAK_ONLY").unwrap_or_default();
+    let only = var("SOAK_ONLY").unwrap_or_default();
     let r = |name: &str, base: f64| {
         if only.is_empty() || only == name {
             base

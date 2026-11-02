@@ -17,10 +17,11 @@
 //! jumps — no deadline can fire "before" an earlier one, so tests keep
 //! their serialization guarantees.
 
+use std::env::var;
 use std::time::Duration;
 
 fn factor_milli() -> u64 {
-    let parsed = std::env::var("SB_TIME_SCALE")
+    let parsed = var("SB_TIME_SCALE")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|f| *f > 0.0)

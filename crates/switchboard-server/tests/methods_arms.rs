@@ -16,17 +16,20 @@ use support::basic_get;
 use support::connect_and_open;
 use support::publish;
 use support::start_broker;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 async fn get_eventually(c: &mut TestClient, queue: &str) -> Option<(u64, Vec<u8>)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "message never arrived on {queue}"
         );
         match basic_get(c, 1, queue, true).await.unwrap() {
             Some(got) => return Some(got),
-            None => tokio::time::sleep(Duration::from_millis(100)).await,
+            None => sleep(Duration::from_millis(100)).await,
         }
     }
 }
@@ -67,15 +70,12 @@ async fn ack_inside_a_transaction_commits_with_it() {
     .unwrap();
     // Unacked delivery (publish is asynchronous — poll for it).
     let mut tag = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while tag.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "expected a delivery"
-        );
+        assert!(Instant::now() < deadline, "expected a delivery");
         tag = basic_get(&mut c, 1, "txa", false).await.unwrap();
         if tag.is_none() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     }
     let (tag, _) = tag.unwrap();
@@ -319,7 +319,7 @@ async fn qos_prefetch_grants_a_bounded_credit_window() {
         .unwrap();
     }
     // Exactly two deliveries arrive within the window.
-    let first = tokio::time::timeout(Duration::from_secs(10), c.expect(2))
+    let first = timeout(Duration::from_secs(10), c.expect(2))
         .await
         .unwrap()
         .unwrap();
@@ -329,7 +329,7 @@ async fn qos_prefetch_grants_a_bounded_credit_window() {
     else {
         panic!("expected a delivery, got {first:?}");
     };
-    let second = tokio::time::timeout(Duration::from_secs(10), c.expect(2))
+    let second = timeout(Duration::from_secs(10), c.expect(2))
         .await
         .unwrap()
         .unwrap();
@@ -340,7 +340,7 @@ async fn qos_prefetch_grants_a_bounded_credit_window() {
         panic!("expected a second delivery");
     };
     // No third delivery while both are unacked.
-    let third = tokio::time::timeout(Duration::from_millis(700), c.expect(2)).await;
+    let third = timeout(Duration::from_millis(700), c.expect(2)).await;
     assert!(third.is_err(), "credit window must bound hand-outs");
     // Acking both releases the third.
     c.send_method(
@@ -361,7 +361,7 @@ async fn qos_prefetch_grants_a_bounded_credit_window() {
     )
     .await
     .unwrap();
-    let third = tokio::time::timeout(Duration::from_secs(10), c.expect(2))
+    let third = timeout(Duration::from_secs(10), c.expect(2))
         .await
         .unwrap()
         .unwrap();
@@ -394,7 +394,7 @@ fn protocol_list_parses_and_validates() {
 
 /// Expect a Basic.Return with the given reply code on channel 1.
 async fn expect_return(c: &mut TestClient, code: u16) {
-    let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1))
+    let m = timeout(Duration::from_secs(10), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -410,7 +410,7 @@ async fn expect_return(c: &mut TestClient, code: u16) {
     // The returned content follows.
     // The return's content was already consumed by expect(); a short
     // negative window proves nothing else follows (e.g. a channel close).
-    if tokio::time::timeout(Duration::from_millis(200), c.expect(1))
+    if timeout(Duration::from_millis(200), c.expect(1))
         .await
         .is_ok()
     {
@@ -438,7 +438,7 @@ async fn mandatory_unroutable_returns_312_no_route() {
     c.send_content(1, &BasicProperties::new(), b"lost")
         .await
         .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1))
+    let m = timeout(Duration::from_secs(10), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -455,7 +455,7 @@ async fn mandatory_unroutable_returns_312_no_route() {
     // The returned content follows the return frame.
     // The return's content was already consumed by expect(); a short
     // negative window proves nothing else follows (e.g. a channel close).
-    if tokio::time::timeout(Duration::from_millis(200), c.expect(1))
+    if timeout(Duration::from_millis(200), c.expect(1))
         .await
         .is_ok()
     {
@@ -542,7 +542,7 @@ async fn mandatory_fanout_with_no_bindings_returns_312() {
         .unwrap();
     // Unroutable fanout also returns 312 NO_ROUTE (RabbitMQ parity:
     // 312 covers every unroutable mandatory publish).
-    let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1))
+    let m = timeout(Duration::from_secs(10), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -552,7 +552,7 @@ async fn mandatory_fanout_with_no_bindings_returns_312() {
     assert_eq!(reply_code, 312);
     // The return's content was already consumed by expect(); a short
     // negative window proves nothing else follows (e.g. a channel close).
-    if tokio::time::timeout(Duration::from_millis(200), c.expect(1))
+    if timeout(Duration::from_millis(200), c.expect(1))
         .await
         .is_ok()
     {
@@ -596,16 +596,13 @@ async fn multiple_ack_settles_every_delivery_up_to_the_tag() {
     }
     // Three unacked deliveries.
     let mut tags = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while tags.len() < 3 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "expected 3 deliveries"
-        );
+        assert!(Instant::now() < deadline, "expected 3 deliveries");
         if let Some((tag, _)) = basic_get(&mut c, 1, "multi", false).await.unwrap() {
             tags.push(tag);
         } else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     }
     // A single multiple-ack through the highest tag settles all three.
@@ -618,7 +615,7 @@ async fn multiple_ack_settles_every_delivery_up_to_the_tag() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
     assert!(
         basic_get(&mut c, 1, "multi", true).await.unwrap().is_none(),
         "multiple ack must settle every tagged delivery"
@@ -694,7 +691,7 @@ async fn recover_requeues_and_refills_consumer_windows() {
     .await
     .unwrap();
     // The delivery is held unacked by the consumer.
-    let held = tokio::time::timeout(Duration::from_secs(10), c.expect(2))
+    let held = timeout(Duration::from_secs(10), c.expect(2))
         .await
         .unwrap()
         .unwrap();
@@ -710,7 +707,7 @@ async fn recover_requeues_and_refills_consumer_windows() {
     let mut saw_ok = false;
     let mut saw_redelivered = false;
     for _ in 0..2 {
-        let m = tokio::time::timeout(Duration::from_secs(10), c.expect(2))
+        let m = timeout(Duration::from_secs(10), c.expect(2))
             .await
             .unwrap()
             .unwrap();
@@ -753,7 +750,7 @@ async fn consume_missing_queue_is_not_found() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(1))
+    let m = timeout(Duration::from_secs(15), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -798,7 +795,7 @@ async fn empty_consumer_tag_gets_a_server_generated_one() {
     )
     .await
     .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(1))
+    let m = timeout(Duration::from_secs(15), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -841,7 +838,7 @@ async fn channel_flow_pauses_and_resumes_consumers() {
     c.send_method(1, &Method::ChannelFlow { active: false })
         .await
         .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(1))
+    let m = timeout(Duration::from_secs(15), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -849,7 +846,7 @@ async fn channel_flow_pauses_and_resumes_consumers() {
     c.send_method(1, &Method::ChannelFlow { active: true })
         .await
         .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(15), c.expect(1))
+    let m = timeout(Duration::from_secs(15), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -921,20 +918,20 @@ async fn deleting_the_queue_cancels_its_consumers() {
     // but must not swallow the Cancel: drain up to a few frames.
     let mut saw_delete_ok = false;
     let mut cancel_tag: Option<String> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !(saw_delete_ok && cancel_tag.is_some()) {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "timed out: delete_ok={saw_delete_ok} cancel={cancel_tag:?}"
         );
-        match tokio::time::timeout(Duration::from_secs(5), c.expect(1)).await {
+        match timeout(Duration::from_secs(5), c.expect(1)).await {
             Ok(Ok(m)) => match m {
                 Method::QueueDeleteOk { .. } => saw_delete_ok = true,
                 other => panic!("unexpected on ch1: {other:?}"),
             },
             _ => {}
         }
-        if let Ok(Ok(m)) = tokio::time::timeout(Duration::from_secs(2), c.expect(2)).await {
+        if let Ok(Ok(m)) = timeout(Duration::from_secs(2), c.expect(2)).await {
             match m {
                 Method::BasicCancel { consumer_tag, .. } => cancel_tag = Some(consumer_tag),
                 other => panic!("unexpected on ch2: {other:?}"),
@@ -1020,7 +1017,7 @@ async fn publisher_confirms_arrive_for_every_publish() {
         )
         .await
         .unwrap();
-        let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1))
+        let m = timeout(Duration::from_secs(10), c.expect(1))
             .await
             .unwrap()
             .unwrap();
@@ -1051,7 +1048,7 @@ async fn immediate_publish_without_any_route_returns_312() {
     c.send_content(1, &BasicProperties::new(), b"lost")
         .await
         .unwrap();
-    let m = tokio::time::timeout(Duration::from_secs(10), c.expect(1))
+    let m = timeout(Duration::from_secs(10), c.expect(1))
         .await
         .unwrap()
         .unwrap();
@@ -1061,7 +1058,7 @@ async fn immediate_publish_without_any_route_returns_312() {
     assert_eq!(reply_code, 312);
     // The return's content was already consumed by expect(); a short
     // negative window proves nothing else follows (e.g. a channel close).
-    if tokio::time::timeout(Duration::from_millis(200), c.expect(1))
+    if timeout(Duration::from_millis(200), c.expect(1))
         .await
         .is_ok()
     {

@@ -27,7 +27,28 @@
 //! unauthenticated from any peer: they carry no information beyond
 //! "the process is serving".
 
+use crate::channel::ConnectionLimits;
+use crate::protocols::admin::header_value;
+use crate::protocols::admin::is_admin_user;
+use crate::protocols::admin::parse_basic_auth;
+use crate::protocols::admin::serve as serve_admin;
+use crate::protocols::gateway::Prefixed;
+use crate::protocols::metrics::render;
+use crate::protocols::shared::ProtocolConfig;
+use crate::protocols::shared::authorize;
+use crate::protocols::ws::serve_with_head;
+use std::env::var;
+use std::fs::read_dir;
+#[cfg(target_os = "linux")]
+use std::fs::read_to_string;
+use std::io::Result as IoResult;
+use std::net::IpAddr;
+use std::path::Path;
+use std::process::id;
+use std::sync::Arc;
+use switchboard_cluster::ClusterNode;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 
 /// Does this request carry a WebSocket upgrade?
@@ -38,7 +59,7 @@ pub fn wants_upgrade(prefix: &[u8]) -> bool {
 }
 
 /// Read a full HTTP request head (up to `\r\n\r\n`).
-pub async fn read_head<S>(io: &mut S, pre: &[u8]) -> std::io::Result<Vec<u8>>
+pub async fn read_head<S>(io: &mut S, pre: &[u8]) -> IoResult<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
@@ -49,7 +70,7 @@ where
         if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 16 * 1024 {
             break;
         }
-        let n = tokio::io::AsyncReadExt::read(io, &mut buf).await?;
+        let n = AsyncReadExt::read(io, &mut buf).await?;
         if n == 0 {
             break;
         }
@@ -62,12 +83,12 @@ where
 /// everything else gets a tiny JSON health answer (`GET /` or `/health`
 /// → 200, otherwise 404).
 pub async fn serve<S>(
-    mut io: super::gateway::Prefixed<S>,
+    mut io: Prefixed<S>,
     _pre: &[u8],
-    node: std::sync::Arc<switchboard_cluster::ClusterNode>,
-    protocols: super::shared::ProtocolConfig,
-    limits: crate::channel::ConnectionLimits,
-) -> std::io::Result<()>
+    node: Arc<ClusterNode>,
+    protocols: ProtocolConfig,
+    limits: ConnectionLimits,
+) -> IoResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -75,7 +96,7 @@ where
     let head = read_head(&mut io, &[]).await?;
     if protocols.websocket && wants_upgrade(&head) {
         let head = head.clone();
-        return super::ws::serve_with_head(io, &head, node, protocols, limits).await;
+        return serve_with_head(io, &head, node, protocols, limits).await;
     }
     let first_line = String::from_utf8_lossy(head.split(|&b| b == b'\n').next().unwrap_or(&[]));
     let mut parts = first_line.split_whitespace();
@@ -119,15 +140,11 @@ where
     } else if path == "/metrics" && method == "GET" {
         // Prometheus text exposition (v0.0.4), hand-rolled in
         // [`super::metrics`]; behind the shared /stats access gate.
-        (
-            "200 OK",
-            "text/plain; version=0.0.4",
-            super::metrics::render(&node),
-        )
+        ("200 OK", "text/plain; version=0.0.4", render(&node))
     } else if path == "/api" || path.starts_with("/api/") {
         // Admin API (JSON, basic auth): dispatches with its own reader and
         // writer; the head has already been consumed here.
-        return super::admin::serve(io, &head, node, limits).await;
+        return serve_admin(io, &head, node, limits).await;
     } else {
         let body = if ok {
             "{\"status\":\"ok\"}".to_string()
@@ -164,7 +181,7 @@ enum StatsDenial {
 /// scrapes from ANY peer. Exists because the docker/k8s labs scrape
 /// these endpoints from other containers/pods; see the module docs.
 fn stats_unauthed_opt_out() -> bool {
-    match std::env::var("SWITCHBOARD_STATS_UNAUTHED") {
+    match var("SWITCHBOARD_STATS_UNAUTHED") {
         Ok(v) => !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
@@ -176,7 +193,7 @@ fn stats_unauthed_opt_out() -> bool {
 /// same way `shared::authorize` treats it) so localhost tooling keeps
 /// working — and any peer under the lab opt-out. A provably
 /// non-loopback peer must authenticate.
-fn unauthenticated_stats_allowed(peer_ip: Option<std::net::IpAddr>, lab_opt_out: bool) -> bool {
+fn unauthenticated_stats_allowed(peer_ip: Option<IpAddr>, lab_opt_out: bool) -> bool {
     if lab_opt_out {
         return true;
     }
@@ -189,14 +206,14 @@ fn unauthenticated_stats_allowed(peer_ip: Option<std::net::IpAddr>, lab_opt_out:
 /// belong to an admin user — from any peer. Without credentials:
 /// loopback or the lab opt-out passes, everything else is a 401.
 async fn stats_access(
-    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
-    limits: &crate::channel::ConnectionLimits,
+    node: &Arc<ClusterNode>,
+    limits: &ConnectionLimits,
     head: &[u8],
 ) -> Result<(), StatsDenial> {
-    let auth_header = super::admin::header_value(head, "authorization");
-    match super::admin::parse_basic_auth(auth_header.as_deref()) {
+    let auth_header = header_value(head, "authorization");
+    match parse_basic_auth(auth_header.as_deref()) {
         Some((user, pass)) => {
-            super::shared::authorize(
+            authorize(
                 node,
                 &user,
                 &pass,
@@ -206,7 +223,7 @@ async fn stats_access(
             .await
             .map_err(|_| StatsDenial::Unauthorized)?;
             let topo = node.topology();
-            if super::admin::is_admin_user(&topo, &user) {
+            if is_admin_user(&topo, &user) {
                 Ok(())
             } else {
                 Err(StatsDenial::Forbidden)
@@ -226,7 +243,7 @@ async fn stats_access(
 /// resident memory, open fds, data-dir size, uptime. Zeros on platforms
 /// without `/proc` (macOS dev boxes) rather than an error — monitors
 /// trend these numbers, they don't gate on absolute values.
-fn stats_json(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> String {
+fn stats_json(node: &Arc<ClusterNode>) -> String {
     let (rss_kb, fds) = proc_self_stats();
     // Joined = the node is a real cluster member (bootstrap entities
     // applied and a shard layout visible). Orchestrator readiness gates
@@ -250,7 +267,7 @@ fn stats_json(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> String
             "\"messages\":{},\"version\":\"{}\"}}"
         ),
         node.id,
-        std::process::id(),
+        id(),
         rss_kb,
         fds,
         dir_size_kb(&node.cfg.data_dir),
@@ -265,7 +282,7 @@ fn stats_json(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> String
 /// Process vitals shared by `/stats` and `/metrics`.
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_self_stats() -> (u64, u64) {
-    let rss_kb = std::fs::read_to_string("/proc/self/status")
+    let rss_kb = read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
@@ -275,7 +292,7 @@ pub(crate) fn proc_self_stats() -> (u64, u64) {
             })
         })
         .unwrap_or(0);
-    let fds = std::fs::read_dir("/proc/self/fd")
+    let fds = read_dir("/proc/self/fd")
         .map(|d| d.filter_map(|e| e.ok()).count() as u64)
         .unwrap_or(0);
     (rss_kb, fds)
@@ -287,11 +304,11 @@ pub(crate) fn proc_self_stats() -> (u64, u64) {
 }
 
 /// Recursive data-dir size in KiB; I/O errors degrade to 0.
-fn dir_size_kb(dir: &std::path::Path) -> u64 {
+fn dir_size_kb(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
+        let Ok(rd) = read_dir(&d) else {
             continue;
         };
         for entry in rd.filter_map(|e| e.ok()) {
@@ -309,6 +326,7 @@ fn dir_size_kb(dir: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     #[test]
     fn upgrade_detection() {
@@ -324,8 +342,8 @@ mod tests {
     /// (never the refusal).
     #[test]
     fn unauthenticated_stats_scrape_decision() {
-        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let remote: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: IpAddr = "192.0.2.10".parse().unwrap();
         assert!(
             unauthenticated_stats_allowed(Some(loopback), false),
             "loopback tooling scrapes without credentials"

@@ -1,7 +1,12 @@
 //! RocksDB wrapper: the only module in the workspace that imports `rocksdb`.
 
+use std::env::temp_dir;
+use std::env::var as env_var;
 use std::path::Path;
+use std::process::id;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use rocksdb::DB;
 use rocksdb::Options;
@@ -27,7 +32,7 @@ impl RocksKv {
         // exhausted small hosts running several brokers side by side.
         // Env-tunable so a dedicated large host can raise them.
         let mb = |var: &str, default: u64| {
-            std::env::var(var)
+            env_var(var)
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(default)
@@ -50,14 +55,14 @@ impl RocksKv {
     pub fn open_temp(name: &str) -> Self {
         let unique = format!(
             "{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
             name
         );
-        let dir = std::env::temp_dir().join(format!("switchboard-kv-{unique}"));
+        let dir = temp_dir().join(format!("switchboard-kv-{unique}"));
         Self::open(&dir).expect("open temp rocksdb")
     }
 

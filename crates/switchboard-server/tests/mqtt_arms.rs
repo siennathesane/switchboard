@@ -10,8 +10,12 @@ use gateway_support::mqtt_read;
 use gateway_support::mqtt_remaining;
 use gateway_support::start_gateway;
 use gateway_support::with_timeout;
+use switchboard_server::protocols::mqtt::convert_filter;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 async fn gw() -> (String, gateway_support::NodeGuard) {
     start_gateway(Default::default()).await
@@ -65,8 +69,8 @@ fn pubcomp(pid: u16) -> Vec<u8> {
 }
 
 /// CONNECT + read CONNACK; returns the socket and the CONNACK payload.
-async fn connect_ok(addr: &str, packet: Vec<u8>) -> (tokio::net::TcpStream, Vec<u8>) {
-    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+async fn connect_ok(addr: &str, packet: Vec<u8>) -> (TcpStream, Vec<u8>) {
+    let mut c = TcpStream::connect(addr).await.unwrap();
     c.write_all(&packet).await.unwrap();
     let (t, payload) = with_timeout(mqtt_read(&mut c), 30).await.unwrap().unwrap();
     assert_eq!(t, 2, "CONNACK expected, got type {t}");
@@ -76,7 +80,7 @@ async fn connect_ok(addr: &str, packet: Vec<u8>) -> (tokio::net::TcpStream, Vec<
 #[tokio::test(flavor = "multi_thread")]
 async fn mqtt_first_packet_must_be_connect() {
     let (addr, _n) = gw().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     // A PINGREQ before CONNECT: the server hangs up.
     c.write_all(&pingreq()).await.unwrap();
     let mut buf = [0u8; 32];
@@ -123,7 +127,7 @@ async fn mqtt_silent_client_with_keepalive_times_out() {
     // out and closes.
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 32];
-    let n = tokio::time::timeout(Duration::from_secs(20), c.read(&mut buf)).await;
+    let n = timeout(Duration::from_secs(20), c.read(&mut buf)).await;
     match n {
         Ok(Ok(0)) => {}
         Ok(Ok(_)) => {} // a close notification is fine
@@ -160,7 +164,7 @@ async fn mqtt_puback_settles_outbound_qos1() {
     assert_eq!(body, b"m1");
     // PUBACK settles it (the broker may redeliver otherwise).
     sub.write_all(&puback(pid)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -197,7 +201,7 @@ async fn mqtt_outbound_qos2_full_flow() {
     assert_eq!(t, 6, "PUBREL expected, got type {t}");
     assert_eq!(u16::from_be_bytes([rel[0], rel[1]]), pid);
     sub.write_all(&pubcomp(pid)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -224,7 +228,7 @@ async fn mqtt_unsubscribe_stops_delivery() {
     pubc.write_all(&gateway_support::mqtt_publish("arm/u", b"late", 0, 0))
         .await
         .unwrap();
-    let burst = tokio::time::timeout(Duration::from_millis(700), mqtt_read(&mut sub)).await;
+    let burst = timeout(Duration::from_millis(700), mqtt_read(&mut sub)).await;
     assert!(burst.is_err(), "no delivery may follow UNSUBSCRIBE");
 }
 
@@ -240,14 +244,8 @@ async fn mqtt_persistent_session_shard_is_declared_when_missing() {
 fn mqtt_filter_conversion_wrapper() {
     // '/' maps to the AMQP topic separator '.'; a leading slash yields a
     // leading empty level ("$shared" style) — mapped consistently.
-    assert_eq!(
-        switchboard_server::protocols::mqtt::convert_filter("/a/b"),
-        ".a.b"
-    );
-    assert_eq!(
-        switchboard_server::protocols::mqtt::convert_filter("a/b"),
-        "a.b"
-    );
+    assert_eq!(convert_filter("/a/b"), ".a.b");
+    assert_eq!(convert_filter("a/b"), "a.b");
 }
 
 /// Parse a broker PUBLISH (qos>0) payload: topic-len, topic, packet-id,

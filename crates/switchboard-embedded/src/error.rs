@@ -3,7 +3,9 @@
 //! are the entire error surface, and their variant sets are frozen for 1.0
 //! (embedded design §3, §9/R7).
 
+use std::error::Error;
 use std::fmt;
+use std::io::Error as IoError;
 
 /// Failure to create and start a [`crate::Broker`].
 ///
@@ -19,7 +21,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum StartError {
     /// Binding a listener failed.
-    Io(std::io::Error),
+    Io(IoError),
     /// The store at `data_dir` could not be opened — almost always the
     /// RocksDB exclusive LOCK held by another live broker. A broker that
     /// returned `Storage` (or `Formation`) leaves the store locked for the
@@ -47,7 +49,7 @@ impl fmt::Display for StartError {
     }
 }
 
-impl std::error::Error for StartError {}
+impl Error for StartError {}
 
 /// Failure of [`crate::Broker::connect`] / [`crate::EmbeddedConnection::open_channel`].
 ///
@@ -71,7 +73,7 @@ pub enum ConnectError {
     /// connection is gone.
     Closed,
     /// A transport error (the in-memory duplex, or a handshake timeout).
-    Io(std::io::Error),
+    Io(IoError),
 }
 
 impl fmt::Display for ConnectError {
@@ -85,7 +87,7 @@ impl fmt::Display for ConnectError {
     }
 }
 
-impl std::error::Error for ConnectError {}
+impl Error for ConnectError {}
 
 impl From<OpError> for ConnectError {
     fn from(e: OpError) -> Self {
@@ -123,7 +125,7 @@ pub enum OpError {
     /// Decoded from close code 406 (re-declare with different arguments).
     PreconditionFailed { text: String },
     /// A transport failure on the in-memory duplex.
-    Io(std::io::Error),
+    Io(IoError),
 }
 
 impl fmt::Display for OpError {
@@ -146,7 +148,7 @@ impl fmt::Display for OpError {
     }
 }
 
-impl std::error::Error for OpError {}
+impl Error for OpError {}
 
 /// Failure of a [`crate::Broker`] typed admin call
 /// ([`crate::Broker::declare_vhost`] / [`create_user`](crate::Broker::create_user)
@@ -178,7 +180,7 @@ impl fmt::Display for AdminError {
     }
 }
 
-impl std::error::Error for AdminError {}
+impl Error for AdminError {}
 
 /// Failure of [`crate::Broker::stop`].
 #[derive(Debug)]
@@ -201,7 +203,7 @@ impl fmt::Display for StopError {
     }
 }
 
-impl std::error::Error for StopError {}
+impl Error for StopError {}
 
 /// Decode a §4.8 channel-close pair into the operation error the caller
 /// sees. 403/404/406 fold into their named variants; everything else stays

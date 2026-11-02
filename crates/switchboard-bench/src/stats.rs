@@ -6,6 +6,9 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 /// A monotonic message counter shared between load tasks and the sampler.
 #[derive(Debug, Default)]
@@ -44,7 +47,7 @@ pub struct RateSampler {
     samples: Arc<Mutex<Vec<u64>>>,
     byte_samples: Arc<Mutex<Vec<u64>>>,
     stop: Arc<AtomicU64>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: JoinHandle<()>,
 }
 
 impl RateSampler {
@@ -58,11 +61,11 @@ impl RateSampler {
             let byte_samples = byte_samples.clone();
             let stop = stop.clone();
             let counter = counter.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 let mut last = counter.msgs();
                 let mut last_bytes = counter.bytes();
                 while stop.load(Ordering::Relaxed) == 0 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_secs(1)).await;
                     let now = counter.msgs();
                     let now_bytes = counter.bytes();
                     let rate = now.saturating_sub(last);

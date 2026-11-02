@@ -9,11 +9,13 @@
 
 use std::ffi::c_char;
 use std::ffi::c_int;
+use std::mem::zeroed;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use switchboard_embedded::Consumer;
 use tokio::runtime::Handle;
+use tokio::time::timeout;
 
 use crate::handles::as_consumer;
 use crate::map::op_status;
@@ -67,17 +69,17 @@ pub extern "C" fn sb_consumer_next(
         }
         // Zero the out-struct FIRST: on any failure below (timeout,
         // cancellation) the caller may still sb_message_free it.
-        unsafe { *out = std::mem::zeroed() };
+        unsafe { *out = zeroed() };
         unsafe { *out_has_message = 0 };
         let c = as_consumer(consumer)?;
         let mut slot = c.consumer.lock().unwrap_or_else(|p| p.into_inner());
         let Some(consumer_val) = slot.as_mut() else {
-            unsafe { *out = std::mem::zeroed() };
+            unsafe { *out = zeroed() };
             unsafe { *out_has_message = 0 };
             return Err(SB_ERR_CONSUMER_CANCELLED);
         };
         let waited = c.rt.block_on(async {
-            tokio::time::timeout(
+            timeout(
                 Duration::from_millis(timeout_ms as u64),
                 consumer_val.next(),
             )
@@ -95,13 +97,13 @@ pub extern "C" fn sb_consumer_next(
                 *slot = None;
                 drop(slot);
                 table::mark_dead(consumer as usize);
-                unsafe { *out = std::mem::zeroed() };
+                unsafe { *out = zeroed() };
                 unsafe { *out_has_message = 0 };
                 Err(SB_ERR_CONSUMER_CANCELLED)
             }
             Err(_elapsed) => {
                 // Timeout: consumer stays live and parked for the next call.
-                unsafe { *out = std::mem::zeroed() };
+                unsafe { *out = zeroed() };
                 unsafe { *out_has_message = 0 };
                 Ok(())
             }

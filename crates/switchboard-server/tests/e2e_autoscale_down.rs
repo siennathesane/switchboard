@@ -11,6 +11,7 @@ mod support;
 
 use switchboard_wire::BasicProperties;
 
+use std::time::Duration;
 use support::TestClient;
 use support::basic_get;
 use support::connect_and_open;
@@ -19,6 +20,9 @@ use support::publish;
 use support::start_cluster;
 use support::teardown_cluster;
 use support::wait_until;
+use switchboard_cluster::MAX_VOTERS;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_autoscales_down_from_9_to_3_nodes() {
@@ -65,7 +69,7 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
         // Voter-cap invariant after the reconfiguration.
         for (g, members) in &survivors[0].topology().groups {
             assert!(
-                members.len() <= switchboard_cluster::MAX_VOTERS,
+                members.len() <= MAX_VOTERS,
                 "leave {id}: group {g} has {} members",
                 members.len()
             );
@@ -80,8 +84,7 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
             || {
                 survivors.iter().all(|n| {
                     n.topology().groups.values().all(|m| {
-                        m.len() == switchboard_cluster::MAX_VOTERS
-                            && m.iter().all(|x| survivor_ids.contains(x))
+                        m.len() == MAX_VOTERS && m.iter().all(|x| survivor_ids.contains(x))
                     })
                 })
             },
@@ -90,7 +93,7 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
         .await;
         assert!(ok, "leave {id}: groups did not refill with live members");
         // A beat for the raft side (learner catch-up + voter promotion).
-        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        sleep(Duration::from_millis(1_200)).await;
 
         // The cluster keeps serving writes through distinct survivors.
         // (Publishes are fire-and-forget across connections, so poll.)
@@ -136,15 +139,15 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
     // Enqueues from three distinct connections race, so drain the queue
     // and assert on the set, not on FIFO order.
     let mut drained: Vec<Vec<u8>> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while drained.len() < 3 {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "survivor messages incomplete: {drained:?}"
         );
         match basic_get(&mut admin, 1, "dd", true).await {
             Ok(Some((_, body))) => drained.push(body),
-            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Ok(None) => sleep(Duration::from_millis(100)).await,
             Err(e) => panic!("final get failed: {e}"),
         }
     }
@@ -166,10 +169,10 @@ async fn cluster_autoscales_down_from_9_to_3_nodes() {
 /// Publishes are asynchronous across connections: a single immediate get
 /// would race the enqueue's raft write.
 async fn get_eventually(c: &mut TestClient, queue: &str, want: &[u8]) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "message {want:?} never arrived on {queue:?}"
         );
         match basic_get(c, 1, queue, true).await {
@@ -178,7 +181,7 @@ async fn get_eventually(c: &mut TestClient, queue: &str, want: &[u8]) {
                 return;
             }
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             Err(e) => panic!("get on {queue:?} failed: {e}"),
         }

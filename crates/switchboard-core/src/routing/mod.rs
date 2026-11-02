@@ -67,7 +67,7 @@ pub fn route<T: TopologyView + ?Sized>(
 fn expand_routes<T: TopologyView + ?Sized>(
     topo: &T,
     exchange: &str,
-    ex: &crate::model::Exchange,
+    ex: &Exchange,
     routing_key: &str,
     properties: &BasicProperties,
     dest: &mut Vec<String>,
@@ -369,12 +369,13 @@ mod e2e_exchange_tests {
     use super::*;
     use crate::model::Exchange;
     use crate::model::ExchangeKind;
+    use std::collections::BTreeMap;
     use switchboard_wire::field::FieldTable;
 
     struct Vw {
-        exchanges: std::collections::BTreeMap<String, Exchange>,
-        bindings: std::collections::BTreeMap<String, Vec<Binding>>,
-        queues: std::collections::BTreeMap<String, ()>,
+        exchanges: BTreeMap<String, Exchange>,
+        bindings: BTreeMap<String, Vec<Binding>>,
+        queues: BTreeMap<String, ()>,
     }
 
     impl TopologyView for Vw {

@@ -10,6 +10,11 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt::Display;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
+use std::mem::take;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -19,6 +24,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use switchboard_core::auth::LOCALES;
+use switchboard_core::tempo::scale;
 use switchboard_server::outbound::max_body_size;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::Frame;
@@ -33,11 +40,18 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio::select;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::time::Instant;
+use tokio::time::MissedTickBehavior;
+use tokio::time::interval;
+use tokio::time::timeout;
 use tracing::debug;
 
+use crate::config::EmbeddedLimits;
 use crate::error::ConnectError;
 use crate::error::OpError;
 use crate::error::decode_channel_close;
@@ -48,7 +62,7 @@ use crate::types::ReturnedMessage;
 /// Budget for one handshake and one close handshake. Generous in
 /// production; shrinks with the test tempo like every other wait.
 pub(crate) fn handshake_budget() -> Duration {
-    switchboard_core::tempo::scale(Duration::from_secs(10))
+    scale(Duration::from_secs(10))
 }
 
 /// One message for the writer task.
@@ -163,7 +177,7 @@ impl ConnShared {
             }
         }
         *self.returns_tx.lock().unwrap() = None;
-        for tx in std::mem::take(&mut *self.close_waiters.lock().unwrap()) {
+        for tx in take(&mut *self.close_waiters.lock().unwrap()) {
             let _ = tx.send(());
         }
     }
@@ -194,7 +208,7 @@ pub(crate) struct ChannelShared {
     /// Serializes the mandatory-ish publish paths (`publish_mandatory`,
     /// `publish_confirmed`, `confirm_select`) so a `basic.return` is never
     /// ambiguous between two in-flight publishes.
-    pub(crate) publish_lock: tokio::sync::Mutex<()>,
+    pub(crate) publish_lock: TokioMutex<()>,
 }
 
 impl ChannelShared {
@@ -208,7 +222,7 @@ impl ChannelShared {
             confirm_active: AtomicBool::new(false),
             confirm_next: Mutex::new(0),
             confirm_waiters: Mutex::new(BTreeMap::new()),
-            publish_lock: tokio::sync::Mutex::new(()),
+            publish_lock: TokioMutex::new(()),
         })
     }
 
@@ -244,10 +258,10 @@ impl ChannelShared {
 }
 
 fn fail_channel_waiters(ch: &Arc<ChannelShared>, make: impl Fn() -> OpError) {
-    for tx in std::mem::take(&mut *ch.waiters.lock().unwrap()) {
+    for tx in take(&mut *ch.waiters.lock().unwrap()) {
         let _ = tx.send(Err(make()));
     }
-    for (_, tx) in std::mem::take(&mut *ch.confirm_waiters.lock().unwrap()) {
+    for (_, tx) in take(&mut *ch.confirm_waiters.lock().unwrap()) {
         let _ = tx.send(Err(make()));
     }
     if let Some(waiters) = ch.conn.mandatory_returns.lock().unwrap().remove(&ch.id) {
@@ -286,8 +300,8 @@ pub(crate) struct Agreed {
     pub(crate) heartbeat: u16,
 }
 
-fn io_other(e: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::other(e.to_string())
+fn io_other(e: impl Display) -> Error {
+    Error::other(e.to_string())
 }
 
 /// The client may only lower (§2.3.3) — the same function the server uses
@@ -308,7 +322,7 @@ fn agreed(server: u32, client: u32) -> u32 {
     }
 }
 
-async fn send_method<W: AsyncWrite + Unpin>(writer: &mut W, m: &Method) -> std::io::Result<()> {
+async fn send_method<W: AsyncWrite + Unpin>(writer: &mut W, m: &Method) -> IoResult<()> {
     let bytes = Frame::method(0, m).to_bytes();
     writer.write_all(&bytes).await?;
     writer.flush().await
@@ -320,7 +334,7 @@ async fn send_method<W: AsyncWrite + Unpin>(writer: &mut W, m: &Method) -> std::
 async fn read_method_or_eof<R: AsyncRead + Unpin>(
     reader: &mut R,
     fr: &mut FrameReader,
-) -> std::io::Result<Option<Method>> {
+) -> IoResult<Option<Method>> {
     let mut first = true;
     loop {
         if let Some(f) = fr.next_frame(0).map_err(io_other)? {
@@ -357,7 +371,7 @@ pub(crate) async fn handshake<R, W>(
     user: &str,
     password: &str,
     vhost: &str,
-    limits: &crate::config::EmbeddedLimits,
+    limits: &EmbeddedLimits,
 ) -> Result<(Agreed, R, W), ConnectError>
 where
     R: AsyncRead + Unpin,
@@ -393,7 +407,7 @@ where
                 client_properties: FieldTable::new(),
                 mechanism: "PLAIN".into(),
                 response,
-                locale: switchboard_core::auth::LOCALES.into(),
+                locale: LOCALES.into(),
             },
         )
         .await
@@ -454,10 +468,10 @@ where
         };
         Ok((agreed_values, reader, writer))
     };
-    match tokio::time::timeout(handshake_budget(), fut).await {
+    match timeout(handshake_budget(), fut).await {
         Ok(r) => r,
-        Err(_elapsed) => Err(ConnectError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
+        Err(_elapsed) => Err(ConnectError::Io(Error::new(
+            ErrorKind::TimedOut,
             "handshake did not complete in time",
         ))),
     }
@@ -502,7 +516,7 @@ pub(crate) async fn driver_task<R>(
             }
         }
         // 2) Wait for a close trigger or more octets.
-        tokio::select! {
+        select! {
             biased;
             changed = close_rx.changed() => {
                 match changed {
@@ -620,7 +634,7 @@ async fn handle_method(conn: &Arc<ConnShared>, channel: u16, method: Method) -> 
         }
         Method::ConnectionCloseOk {} => {
             // Our own close handshake completed.
-            for tx in std::mem::take(&mut *conn.close_waiters.lock().unwrap()) {
+            for tx in take(&mut *conn.close_waiters.lock().unwrap()) {
                 let _ = tx.send(());
             }
             let _ = conn.writer.send(WriteMsg::Shutdown);
@@ -855,7 +869,7 @@ pub(crate) async fn close_handshake(conn: &Arc<ConnShared>) {
         // Another actor is already closing; piggyback on its waiter.
         let (tx, rx) = oneshot::channel();
         conn.close_waiters.lock().unwrap().push(tx);
-        let _ = tokio::time::timeout(handshake_budget(), rx).await;
+        let _ = timeout(handshake_budget(), rx).await;
         return;
     }
     let (tx, rx) = oneshot::channel();
@@ -872,7 +886,7 @@ pub(crate) async fn close_handshake(conn: &Arc<ConnShared>) {
     )
     .encode(&mut buf);
     let _ = conn.writer.send(WriteMsg::Frame(buf.freeze()));
-    let _ = tokio::time::timeout(handshake_budget(), rx).await;
+    let _ = timeout(handshake_budget(), rx).await;
     conn.mark_closed(reply::REPLY_SUCCESS, "connection closed");
     let _ = conn.writer.send(WriteMsg::Shutdown);
 }
@@ -889,17 +903,17 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin + Send>(
     let heartbeat = if heartbeat_secs == 0 {
         Duration::ZERO
     } else {
-        switchboard_core::tempo::scale(Duration::from_secs(heartbeat_secs as u64))
+        scale(Duration::from_secs(heartbeat_secs as u64))
     };
-    let mut last_write = tokio::time::Instant::now();
-    let mut ticker = tokio::time::interval(if heartbeat > Duration::ZERO {
+    let mut last_write = Instant::now();
+    let mut ticker = interval(if heartbeat > Duration::ZERO {
         heartbeat / 2
     } else {
         Duration::from_secs(3600)
     });
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let msg = tokio::select! {
+        let msg = select! {
             m = rx.recv() => match m {
                 Some(m) => m,
                 None => break,
@@ -921,7 +935,7 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin + Send>(
                 break;
             }
             let _ = writer.flush().await;
-            last_write = tokio::time::Instant::now();
+            last_write = Instant::now();
         }
         if shutdown {
             let _ = writer.shutdown().await;
@@ -950,7 +964,7 @@ pub(crate) fn begin_call(
     ch.conn
         .writer
         .send(WriteMsg::Frame(buf.freeze()))
-        .map_err(|_| OpError::Io(std::io::Error::other("connection is closed")))?;
+        .map_err(|_| OpError::Io(Error::other("connection is closed")))?;
     waiters.push_back(tx);
     Ok(rx)
 }
@@ -960,9 +974,7 @@ pub(crate) fn begin_call(
 pub(crate) async fn await_call(rx: oneshot::Receiver<OpReply>) -> OpReply {
     match rx.await {
         Ok(reply) => reply,
-        Err(_) => Err(OpError::Io(std::io::Error::other(
-            "connection driver is gone",
-        ))),
+        Err(_) => Err(OpError::Io(Error::other("connection driver is gone"))),
     }
 }
 
@@ -981,7 +993,7 @@ pub(crate) fn send_bytes(ch: &Arc<ChannelShared>, bytes: Bytes) -> Result<(), Op
     ch.conn
         .writer
         .send(WriteMsg::Frame(bytes))
-        .map_err(|_| OpError::Io(std::io::Error::other("connection is closed")))
+        .map_err(|_| OpError::Io(Error::other("connection is closed")))
 }
 
 /// Encode one method frame for channel `id` as an atomic writer message.

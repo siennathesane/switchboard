@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tokio::time::sleep_until;
 
 /// Emits permission to proceed once every `1 / rate` seconds.
 pub struct Pacer {
@@ -40,7 +41,7 @@ impl Pacer {
                 self.next = Some(Instant::now() + self.period);
             }
             Some(at) => {
-                tokio::time::sleep_until(at).await;
+                sleep_until(at).await;
                 let now = Instant::now();
                 // Delay behavior: a late tick reschedules from now, so a
                 // slow operation never accumulates a catch-up burst.
@@ -57,11 +58,12 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant as StdInstant;
 
     #[tokio::test]
     async fn paces_at_rate() {
         let mut p = Pacer::new(100.0); // 10ms period
-        let t0 = std::time::Instant::now();
+        let t0 = StdInstant::now();
         p.wait().await; // immediate
         p.wait().await; // +10ms
         p.wait().await; // +20ms

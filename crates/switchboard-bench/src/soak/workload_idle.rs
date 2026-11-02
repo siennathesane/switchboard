@@ -10,6 +10,10 @@ use std::time::Duration;
 
 use lapin::options::QueueDeclareOptions;
 use lapin::types::FieldTable;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::soak::Ctx;
 use crate::soak::client;
@@ -29,12 +33,12 @@ pub async fn run(ctx: Arc<Ctx>) {
             };
             let mut broken = false;
             for _ in 0..1000 {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => {
                         let _ = conn.close(200, "soak done").await;
                         return;
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    _ = sleep(Duration::from_secs(60)) => {}
                 }
                 match ch
                     .queue_declare(
@@ -78,6 +82,6 @@ pub async fn run(ctx: Arc<Ctx>) {
     }
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
-    vec![tokio::spawn(run(ctx.clone()))]
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
+    vec![spawn(run(ctx.clone()))]
 }

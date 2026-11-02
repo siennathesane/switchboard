@@ -8,10 +8,10 @@ mod support;
 /// Each test boots a full broker cluster; running them in parallel
 /// saturates CPU and skews raft timing, so they are serialized behind a
 /// shared lock.
-static GATEWAY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static GATEWAY_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Acquire the global gateway serialization lock.
-async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+async fn lock() -> MutexGuard<'static, ()> {
     GATEWAY_LOCK.lock().await
 }
 
@@ -24,11 +24,47 @@ use gateway_support::read_stomp_frame_full;
 use gateway_support::start_gateway;
 use gateway_support::with_timeout;
 use gateway_support::ws_connect;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::time::Duration;
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::META_GROUP;
+use switchboard_core::auth::hash_password;
+use switchboard_server::ProtocolConfig;
+use switchboard_server::protocols::amqp10::frames::Frame;
+use switchboard_server::protocols::amqp10::frames::begin;
+use switchboard_server::protocols::amqp10::frames::close;
+use switchboard_server::protocols::amqp10::frames::codes::ATTACH;
+use switchboard_server::protocols::amqp10::frames::codes::DETACH;
+use switchboard_server::protocols::amqp10::frames::codes::DISPOSITION;
+use switchboard_server::protocols::amqp10::frames::codes::END;
+use switchboard_server::protocols::amqp10::frames::codes::FLOW;
+use switchboard_server::protocols::amqp10::frames::codes::SASL_INIT;
+use switchboard_server::protocols::amqp10::frames::codes::SASL_OUTCOME;
+use switchboard_server::protocols::amqp10::frames::codes::SECTION_DATA;
+use switchboard_server::protocols::amqp10::frames::codes::TRANSFER;
+use switchboard_server::protocols::amqp10::frames::decode_frame;
+use switchboard_server::protocols::amqp10::frames::detach;
+use switchboard_server::protocols::amqp10::frames::encode_frame;
+use switchboard_server::protocols::amqp10::frames::encode_frame_with_payload;
+use switchboard_server::protocols::amqp10::frames::encode_sasl_frame;
+use switchboard_server::protocols::amqp10::frames::end;
+use switchboard_server::protocols::amqp10::frames::is_more;
+use switchboard_server::protocols::amqp10::frames::open;
 use switchboard_server::protocols::amqp10::types;
+use switchboard_server::protocols::amqp10::types::Value;
+use switchboard_server::protocols::amqp10::types::decode;
+use switchboard_server::protocols::amqp10::types::encode;
 use switchboard_wire::BasicProperties;
 use switchboard_wire::method::Method;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 // ---------------------------------------------------------------------
 // Demux basics
@@ -66,7 +102,7 @@ async fn gateway_still_speaks_amqp() {
 async fn gateway_http_health_probe() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -83,29 +119,25 @@ async fn gateway_http_health_probe() {
 async fn gateway_closes_on_unrecognized_preamble() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"NONSENSE BYTES").await.unwrap();
     let mut buf = Vec::new();
     // The server closes: read hits EOF quickly.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sock.read_to_end(&mut buf),
-    )
-    .await;
+    let _ = timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_config_can_disable_protocols() {
     let _gateway_guard = lock().await;
-    let cfg = switchboard_server::ProtocolConfig {
+    let cfg = ProtocolConfig {
         amqp10: false,
         mqtt: false,
         ..Default::default()
     };
     let (addr, _node) = start_gateway(cfg).await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     // MQTT CONNECT arrives but MQTT is disabled: the server closes.
@@ -113,11 +145,7 @@ async fn gateway_config_can_disable_protocols() {
         .await
         .unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sock.read_to_end(&mut buf),
-    )
-    .await;
+    let _ = timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await;
 }
 
 // ---------------------------------------------------------------------
@@ -130,7 +158,7 @@ async fn mqtt_pub_sub_roundtrip() {
     let addr = gateway_support::shared_gateway().await;
 
     // Subscriber.
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(&mqtt_connect("sub-1")).await.unwrap();
     let (t, body) = with_timeout(mqtt_read(&mut sub), 60)
         .await
@@ -147,7 +175,7 @@ async fn mqtt_pub_sub_roundtrip() {
     assert_eq!((t, body[2]), (9, 0), "expected SUBACK grant");
 
     // Publisher (separate connection).
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&mqtt_connect("pub-1")).await.unwrap();
     with_timeout(mqtt_read(&mut pubc), 60)
         .await
@@ -173,7 +201,7 @@ async fn mqtt_pub_sub_roundtrip() {
 async fn mqtt_qos1_publish_gets_puback() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(&mqtt_connect("qos1")).await.unwrap();
     with_timeout(mqtt_read(&mut c), 10).await.unwrap().unwrap();
     c.write_all(&mqtt_publish("alerts/temp", b"99", 1, 42))
@@ -196,12 +224,12 @@ async fn mqtt_colliding_client_ids_get_distinct_sessions() {
     let node = guard.0.clone();
 
     // Persistent (clean_session=false) clients on the colliding pair.
-    let mut xs = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut xs = TcpStream::connect(&addr).await.unwrap();
     xs.write_all(&mqtt_connect_persistent("a/b", "guest", "guest"))
         .await
         .unwrap();
     let (_t, _) = with_timeout(mqtt_read(&mut xs), 10).await.unwrap().unwrap();
-    let mut ys = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut ys = TcpStream::connect(&addr).await.unwrap();
     ys.write_all(&mqtt_connect_persistent("a_b", "guest", "guest"))
         .await
         .unwrap();
@@ -217,7 +245,7 @@ async fn mqtt_colliding_client_ids_get_distinct_sessions() {
     }
 
     // The two session queues are distinct broker entities.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let topo = node.topology();
         let vh = topo.vhosts.get("/");
@@ -231,15 +259,15 @@ async fn mqtt_colliding_client_ids_get_distinct_sessions() {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "both distinct session queues must exist"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     // Three messages; a shared queue would split them between the two
     // competing consumers — distinct sessions deliver all three to each.
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&mqtt_connect("publisher")).await.unwrap();
     let (_t, _) = with_timeout(mqtt_read(&mut pubc), 10)
         .await
@@ -251,12 +279,12 @@ async fn mqtt_colliding_client_ids_get_distinct_sessions() {
             .unwrap();
     }
 
-    async fn drain_three(c: &mut tokio::net::TcpStream) -> Vec<u8> {
+    async fn drain_three(c: &mut TcpStream) -> Vec<u8> {
         let mut got = Vec::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while got.len() < 3 {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "timed out with only {:?} of 3 messages",
                 got
             );
@@ -315,7 +343,7 @@ async fn mqtt_cross_protocol_to_amqp() {
     amqp.expect(1).await.unwrap();
 
     // MQTT publisher.
-    let mut mqtt = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut mqtt = TcpStream::connect(&addr).await.unwrap();
     mqtt.write_all(&mqtt_connect("xproto")).await.unwrap();
     with_timeout(mqtt_read(&mut mqtt), 10)
         .await
@@ -326,12 +354,9 @@ async fn mqtt_cross_protocol_to_amqp() {
         .unwrap();
 
     // AMQP basic.get sees it (MQTT '/' topics are preserved byte-wise).
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "message never crossed protocols"
-        );
+        assert!(Instant::now() < deadline, "message never crossed protocols");
         amqp.send_method(
             1,
             &Method::BasicGet {
@@ -345,7 +370,7 @@ async fn mqtt_cross_protocol_to_amqp() {
         match amqp.expect(1).await.unwrap() {
             Method::BasicGetOk { .. } => return,
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -356,7 +381,7 @@ async fn mqtt_cross_protocol_to_amqp() {
 async fn mqtt_bad_credentials_are_refused() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     // CONNECT with wrong credentials.
     c.write_all(&gateway_support::mqtt_connect_creds(
         "intruder",
@@ -378,7 +403,7 @@ async fn mqtt_bad_credentials_are_refused() {
 async fn stomp_send_subscribe_roundtrip() {
     let _gateway_guard = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -417,7 +442,7 @@ async fn stomp_send_subscribe_roundtrip() {
 async fn stomp_client_ack_removes_message() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\nlogin:guest\npasscode:guest\n\n\0")
         .await
         .unwrap();
@@ -439,9 +464,9 @@ async fn stomp_client_ack_removes_message() {
     assert_eq!(cmd, "MESSAGE");
     // ACK was implied consumed; the queue must now be empty (verify via AMQP get).
     let mut amqp = support::connect_and_open(&addr, "/").await.unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(tokio::time::Instant::now() < deadline);
+        assert!(Instant::now() < deadline);
         amqp.send_method(
             1,
             &Method::BasicGet {
@@ -468,14 +493,14 @@ async fn stomp_client_ack_removes_message() {
 async fn stomp_preauth_oversized_content_length_closes_the_connection() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     // Pre-auth CONNECT announcing a ~1 TiB body: the server must refuse
     // the frame (protocol error -> connection close), never allocate.
     c.write_all(b"CONNECT\ncontent-length:999999999999\n\n")
         .await
         .unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), c.read_to_end(&mut buf))
+    let _ = timeout(Duration::from_secs(15), c.read_to_end(&mut buf))
         .await
         .expect("server must close the connection");
     assert!(
@@ -489,12 +514,12 @@ async fn stomp_preauth_oversized_content_length_closes_the_connection() {
 async fn mqtt_preauth_oversized_remaining_length_closes_the_connection() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     // CONNECT header byte + the maximal 4-byte varint (268,435,455): the
     // server must refuse before allocating the ~256 MiB body.
     c.write_all(&[0x10, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), c.read_to_end(&mut buf))
+    let _ = timeout(Duration::from_secs(15), c.read_to_end(&mut buf))
         .await
         .expect("server must close the connection");
 }
@@ -549,7 +574,7 @@ async fn websocket_stomp_via_first_frame_sniffing() {
 async fn amqp10_anon_connect_and_close() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
@@ -559,32 +584,24 @@ async fn amqp10_anon_connect_and_close() {
     assert!(n > 0, "no sasl mechanisms");
     eprintln!("[a10-client] mechanisms {}B: {:x?}", n, &buf[..n]);
 
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("ANONYMOUS".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(b"trace".to_vec()),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("ANONYMOUS".into()),
+            Value::Null,
+            Value::Binary(b"trace".to_vec()),
+        ],
+    ))
     .await
     .unwrap();
     let n2 = sock.read(&mut buf).await.unwrap();
     eprintln!("[a10-client] outcome {}B: {:x?}", n2, &buf[..n2]);
     // Client restarts the connection header.
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "test-client",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("test-client")).await.unwrap();
     let n = sock.read(&mut buf).await.unwrap();
     assert!(n > 0, "no open reply");
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::close())
-        .await
-        .unwrap();
+    sock.write_all(&close()).await.unwrap();
     let n = sock.read(&mut buf).await.unwrap();
     assert!(n > 0, "no close reply");
 }
@@ -614,57 +631,47 @@ async fn amqp10_publish_reaches_amqp_queue() {
 
     // AMQP 1.0 client: SASL ANONYMOUS, open, begin, attach sender to
     // /queue/one-oh, transfer "from-1.0", close.
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // mechanisms
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("ANONYMOUS".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(Vec::new()),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("ANONYMOUS".into()),
+            Value::Null,
+            Value::Binary(Vec::new()),
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // outcome
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "client",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("client")).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // open reply
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::begin(
-        None, 1,
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&begin(None, 1)).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // begin reply
-    let attach = switchboard_server::protocols::amqp10::frames::encode_frame(
+    let attach = encode_frame(
         0,
-        switchboard_server::protocols::amqp10::frames::codes::ATTACH,
+        ATTACH,
         vec![
-            switchboard_server::protocols::amqp10::types::Value::String("sender-link".into()),
-            switchboard_server::protocols::amqp10::types::Value::UInt(0),
-            switchboard_server::protocols::amqp10::types::Value::Bool(false), // client is sender
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Map(vec![(
-                switchboard_server::protocols::amqp10::types::Value::Symbol("address".into()),
-                switchboard_server::protocols::amqp10::types::Value::String("/queue/one-oh".into()),
+            Value::String("sender-link".into()),
+            Value::UInt(0),
+            Value::Bool(false), // client is sender
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Map(vec![(
+                Value::Symbol("address".into()),
+                Value::String("/queue/one-oh".into()),
             )]),
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Bool(false),
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Null,
+            Value::Null,
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
         ],
     );
     sock.write_all(&attach).await.unwrap();
@@ -673,41 +680,34 @@ async fn amqp10_publish_reaches_amqp_queue() {
     let body = b"from-1.0";
     let mut msg = Vec::new();
     types::encode(
-        &switchboard_server::protocols::amqp10::types::Value::Described(
-            Box::new(switchboard_server::protocols::amqp10::types::Value::ULong(
-                switchboard_server::protocols::amqp10::frames::codes::SECTION_DATA,
-            )),
-            Box::new(switchboard_server::protocols::amqp10::types::Value::Binary(
-                body.to_vec(),
-            )),
+        &Value::Described(
+            Box::new(Value::ULong(SECTION_DATA)),
+            Box::new(Value::Binary(body.to_vec())),
         ),
         &mut msg,
     );
-    let transfer = switchboard_server::protocols::amqp10::frames::encode_frame_with_payload(
+    let transfer = encode_frame_with_payload(
         0,
-        switchboard_server::protocols::amqp10::frames::codes::TRANSFER,
+        TRANSFER,
         vec![
-            switchboard_server::protocols::amqp10::types::Value::UInt(0), // handle
-            switchboard_server::protocols::amqp10::types::Value::UInt(1), // delivery-id
-            switchboard_server::protocols::amqp10::types::Value::Binary(vec![1]), // delivery-tag
-            switchboard_server::protocols::amqp10::types::Value::UInt(0), // message-format
-            switchboard_server::protocols::amqp10::types::Value::Bool(true), // settled
-            switchboard_server::protocols::amqp10::types::Value::Bool(false), // more
-            switchboard_server::protocols::amqp10::types::Value::Null,
-            switchboard_server::protocols::amqp10::types::Value::Null,
+            Value::UInt(0),         // handle
+            Value::UInt(1),         // delivery-id
+            Value::Binary(vec![1]), // delivery-tag
+            Value::UInt(0),         // message-format
+            Value::Bool(true),      // settled
+            Value::Bool(false),     // more
+            Value::Null,
+            Value::Null,
         ],
         &msg,
     );
     sock.write_all(&transfer).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // The AMQP 0-9-1 world sees the message.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "1.0 message never arrived"
-        );
+        assert!(Instant::now() < deadline, "1.0 message never arrived");
         amqp.send_method(
             1,
             &Method::BasicGet {
@@ -721,7 +721,7 @@ async fn amqp10_publish_reaches_amqp_queue() {
         match amqp.expect(1).await.unwrap() {
             Method::BasicGetOk { .. } => return,
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -765,117 +765,97 @@ async fn amqp10_receiver_gets_deliveries_honoring_credit() {
     }
 
     // AMQP 1.0 client attaches as receiver and grants credit.
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("ANONYMOUS".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(Vec::new()),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("ANONYMOUS".into()),
+            Value::Null,
+            Value::Binary(Vec::new()),
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-outcome
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "receiver",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("receiver")).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // open
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::begin(
-        None, 1,
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&begin(None, 1)).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // begin
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::ATTACH,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::String("recv-link".into()),
-                switchboard_server::protocols::amqp10::types::Value::UInt(0), // handle
-                switchboard_server::protocols::amqp10::types::Value::Bool(true), // client is receiver
-                switchboard_server::protocols::amqp10::types::Value::Null,       // snd-settle-mode
-                switchboard_server::protocols::amqp10::types::Value::Null,       // rcv-settle-mode
-                switchboard_server::protocols::amqp10::types::Value::Map(vec![(
-                    switchboard_server::protocols::amqp10::types::Value::Symbol("address".into()),
-                    switchboard_server::protocols::amqp10::types::Value::String(
-                        "/queue/rq1".into(),
-                    ),
-                )]), // source
-                switchboard_server::protocols::amqp10::types::Value::Null,       // target
-                switchboard_server::protocols::amqp10::types::Value::Null,       // unsettled
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        ATTACH,
+        vec![
+            Value::String("recv-link".into()),
+            Value::UInt(0),    // handle
+            Value::Bool(true), // client is receiver
+            Value::Null,       // snd-settle-mode
+            Value::Null,       // rcv-settle-mode
+            Value::Map(vec![(
+                Value::Symbol("address".into()),
+                Value::String("/queue/rq1".into()),
+            )]), // source
+            Value::Null,       // target
+            Value::Null,       // unsettled
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // attach reply
     // Grant credit: flow(handle=0, credit=2).
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::FLOW,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(2), // credit
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(0), // handle
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        FLOW,
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::UInt(2), // credit
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Null,
+            Value::UInt(0), // handle
+        ],
+    ))
     .await
     .unwrap();
 
     // Read frames until two transfers arrive; collect their data sections.
     let mut bodies: Vec<Vec<u8>> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut raw: Vec<u8> = Vec::new();
     while bodies.len() < 2 {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "expected two transfers, got {bodies:?}"
         );
         let n = sock.read(&mut buf).await.unwrap();
         assert!(n > 0, "connection ended early");
         raw.extend_from_slice(&buf[..n]);
         loop {
-            let (frame, used) =
-                match switchboard_server::protocols::amqp10::frames::decode_frame(&raw) {
-                    Ok(x) => x,
-                    Err(_) => break,
-                };
-            if switchboard_server::protocols::amqp10::frames::is_more(used) {
+            let (frame, used) = match decode_frame(&raw) {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            if is_more(used) {
                 break;
             }
             raw.drain(..used);
-            if frame.code() == Some(switchboard_server::protocols::amqp10::frames::codes::TRANSFER)
-            {
+            if frame.code() == Some(TRANSFER) {
                 // Pull the data section out of the message payload.
-                let (value, _) =
-                    switchboard_server::protocols::amqp10::types::decode(&frame.payload).unwrap();
-                if let switchboard_server::protocols::amqp10::types::Value::Described(_, v) = &value
-                {
-                    if let switchboard_server::protocols::amqp10::types::Value::Binary(b) = &**v {
+                let (value, _) = decode(&frame.payload).unwrap();
+                if let Value::Described(_, v) = &value {
+                    if let Value::Binary(b) = &**v {
                         bodies.push(b.clone());
                     }
                 }
@@ -895,7 +875,7 @@ async fn amqp10_receiver_gets_deliveries_honoring_credit() {
 async fn mqtt_qos2_full_handshake() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncWriteExt;
     sub.write_all(&gateway_support::mqtt_connect("q2sub"))
         .await
@@ -914,7 +894,7 @@ async fn mqtt_qos2_full_handshake() {
     assert_eq!(t, 9, "expected SUBACK");
     assert_eq!(codes[2], 2, "broker must grant the requested QoS 2");
 
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&gateway_support::mqtt_connect("q2pub"))
         .await
         .unwrap();
@@ -1006,7 +986,7 @@ async fn mqtt_qos2_duplicate_publish_is_deduped() {
     .unwrap();
     amqp.expect(1).await.unwrap();
 
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&gateway_support::mqtt_connect("q2dup"))
         .await
         .unwrap();
@@ -1039,7 +1019,7 @@ async fn mqtt_qos2_duplicate_publish_is_deduped() {
     assert_eq!(t, 7); // PUBCOMP
 
     // Exactly one message in the AMQP queue.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
     amqp.send_method(
         1,
         &Method::BasicGet {
@@ -1076,7 +1056,7 @@ async fn mqtt_persistent_session_survives_offline() {
     let addr = gateway_support::shared_gateway().await;
 
     // Session 1: clean=false, subscribe, disconnect.
-    let mut s1 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s1 = TcpStream::connect(&addr).await.unwrap();
     let mut conn = gateway_support::mqtt_connect_creds("persist-1", None, None);
     // Clear the clean-session flag (0x02) in the connect flags byte.
     conn[9] &= !0x02;
@@ -1091,7 +1071,7 @@ async fn mqtt_persistent_session_survives_offline() {
     drop(s1); // offline
 
     // Publish while offline.
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&gateway_support::mqtt_connect("pub-offline"))
         .await
         .unwrap();
@@ -1114,7 +1094,7 @@ async fn mqtt_persistent_session_survives_offline() {
     assert_eq!(t, 4); // PUBACK
 
     // Reconnect with the same client id: the queued message arrives.
-    let mut s2 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s2 = TcpStream::connect(&addr).await.unwrap();
     let mut conn2 = gateway_support::mqtt_connect_creds("persist-1", None, None);
     conn2[9] &= !0x02;
     s2.write_all(&conn2).await.unwrap();
@@ -1140,7 +1120,7 @@ fn codes_ok(body: &[u8]) -> bool {
 async fn mqtt_retained_message_served_to_late_subscriber() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&gateway_support::mqtt_connect("retain-pub"))
         .await
         .unwrap();
@@ -1152,11 +1132,11 @@ async fn mqtt_retained_message_served_to_late_subscriber() {
     pubc.write_all(&gateway_support::mqtt_publish_retained("state/last", b"ON"))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
     drop(pubc);
 
     // A brand-new subscriber receives the retained state immediately.
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(&gateway_support::mqtt_connect("retain-sub"))
         .await
         .unwrap();
@@ -1184,7 +1164,7 @@ async fn mqtt_retained_message_served_to_late_subscriber() {
 async fn mqtt_retained_clear_with_empty_payload() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(&gateway_support::mqtt_connect("retain-clear"))
         .await
         .unwrap();
@@ -1195,13 +1175,13 @@ async fn mqtt_retained_clear_with_empty_payload() {
     pubc.write_all(&gateway_support::mqtt_publish_retained("state/x", b"v"))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
     pubc.write_all(&gateway_support::mqtt_publish_retained("state/x", b""))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
 
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(&gateway_support::mqtt_connect("retain-clear-sub"))
         .await
         .unwrap();
@@ -1229,7 +1209,7 @@ async fn mqtt_retained_clear_with_empty_payload() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stomp_transaction_commit_delivers_atomically() {
     for attempt in 0..2 {
-        let result = std::panic::AssertUnwindSafe(run_commit_flow(attempt));
+        let result = AssertUnwindSafe(run_commit_flow(attempt));
         match futures::FutureExt::catch_unwind(result).await {
             Ok(()) => return,
             Err(payload) if attempt == 0 => {
@@ -1259,7 +1239,7 @@ async fn run_commit_flow(attempt: u8) {
     // this flow sensitive to full-workspace load (shared-runtime
     // scheduling), while fresh nodes are deterministic.
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1272,7 +1252,7 @@ async fn run_commit_flow(attempt: u8) {
         .await
         .unwrap();
 
-    let mut send = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut send = TcpStream::connect(&addr).await.unwrap();
     send.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1294,12 +1274,9 @@ async fn run_commit_flow(attempt: u8) {
         .unwrap();
 
     let mut got = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(45);
     while got.len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "transaction messages incomplete"
-        );
+        assert!(Instant::now() < deadline, "transaction messages incomplete");
         let Some((cmd, body)) = with_timeout(read_stomp_frame(&mut sub), 15).await.unwrap() else {
             panic!("connection closed before all tx messages arrived");
         };
@@ -1314,7 +1291,7 @@ async fn run_commit_flow(attempt: u8) {
 async fn stomp_transaction_abort_discards() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1326,7 +1303,7 @@ async fn stomp_transaction_abort_discards() {
         .await
         .unwrap();
 
-    let mut send = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut send = TcpStream::connect(&addr).await.unwrap();
     send.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1343,7 +1320,7 @@ async fn stomp_transaction_abort_discards() {
     send.write_all(b"ABORT\ntransaction:tx-2\n\n\0")
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // The queue must be empty: verify via AMQP.
     let mut amqp = support::connect_and_open(&addr, "/").await.unwrap();
@@ -1392,173 +1369,137 @@ async fn amqp10_unsettled_delivery_and_dispositions() {
     amqp_publish_091(&mut amqp, b"settle-me").await;
 
     // AMQP 1.0 client attaches as receiver with snd-settle-mode=0 (unsettled).
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // mechanisms
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("ANONYMOUS".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(Vec::new()),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("ANONYMOUS".into()),
+            Value::Null,
+            Value::Binary(Vec::new()),
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "unsettled-client",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("unsettled-client")).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::begin(
-        None, 1,
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&begin(None, 1)).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::ATTACH,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::String(
-                    "unsettled-link".into(),
-                ),
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-                switchboard_server::protocols::amqp10::types::Value::Bool(true), // role: receiver (client)
-                switchboard_server::protocols::amqp10::types::Value::UByte(0), // snd-settle-mode: UNSETTLED
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Map(vec![(
-                    switchboard_server::protocols::amqp10::types::Value::Symbol("address".into()),
-                    switchboard_server::protocols::amqp10::types::Value::String(
-                        "/queue/unsettled".into(),
-                    ),
-                )]),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        ATTACH,
+        vec![
+            Value::String("unsettled-link".into()),
+            Value::UInt(0),
+            Value::Bool(true), // role: receiver (client)
+            Value::UByte(0),   // snd-settle-mode: UNSETTLED
+            Value::Null,
+            Value::Map(vec![(
+                Value::Symbol("address".into()),
+                Value::String("/queue/unsettled".into()),
+            )]),
+            Value::Null,
+            Value::Null,
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // attach reply
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::FLOW,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(5), // credit
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        FLOW,
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::UInt(5), // credit
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Null,
+            Value::UInt(0),
+        ],
+    ))
     .await
     .unwrap();
 
     // Receive the transfer; it must be UNSETTLED.
     let (frame, _) = read_amqp10_frame(&mut sock).await;
-    assert_eq!(
-        frame.code(),
-        Some(switchboard_server::protocols::amqp10::frames::codes::TRANSFER)
-    );
-    let settled = matches!(
-        frame.field(4),
-        Some(switchboard_server::protocols::amqp10::types::Value::Bool(
-            true
-        ))
-    );
+    assert_eq!(frame.code(), Some(TRANSFER));
+    let settled = matches!(frame.field(4), Some(Value::Bool(true)));
     assert!(
         !settled,
         "unsettled-mode transfers must carry settled=false"
     );
     let delivery_id = match frame.field(1) {
-        Some(switchboard_server::protocols::amqp10::types::Value::UInt(id)) => *id,
+        Some(Value::UInt(id)) => *id,
         other => panic!("no delivery id: {other:?}"),
     };
 
     // RELEASE it: the message returns to the queue…
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::DISPOSITION,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Bool(false), // role: sender
-                switchboard_server::protocols::amqp10::types::Value::UInt(delivery_id),
-                switchboard_server::protocols::amqp10::types::Value::UInt(delivery_id),
-                switchboard_server::protocols::amqp10::types::Value::Bool(true), // settled
-                described_state(0x25),                                           // released
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        DISPOSITION,
+        vec![
+            Value::Bool(false), // role: sender
+            Value::UInt(delivery_id),
+            Value::UInt(delivery_id),
+            Value::Bool(true),     // settled
+            described_state(0x25), // released
+        ],
+    ))
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // …and the broker re-delivers it on fresh credit (redelivered).
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::FLOW,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(5),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        FLOW,
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::UInt(5),
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Null,
+            Value::UInt(0),
+        ],
+    ))
     .await
     .unwrap();
     let (frame2, _) = read_amqp10_frame(&mut sock).await;
-    assert_eq!(
-        frame2.code(),
-        Some(switchboard_server::protocols::amqp10::frames::codes::TRANSFER),
-        "expected redelivery"
-    );
+    assert_eq!(frame2.code(), Some(TRANSFER), "expected redelivery");
 
     // ACCEPT this time: the message leaves the queue for good.
     let delivery_id2 = match frame2.field(1) {
-        Some(switchboard_server::protocols::amqp10::types::Value::UInt(id)) => *id,
+        Some(Value::UInt(id)) => *id,
         other => panic!("no delivery id: {other:?}"),
     };
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::DISPOSITION,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::UInt(delivery_id2),
-                switchboard_server::protocols::amqp10::types::Value::UInt(delivery_id2),
-                switchboard_server::protocols::amqp10::types::Value::Bool(true),
-                described_state(0x24), // accepted
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        DISPOSITION,
+        vec![
+            Value::Bool(false),
+            Value::UInt(delivery_id2),
+            Value::UInt(delivery_id2),
+            Value::Bool(true),
+            described_state(0x24), // accepted
+        ],
+    ))
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // The AMQP 0-9-1 side sees an empty queue.
     amqp.send_method(
@@ -1590,32 +1531,22 @@ async fn amqp_publish_091(c: &mut support::TestClient, body: &[u8]) {
     )
     .await
     .unwrap();
-    c.send_content(1, &switchboard_wire::BasicProperties::new(), body)
+    c.send_content(1, &BasicProperties::new(), body)
         .await
         .unwrap();
 }
 
-fn described_state(code: u64) -> switchboard_server::protocols::amqp10::types::Value {
-    switchboard_server::protocols::amqp10::types::Value::Described(
-        Box::new(switchboard_server::protocols::amqp10::types::Value::ULong(
-            code,
-        )),
-        Box::new(switchboard_server::protocols::amqp10::types::Value::List(
-            vec![],
-        )),
-    )
+fn described_state(code: u64) -> Value {
+    Value::Described(Box::new(Value::ULong(code)), Box::new(Value::List(vec![])))
 }
 
-async fn read_amqp10_frame(
-    sock: &mut tokio::net::TcpStream,
-) -> (switchboard_server::protocols::amqp10::frames::Frame, usize) {
+async fn read_amqp10_frame(sock: &mut TcpStream) -> (Frame, usize) {
     use tokio::io::AsyncReadExt;
     let mut raw: Vec<u8> = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
-        if let Ok((frame, used)) = switchboard_server::protocols::amqp10::frames::decode_frame(&raw)
-        {
-            if !switchboard_server::protocols::amqp10::frames::is_more(used) {
+        if let Ok((frame, used)) = decode_frame(&raw) {
+            if !is_more(used) {
                 return (frame, used);
             }
         }
@@ -1633,7 +1564,7 @@ async fn read_amqp10_frame(
 async fn stomp_unknown_command_yields_error_frame() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     // Bytes before a CONNECT frame are a different (unrecognized)
     // protocol and the gateway closes; the unknown-command ERROR arm is
     // reachable only inside an established STOMP session.
@@ -1657,7 +1588,7 @@ async fn stomp_unknown_command_yields_error_frame() {
 async fn stomp_subscribe_without_id_is_rejected() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1680,7 +1611,7 @@ async fn stomp_subscribe_without_id_is_rejected() {
 async fn stomp_bad_destination_is_rejected() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1703,7 +1634,7 @@ async fn stomp_bad_destination_is_rejected() {
 async fn stomp_ack_unknown_id_yields_error() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1724,7 +1655,7 @@ async fn stomp_ack_unknown_id_yields_error() {
 async fn stomp_commit_unknown_transaction_is_error() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1749,7 +1680,7 @@ async fn stomp_commit_unknown_transaction_is_error() {
 async fn stomp_duplicate_connect_closes() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1772,7 +1703,7 @@ async fn stomp_duplicate_connect_closes() {
 async fn stomp_unsubscribe_stops_delivery() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut sub = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
     sub.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1798,7 +1729,7 @@ async fn stomp_unsubscribe_stops_delivery() {
     assert_eq!(cmd, "RECEIPT");
 
     // A message published after the unsubscribe is not delivered.
-    let mut send = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut send = TcpStream::connect(&addr).await.unwrap();
     send.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1809,7 +1740,7 @@ async fn stomp_unsubscribe_stops_delivery() {
     send.write_all(b"SEND\ndestination:/topic/unsubme\n\n\nlate\n\0")
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // The queue is durable+auto-delete… after unsubscribe the gen queue
     // is dropped, so the late message is unroutable. Drain via AMQP get
@@ -1833,7 +1764,7 @@ async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
     let (addr, guard) = start_gateway(Default::default()).await;
     let node = guard.0.clone();
 
-    let mut a = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut a = TcpStream::connect(&addr).await.unwrap();
     a.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1850,7 +1781,7 @@ async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
         .unwrap();
     assert_eq!(cmd, "RECEIPT");
 
-    let mut b = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut b = TcpStream::connect(&addr).await.unwrap();
     b.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1867,7 +1798,7 @@ async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
         .unwrap();
     assert_eq!(cmd, "RECEIPT");
 
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1901,10 +1832,10 @@ async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
         .unwrap();
     assert_eq!(cmd, "RECEIPT");
     drop(c);
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // The named queue survived both departures.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let alive = node
             .topology()
@@ -1916,14 +1847,14 @@ async fn stomp_shared_queue_survives_unsubscribe_and_teardown() {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "shared /queue/ destination must survive other sessions leaving"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     // And its messages still reach the remaining session.
-    let mut sender = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sender = TcpStream::connect(&addr).await.unwrap();
     sender
         .write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
@@ -1952,7 +1883,7 @@ async fn stomp_topic_private_queue_is_cleaned_up_on_teardown() {
     let (addr, guard) = start_gateway(Default::default()).await;
     let node = guard.0.clone();
 
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -1970,16 +1901,16 @@ async fn stomp_topic_private_queue_is_cleaned_up_on_teardown() {
     assert_eq!(cmd, "RECEIPT");
 
     // Wait until the bridge-private amq.gen-* queue exists.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if gen_queue_count(&node) >= 1 {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "topic subscription must create its private queue"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     c.write_all(b"DISCONNECT\nreceipt:done\n\n\0")
@@ -1993,21 +1924,21 @@ async fn stomp_topic_private_queue_is_cleaned_up_on_teardown() {
     drop(c);
 
     // The private queue is deleted by the teardown.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if gen_queue_count(&node) == 0 {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "topic-derived private queue must be cleaned up on teardown"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
 /// Count bridge-private generated queues in the default vhost.
-fn gen_queue_count(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> usize {
+fn gen_queue_count(node: &Arc<ClusterNode>) -> usize {
     node.topology()
         .vhosts
         .get("/")
@@ -2026,36 +1957,26 @@ fn gen_queue_count(node: &std::sync::Arc<switchboard_cluster::ClusterNode>) -> u
 
 /// Shared helper: SASL-ANONYMOUS handshake + open + begin; returns the
 /// connected socket.
-async fn amqp10_open_session(addr: &str) -> tokio::net::TcpStream {
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+async fn amqp10_open_session(addr: &str) -> TcpStream {
+    let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-mechanisms
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("ANONYMOUS".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(Vec::new()),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("ANONYMOUS".into()),
+            Value::Null,
+            Value::Binary(Vec::new()),
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // sasl-outcome
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "err-client",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("err-client")).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // open reply
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::begin(
-        None, 1,
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&begin(None, 1)).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // begin reply
     sock
 }
@@ -2066,20 +1987,12 @@ async fn amqp10_detach_unknown_handle_gets_reply() {
     let (addr, _node) = start_gateway(Default::default()).await;
     let mut sock = amqp10_open_session(&addr).await;
     // Detach a handle that was never attached: the server must reply.
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::detach(77))
-        .await
-        .unwrap();
+    sock.write_all(&detach(77)).await.unwrap();
     let mut buf = [0u8; 512];
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap();
+    let n = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
     assert!(n > 0, "expected a detach reply");
-    let (frame, _) =
-        switchboard_server::protocols::amqp10::frames::decode_frame(&buf[..n]).unwrap();
-    assert_eq!(
-        frame.code(),
-        Some(switchboard_server::protocols::amqp10::frames::codes::DETACH)
-    );
+    let (frame, _) = decode_frame(&buf[..n]).unwrap();
+    assert_eq!(frame.code(), Some(DETACH));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2089,80 +2002,60 @@ async fn amqp10_transfer_to_unknown_handle_is_ignored_silently() {
     let mut sock = amqp10_open_session(&addr).await;
     // Transfer on an unattached handle: payload destined nowhere.
     let mut msg = Vec::new();
-    switchboard_server::protocols::amqp10::types::encode(
-        &switchboard_server::protocols::amqp10::types::Value::Described(
-            Box::new(switchboard_server::protocols::amqp10::types::Value::ULong(
-                switchboard_server::protocols::amqp10::frames::codes::SECTION_DATA,
-            )),
-            Box::new(switchboard_server::protocols::amqp10::types::Value::Binary(
-                b"orphan".to_vec(),
-            )),
+    encode(
+        &Value::Described(
+            Box::new(Value::ULong(SECTION_DATA)),
+            Box::new(Value::Binary(b"orphan".to_vec())),
         ),
         &mut msg,
     );
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame_with_payload(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::TRANSFER,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::UInt(99), // unknown handle
-                switchboard_server::protocols::amqp10::types::Value::UInt(1),
-                switchboard_server::protocols::amqp10::types::Value::Binary(vec![1]),
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-                switchboard_server::protocols::amqp10::types::Value::Bool(true),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-            ],
-            &msg,
-        ),
-    )
+    sock.write_all(&encode_frame_with_payload(
+        0,
+        TRANSFER,
+        vec![
+            Value::UInt(99), // unknown handle
+            Value::UInt(1),
+            Value::Binary(vec![1]),
+            Value::UInt(0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+        ],
+        &msg,
+    ))
     .await
     .unwrap();
     // The connection must survive: END → END reply proves the session
     // loop is still running.
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::end())
-        .await
-        .unwrap();
+    sock.write_all(&end()).await.unwrap();
     let mut buf = [0u8; 512];
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap();
+    let n = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
     assert!(n > 0, "session must reply to END");
-    let (frame, _) =
-        switchboard_server::protocols::amqp10::frames::decode_frame(&buf[..n]).unwrap();
-    assert_eq!(
-        frame.code(),
-        Some(switchboard_server::protocols::amqp10::frames::codes::END)
-    );
+    let (frame, _) = decode_frame(&buf[..n]).unwrap();
+    assert_eq!(frame.code(), Some(END));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn amqp10_bad_sasl_mechanism_closes() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
-    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap();
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("CRAM-MD5".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(Vec::new()),
-            ],
-        ),
-    )
+    let _ = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("CRAM-MD5".into()),
+            Value::Null,
+            Value::Binary(Vec::new()),
+        ],
+    ))
     .await
     .unwrap();
     // Unsupported mechanism: the server closes without an outcome.
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap_or(0);
+    let n = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
     assert_eq!(n, 0, "connection must close on unsupported mechanism");
 }
 
@@ -2170,19 +2063,13 @@ async fn amqp10_bad_sasl_mechanism_closes() {
 async fn amqp10_close_before_open_is_handled() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
-    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::close())
-        .await
-        .unwrap();
+    let _ = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+    sock.write_all(&close()).await.unwrap();
     // Server responds with its own close and closes the socket.
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap_or(0);
+    let n = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
     let _ = n;
     // Either a close frame or EOF is acceptable; the connection must end.
 }
@@ -2191,7 +2078,7 @@ async fn amqp10_close_before_open_is_handled() {
 async fn stomp_commit_to_missing_exchange_is_rejected() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2223,7 +2110,7 @@ async fn stomp_commit_to_missing_exchange_is_rejected() {
 async fn stomp_disconnect_without_receipt_closes_cleanly() {
     let _gateway_guard = lock().await;
     let addr = gateway_support::shared_gateway().await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2234,16 +2121,14 @@ async fn stomp_disconnect_without_receipt_closes_cleanly() {
     c.write_all(b"DISCONNECT\n\n\0").await.unwrap();
     // No receipt requested: the server closes cleanly.
     let mut buf = Vec::new();
-    let _ = tokio::io::AsyncReadExt::read(&mut c, &mut buf)
-        .await
-        .unwrap_or(0);
+    let _ = AsyncReadExt::read(&mut c, &mut buf).await.unwrap_or(0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stomp_client_individual_ack_holds_message() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2293,7 +2178,7 @@ async fn stomp_client_individual_ack_holds_message() {
 async fn stomp_unsubscribe_unknown_id_is_silent() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2317,7 +2202,7 @@ async fn stomp_unsubscribe_unknown_id_is_silent() {
 async fn stomp_subscribe_exchange_missing_is_error() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2339,7 +2224,7 @@ async fn stomp_subscribe_exchange_missing_is_error() {
 async fn stomp_send_without_destination_is_error() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2378,7 +2263,7 @@ async fn stomp_amqp_queue_destination_roundtrip() {
     .unwrap();
     amqp.expect(1).await.unwrap();
 
-    let mut stomp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut stomp = TcpStream::connect(&addr).await.unwrap();
     stomp
         .write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
@@ -2397,7 +2282,7 @@ async fn stomp_amqp_queue_destination_roundtrip() {
         .unwrap();
     assert_eq!(cmd, "RECEIPT");
 
-    let mut pubc = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
     pubc.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2442,125 +2327,101 @@ async fn amqp10_client_sender_publishes_with_credit_flow() {
     // 1.0 client: SASL PLAIN with real creds, open, begin, attach sender
     // with target /queue/one-flow, then FLOW granting credit, then
     // transfer. Verifies the credit-driven send path end-to-end.
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 2048];
     let _ = sock.read(&mut buf).await.unwrap();
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("PLAIN".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(
-                    b"\0guest\0guest".to_vec(),
-                ),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("PLAIN".into()),
+            Value::Null,
+            Value::Binary(b"\0guest\0guest".to_vec()),
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::open(
-        "flow-client",
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&open("flow-client")).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
-    sock.write_all(&switchboard_server::protocols::amqp10::frames::begin(
-        None, 1,
-    ))
-    .await
-    .unwrap();
+    sock.write_all(&begin(None, 1)).await.unwrap();
     let _ = sock.read(&mut buf).await.unwrap();
 
     // Attach with role=sender (field 2 = false), target /queue/one-flow.
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::ATTACH,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::String("snd".into()),
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Map(vec![(
-                    switchboard_server::protocols::amqp10::types::Value::Symbol("address".into()),
-                    switchboard_server::protocols::amqp10::types::Value::String(
-                        "/queue/one-flow".into(),
-                    ),
-                )]),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        ATTACH,
+        vec![
+            Value::String("snd".into()),
+            Value::UInt(0),
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Map(vec![(
+                Value::Symbol("address".into()),
+                Value::String("/queue/one-flow".into()),
+            )]),
+            Value::Null,
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    ))
     .await
     .unwrap();
     let _ = sock.read(&mut buf).await.unwrap(); // attach reply
 
     // Grant credit for the link (handle 0).
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::FLOW,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(3), // credit
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::UInt(0), // handle
-            ],
-        ),
-    )
+    sock.write_all(&encode_frame(
+        0,
+        FLOW,
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::UInt(3), // credit
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Null,
+            Value::UInt(0), // handle
+        ],
+    ))
     .await
     .unwrap();
 
     // Transfer one settled message.
     let mut msg = Vec::new();
-    switchboard_server::protocols::amqp10::types::encode(
-        &switchboard_server::protocols::amqp10::types::Value::Described(
-            Box::new(switchboard_server::protocols::amqp10::types::Value::ULong(
-                switchboard_server::protocols::amqp10::frames::codes::SECTION_DATA,
-            )),
-            Box::new(switchboard_server::protocols::amqp10::types::Value::Binary(
-                b"credit-msg".to_vec(),
-            )),
+    encode(
+        &Value::Described(
+            Box::new(Value::ULong(SECTION_DATA)),
+            Box::new(Value::Binary(b"credit-msg".to_vec())),
         ),
         &mut msg,
     );
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_frame_with_payload(
-            0,
-            switchboard_server::protocols::amqp10::frames::codes::TRANSFER,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-                switchboard_server::protocols::amqp10::types::Value::UInt(1),
-                switchboard_server::protocols::amqp10::types::Value::Binary(vec![1]),
-                switchboard_server::protocols::amqp10::types::Value::UInt(0),
-                switchboard_server::protocols::amqp10::types::Value::Bool(true),
-                switchboard_server::protocols::amqp10::types::Value::Bool(false),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Null,
-            ],
-            &msg,
-        ),
-    )
+    sock.write_all(&encode_frame_with_payload(
+        0,
+        TRANSFER,
+        vec![
+            Value::UInt(0),
+            Value::UInt(1),
+            Value::Binary(vec![1]),
+            Value::UInt(0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+        ],
+        &msg,
+    ))
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // AMQP 0-9-1 verifies delivery.
     let got = support::basic_get(&mut amqp, 1, "one-flow", true)
@@ -2572,51 +2433,36 @@ async fn amqp10_client_sender_publishes_with_credit_flow() {
 #[tokio::test(flavor = "multi_thread")]
 async fn amqp10_plain_wrong_password_is_rejected() {
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     sock.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 512];
     let _ = sock.read(&mut buf).await.unwrap();
-    sock.write_all(
-        &switchboard_server::protocols::amqp10::frames::encode_sasl_frame(
-            switchboard_server::protocols::amqp10::frames::codes::SASL_INIT,
-            vec![
-                switchboard_server::protocols::amqp10::types::Value::Symbol("PLAIN".into()),
-                switchboard_server::protocols::amqp10::types::Value::Null,
-                switchboard_server::protocols::amqp10::types::Value::Binary(
-                    b"\0guest\0nope".to_vec(),
-                ),
-            ],
-        ),
-    )
+    sock.write_all(&encode_sasl_frame(
+        SASL_INIT,
+        vec![
+            Value::Symbol("PLAIN".into()),
+            Value::Null,
+            Value::Binary(b"\0guest\0nope".to_vec()),
+        ],
+    ))
     .await
     .unwrap();
     // SASL outcome 1 (auth failure), then close.
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
-        .await
-        .unwrap_or(0);
+    let n = AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
     assert!(n > 0, "expected SASL outcome");
-    let (frame, _) =
-        switchboard_server::protocols::amqp10::frames::decode_frame(&buf[..n]).unwrap();
-    assert_eq!(
-        frame.code(),
-        Some(switchboard_server::protocols::amqp10::frames::codes::SASL_OUTCOME)
-    );
-    assert_eq!(
-        frame.field(0).cloned(),
-        Some(switchboard_server::protocols::amqp10::types::Value::UByte(
-            1
-        ))
-    );
+    let (frame, _) = decode_frame(&buf[..n]).unwrap();
+    assert_eq!(frame.code(), Some(SASL_OUTCOME));
+    assert_eq!(frame.field(0).cloned(), Some(Value::UByte(1)));
 }
 
 // ---------------------------------------------------------------------
 // STOMP arm coverage: negotiation, error frames, tx, NACK, teardown.
 // ---------------------------------------------------------------------
 
-async fn stomp_connect_ok(addr: &str) -> tokio::net::TcpStream {
-    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+async fn stomp_connect_ok(addr: &str) -> TcpStream {
+    let mut c = TcpStream::connect(addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2647,7 +2493,7 @@ async fn stomp_first_frame_must_be_connect() {
 async fn stomp_bad_credentials_are_rejected() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\nlogin:guest\npasscode:wrong\n\n\0")
         .await
         .unwrap();
@@ -2668,7 +2514,7 @@ async fn stomp_bad_credentials_are_rejected() {
 async fn stomp_heart_beat_negotiation_echoes_server_values() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\nheart-beat:1000,2000\n\n\0")
         .await
         .unwrap();
@@ -2715,7 +2561,7 @@ async fn stomp_half_frame_disconnect_closes_cleanly() {
         let mut c = stomp_connect_ok(&addr).await;
         c.write_all(partial.as_bytes()).await.unwrap();
         drop(c);
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
     }
     // The server is still healthy afterwards.
     let mut c = stomp_connect_ok(&addr).await;
@@ -2751,12 +2597,12 @@ async fn stomp_forwarder_stops_when_client_vanishes() {
     // Vanish mid-session; the MESSAGE forwarder observes the write
     // failure on the next delivery and stops.
     drop(c);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
     let mut p = stomp_connect_ok(&addr).await;
     p.write_all(b"SEND\ndestination:/queue/vanish\n\nsecond\0")
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2910,7 +2756,7 @@ async fn stomp_send_auto_declares_queue_and_persists() {
 async fn stomp_heart_beat_zero_negotiates_zero() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\nheart-beat:0,0\n\n\0")
         .await
         .unwrap();
@@ -2930,7 +2776,7 @@ async fn stomp_heart_beat_zero_negotiates_zero() {
 async fn stomp_subscribe_without_destination_is_error() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -2950,7 +2796,7 @@ async fn stomp_subscribe_without_destination_is_error() {
 async fn stomp_client_ack_on_fresh_gateway_settles() {
     let _g = lock().await;
     let (addr, _node) = start_gateway(Default::default()).await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     c.write_all(b"CONNECT\naccept-version:1.2\n\n\0")
         .await
         .unwrap();
@@ -3029,7 +2875,7 @@ fn mqtt_connect_persistent(client_id: &str, user: &str, pass: &str) -> Vec<u8> {
 /// Create a user and install their permissions directly through the
 /// node's meta write path (the same commands the admin API issues).
 async fn put_user(
-    node: &std::sync::Arc<switchboard_cluster::ClusterNode>,
+    node: &Arc<ClusterNode>,
     user: &str,
     pass: &str,
     configure: &str,
@@ -3044,7 +2890,7 @@ async fn put_user(
             name: user.to_string(),
             // Propose-side hash (alert #15): the replicated command
             // carries the PHC string, never the plaintext password.
-            password_hash: switchboard_core::auth::hash_password(user, pass),
+            password_hash: hash_password(user, pass),
         },
         MetaCmd::SetPermissions {
             user: user.to_string(),
@@ -3056,7 +2902,7 @@ async fn put_user(
             },
         },
     ] {
-        node.write(switchboard_cluster::META_GROUP, BrokerCommand::Meta(cmd))
+        node.write(META_GROUP, BrokerCommand::Meta(cmd))
             .await
             .unwrap();
     }
@@ -3129,7 +2975,7 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
 
     // MQTT as svc8 (persistent session): the subscription's queue is
     // svc8's own, so declare/bind/consume all pass…
-    let mut c8 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c8 = TcpStream::connect(&addr).await.unwrap();
     c8.write_all(&mqtt_connect_persistent("svc8", "svc8", "pw8"))
         .await
         .unwrap();
@@ -3159,12 +3005,9 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
     // …and the denied topic does not. The eye queue sees EVERY routed
     // message on amq.topic (bound "#"), so the denied one must never
     // appear there while the allowed one does.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "allowed publish never routed"
-        );
+        assert!(Instant::now() < deadline, "allowed publish never routed");
         match support::basic_get(&mut eye, 1, "bridge-authz-eye", true)
             .await
             .unwrap()
@@ -3173,7 +3016,7 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
                 assert_eq!(b, b"allowed");
                 break;
             }
-            None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            None => sleep(Duration::from_millis(100)).await,
         }
     }
     c8.write_all(&gateway_support::mqtt_publish(
@@ -3184,7 +3027,7 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
     ))
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    sleep(Duration::from_millis(1500)).await;
     let got = support::basic_get(&mut eye, 1, "bridge-authz-eye", true)
         .await
         .unwrap();
@@ -3195,7 +3038,7 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
 
     // MQTT as svc9: the consume gate refuses the read, surfacing as
     // SUBACK failure code 0x80.
-    let mut c9 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c9 = TcpStream::connect(&addr).await.unwrap();
     c9.write_all(&mqtt_connect_persistent("svc9", "svc9", "pw9"))
         .await
         .unwrap();
@@ -3211,7 +3054,7 @@ async fn bridge_sessions_are_permission_gated_as_their_user() {
 
     // STOMP as svc9: subscribing to a /queue/ the user cannot read is an
     // ERROR frame (declare/consume is permission-gated there too).
-    let mut s9 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut s9 = TcpStream::connect(&addr).await.unwrap();
     s9.write_all(b"CONNECT\nlogin:svc9\npasscode:pw9\naccept-version:1.2\n\n\0")
         .await
         .unwrap();

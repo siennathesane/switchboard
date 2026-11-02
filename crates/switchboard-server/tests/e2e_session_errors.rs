@@ -10,6 +10,10 @@ use switchboard_wire::method::Method;
 use support::TestClient;
 use support::connect_and_open;
 use support::start_broker;
+use switchboard_wire::BasicProperties;
+use switchboard_wire::ContentHeader;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 
 /// Send a raw frame over the client socket.
 async fn send_raw(c: &mut TestClient, frame: &Frame) {
@@ -19,7 +23,7 @@ async fn send_raw(c: &mut TestClient, frame: &Frame) {
 }
 
 fn heartbeat(channel: u16) -> Frame {
-    let mut f = switchboard_wire::Frame::heartbeat();
+    let mut f = Frame::heartbeat();
     f.channel = channel;
     f
 }
@@ -98,9 +102,8 @@ async fn unexpected_header_is_connection_exception() {
     let mut c = connect_and_open(&addr, "/").await.unwrap();
     // Channel 1 is already open (connect_and_open) with no pending
     // content: a header frame is unexpected → 505.
-    let props = switchboard_wire::BasicProperties::new();
-    let header =
-        switchboard_wire::Frame::header(1, &switchboard_wire::ContentHeader::new(0, props));
+    let props = BasicProperties::new();
+    let header = Frame::header(1, &ContentHeader::new(0, props));
     send_raw(&mut c, &header).await;
     let Method::ConnectionClose { reply_code, .. } = c.expect(0).await.unwrap() else {
         panic!("expected Connection.Close");
@@ -113,7 +116,7 @@ async fn unexpected_header_is_connection_exception() {
 async fn body_on_unknown_channel_is_channel_error() {
     let (_node, addr) = start_broker("body404").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
-    let body = switchboard_wire::Frame::body(9, b"stray");
+    let body = Frame::body(9, b"stray");
     send_raw(&mut c, &body).await;
     // 504 CHANNEL_ERROR is connection-level per our close_for mapping.
     let Method::ConnectionClose { reply_code, .. } = c.expect(0).await.unwrap() else {
@@ -202,7 +205,7 @@ async fn framing_error_sends_501() {
     let (_node, addr) = start_broker("frame501").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
     // A method frame with a corrupted frame-end byte.
-    let mut bytes = switchboard_wire::Frame::method(
+    let mut bytes = Frame::method(
         1,
         &Method::ChannelOpen {
             out_of_band: String::new(),
@@ -240,7 +243,7 @@ async fn framing_error_sends_501() {
 async fn corrupt_frame_end_yields_501() {
     let (_node, addr) = start_broker("ce501").await;
     let mut c = connect_and_open(&addr, "/").await.unwrap();
-    let mut bytes = switchboard_wire::Frame::method(
+    let mut bytes = Frame::method(
         1,
         &Method::ChannelOpen {
             out_of_band: String::new(),
@@ -263,14 +266,12 @@ async fn corrupt_frame_end_yields_501() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_version_gets_header_reply() {
     let (_node, addr) = start_broker("ver911").await;
-    let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut c = TcpStream::connect(&addr).await.unwrap();
     use tokio::io::AsyncWriteExt;
     // AMQP version 1.0.0 header (a valid AMQP version, but we speak 0-9-1).
     c.write_all(b"AMQP\0\x01\0\0").await.unwrap();
     let mut buf = [0u8; 16];
-    let n = tokio::io::AsyncReadExt::read(&mut c, &mut buf)
-        .await
-        .unwrap_or(0);
+    let n = AsyncReadExt::read(&mut c, &mut buf).await.unwrap_or(0);
     // Gateway path may close silently; both behaviors are acceptable
     // (§4.2.2 allows close with or without header reply).
     let _ = n;

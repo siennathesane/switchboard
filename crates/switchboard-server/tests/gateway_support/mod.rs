@@ -6,14 +6,14 @@
 
 use std::sync::Arc;
 
-static TRACING: std::sync::Once = std::sync::Once::new();
+static TRACING: Once = Once::new();
 
 fn init_tracing() {
     TRACING.call_once(|| {
         // Test tempo: shrink fixed delays (raft elections, ticks, join
         // deadlines) 50x. Uniform time-warp — ordering unchanged.
         unsafe {
-            std::env::set_var("SB_TIME_SCALE", "50");
+            set_var("SB_TIME_SCALE", "50");
         }
 
         tracing_subscriber::fmt()
@@ -25,16 +25,46 @@ fn init_tracing() {
             .ok();
     });
 }
+use std::env::set_var;
+use std::env::temp_dir;
+use std::future::Future;
+use std::io::Result as IoResult;
+use std::mem::forget;
+use std::mem::take;
+use std::net::TcpListener;
+use std::process::id;
+use std::sync::Once;
+use std::sync::OnceLock;
+use std::sync::mpsc::channel;
+use std::thread::spawn;
 use std::time::Duration;
 
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::NodeConfig;
+use switchboard_server::ConnectionLimits;
+use switchboard_server::ProtocolConfig;
+use switchboard_server::protocols::BridgeContext;
+use switchboard_server::protocols::serve_client;
+use switchboard_server::protocols::shared::declare_queue;
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
+use tokio::io::split;
+use tokio::net::TcpListener as TokioTcpListener;
 use tokio::net::TcpStream;
+use tokio::runtime::Builder;
+use tokio::runtime::Runtime;
+use tokio::spawn as tokio_spawn;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// Grab a free TCP port.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -45,10 +75,9 @@ pub fn free_port() -> u16 {
 /// per test accumulates RocksDB/raft state that degrades later tests. The
 /// node runs on a dedicated runtime stored in this static and lives for
 /// the whole binary; tests are pure clients.
-static LAST_NODE: std::sync::OnceLock<Arc<switchboard_cluster::ClusterNode>> =
-    std::sync::OnceLock::new();
+static LAST_NODE: OnceLock<Arc<ClusterNode>> = OnceLock::new();
 
-static SHARED: std::sync::OnceLock<(tokio::runtime::Runtime, String)> = std::sync::OnceLock::new();
+static SHARED: OnceLock<(Runtime, String)> = OnceLock::new();
 
 /// The shared gateway's client address (starts the gateway on first use).
 /// Initialization happens on a dedicated thread because callers are inside
@@ -57,7 +86,7 @@ pub async fn shared_gateway() -> String {
     if let Some((rt, addr)) = SHARED.get() {
         // Health check: the accept loop must still answer. A dead runtime
         // returns EOF and the gateway is rebuilt once.
-        let probe = tokio::net::TcpStream::connect(addr).await;
+        let probe = TcpStream::connect(addr).await;
         match probe {
             Ok(_) => return addr.clone(),
             Err(_) => {
@@ -65,17 +94,16 @@ pub async fn shared_gateway() -> String {
             }
         }
     }
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+    let (tx, rx) = channel::<String>();
+    spawn(move || {
+        let rt = Builder::new_multi_thread()
             .enable_all()
             .worker_threads(6)
             .build()
             .unwrap();
-        let (addr, guard) =
-            rt.block_on(async { start_gateway(switchboard_server::ProtocolConfig::all()).await });
+        let (addr, guard) = rt.block_on(async { start_gateway(ProtocolConfig::all()).await });
         // The shared node lives for the whole binary.
-        std::mem::forget(guard);
+        forget(guard);
         let _ = SHARED.set((rt, addr.clone()));
         tx.send(addr).unwrap();
     });
@@ -85,7 +113,7 @@ pub async fn shared_gateway() -> String {
 /// Owns a test node and shuts its raft cores down on drop. Without this,
 /// every gateway test leaks a live broker (background loops hold their own
 /// `Arc`s), and after ~20 tests the zombie janitors starve new commits.
-pub struct NodeGuard(pub Arc<switchboard_cluster::ClusterNode>);
+pub struct NodeGuard(pub Arc<ClusterNode>);
 
 impl Drop for NodeGuard {
     fn drop(&mut self) {
@@ -94,14 +122,10 @@ impl Drop for NodeGuard {
         // shutdown future, leaving zombie RocksDB instances (whose C++
         // background threads keep compacting and starve later tests).
         let node = self.0.clone();
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        let _ = spawn(move || {
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async move {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await;
+                let _ = timeout(Duration::from_secs(10), node.shutdown()).await;
             });
         })
         .join();
@@ -110,24 +134,17 @@ impl Drop for NodeGuard {
 
 /// Start one bootstrap node and serve the FULL protocol gateway on the
 /// returned address. The returned guard shuts the node down when dropped.
-pub async fn start_gateway(protocols: switchboard_server::ProtocolConfig) -> (String, NodeGuard) {
+pub async fn start_gateway(protocols: ProtocolConfig) -> (String, NodeGuard) {
     start_gateway_tagged(protocols, "gw").await
 }
 
 /// Start a gateway with an explicit data-dir tag (for retry isolation).
-pub async fn start_gateway_tagged(
-    protocols: switchboard_server::ProtocolConfig,
-    tag: &str,
-) -> (String, NodeGuard) {
+pub async fn start_gateway_tagged(protocols: ProtocolConfig, tag: &str) -> (String, NodeGuard) {
     init_tracing();
     let internal = format!("127.0.0.1:{}", free_port());
     let client = format!("127.0.0.1:{}", free_port());
-    let dir = std::env::temp_dir().join(format!(
-        "switchboard-gw-{tag}-{}-{}",
-        std::process::id(),
-        free_port()
-    ));
-    let cfg = switchboard_cluster::NodeConfig {
+    let dir = temp_dir().join(format!("switchboard-gw-{tag}-{}-{}", id(), free_port()));
+    let cfg = NodeConfig {
         id: 1,
         data_dir: dir,
         client_addr: client.clone(),
@@ -137,16 +154,15 @@ pub async fn start_gateway_tagged(
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
-    let node: Arc<switchboard_cluster::ClusterNode> =
-        switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
+    let node: Arc<ClusterNode> = ClusterNode::start(cfg).await.unwrap();
     let _ = LAST_NODE.set(node.clone());
-    let listener = tokio::net::TcpListener::bind(&client).await.unwrap();
+    let listener = TokioTcpListener::bind(&client).await.unwrap();
     let node2 = node.clone();
-    tokio::spawn(async move {
+    tokio_spawn(async move {
         let node = node2;
         loop {
             let Ok((sock, _)) = listener.accept().await else {
@@ -154,11 +170,10 @@ pub async fn start_gateway_tagged(
             };
             let node2 = node.clone();
             let protocols = protocols.clone();
-            let mut limits = switchboard_server::ConnectionLimits::default();
+            let mut limits = ConnectionLimits::default();
             limits.peer_ip = sock.peer_addr().ok().map(|a| a.ip());
-            tokio::spawn(async move {
-                let _ = switchboard_server::protocols::serve_client(sock, node2, limits, protocols)
-                    .await;
+            tokio_spawn(async move {
+                let _ = serve_client(sock, node2, limits, protocols).await;
             });
         }
     });
@@ -171,11 +186,11 @@ pub async fn start_gateway_tagged(
         if !topo.vhosts.is_empty() && !topo.groups.is_empty() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
     for _ in 0..400 {
-        match switchboard_server::protocols::shared::declare_queue(
-            &switchboard_server::protocols::BridgeContext::create(node.clone(), "/".into()).await,
+        match declare_queue(
+            &BridgeContext::create(node.clone(), "/".into()).await,
             "gw-ready-probe",
             false,
             false,
@@ -184,7 +199,7 @@ pub async fn start_gateway_tagged(
         .await
         {
             Ok(_) => break,
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(_) => sleep(Duration::from_millis(50)).await,
         }
     }
     (client, NodeGuard(node))
@@ -283,7 +298,7 @@ pub fn mqtt_remaining(mut n: usize, out: &mut Vec<u8>) {
 }
 
 /// Read one MQTT packet: returns (type, body).
-pub async fn mqtt_read<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+pub async fn mqtt_read<R: AsyncRead + Unpin>(r: &mut R) -> IoResult<Option<(u8, Vec<u8>)>> {
     let mut b = [0u8; 1];
     let n = r.read(&mut b).await?;
     if n == 0 {
@@ -318,16 +333,14 @@ pub async fn ws_connect(addr: &str, path: &str, subprotocol: Option<&str>) -> Ws
     }
     req.push_str("\r\n");
     let sock = TcpStream::connect(addr).await.unwrap();
-    let (mut r, mut w) = tokio::io::split(sock);
+    let (mut r, mut w) = split(sock);
     w.write_all(req.as_bytes()).await.unwrap();
     w.flush().await.unwrap();
     // Read the 101 response head.
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     loop {
-        let n = tokio::io::AsyncReadExt::read(&mut r, &mut buf)
-            .await
-            .unwrap();
+        let n = AsyncReadExt::read(&mut r, &mut buf).await.unwrap();
         assert!(n > 0, "ws upgrade failed");
         head.extend_from_slice(&buf[..n]);
         if head.windows(4).any(|x| x == b"\r\n\r\n") {
@@ -349,8 +362,8 @@ pub async fn ws_connect(addr: &str, path: &str, subprotocol: Option<&str>) -> Ws
 }
 
 pub struct WsClient {
-    reader: tokio::io::ReadHalf<TcpStream>,
-    writer: tokio::io::WriteHalf<TcpStream>,
+    reader: ReadHalf<TcpStream>,
+    writer: WriteHalf<TcpStream>,
     leftover: Vec<u8>,
 }
 
@@ -377,7 +390,7 @@ impl WsClient {
     /// Read one unmasked data frame's payload.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         // Drain leftover first.
-        let mut raw = std::mem::take(&mut self.leftover);
+        let mut raw = take(&mut self.leftover);
         loop {
             if let Some((payload, used)) = try_parse_frame(&raw) {
                 raw.drain(..used);
@@ -430,8 +443,8 @@ fn try_parse_frame(raw: &[u8]) -> Option<(Vec<u8>, usize)> {
 pub fn basic_get_unused() {}
 
 /// Convenience: run a closure with a timeout (tests must not hang).
-pub async fn with_timeout<F: std::future::Future>(fut: F, secs: u64) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(secs), fut)
+pub async fn with_timeout<F: Future>(fut: F, secs: u64) -> F::Output {
+    timeout(Duration::from_secs(secs), fut)
         .await
         .expect("test timed out")
 }
@@ -439,7 +452,7 @@ pub async fn with_timeout<F: std::future::Future>(fut: F, secs: u64) -> F::Outpu
 /// Read until `pred` matches a line (for STOMP frames).
 pub async fn read_stomp_frame<R: AsyncRead + Unpin>(
     r: &mut R,
-) -> std::io::Result<Option<(String, Vec<u8>)>> {
+) -> IoResult<Option<(String, Vec<u8>)>> {
     let mut buf = Vec::new();
     let mut b = [0u8; 1];
     loop {
@@ -465,7 +478,7 @@ pub async fn read_stomp_frame<R: AsyncRead + Unpin>(
 /// the ack id of a client-individual MESSAGE).
 pub async fn read_stomp_frame_full<R: AsyncRead + Unpin>(
     r: &mut R,
-) -> std::io::Result<Option<(String, Vec<(String, String)>, Vec<u8>)>> {
+) -> IoResult<Option<(String, Vec<(String, String)>, Vec<u8>)>> {
     let mut buf = Vec::new();
     let mut b = [0u8; 1];
     loop {

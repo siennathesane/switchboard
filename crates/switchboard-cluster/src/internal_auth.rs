@@ -25,6 +25,7 @@
 //! deployments; the flag help says so).
 
 use aws_lc_rs::hmac;
+use bincode::serialize;
 
 use crate::proto::Envelope;
 use crate::proto::InternalMessage;
@@ -65,12 +66,13 @@ pub fn auth_frame(secret: &str) -> Vec<u8> {
         from: 0,
         message: InternalMessage::Request(InternalRequest::Auth { nonce, proof: tag }),
     };
-    bincode::serialize(&env).expect("auth envelope serializes")
+    serialize(&env).expect("auth envelope serializes")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::deserialize;
 
     #[test]
     fn proof_verifies_against_the_same_secret_and_nonce() {
@@ -108,7 +110,7 @@ mod tests {
             !frame.windows(secret.len()).any(|w| w == secret.as_bytes()),
             "secret must not cross the wire in cleartext"
         );
-        let env: Envelope = bincode::deserialize(&frame).unwrap();
+        let env: Envelope = deserialize(&frame).unwrap();
         match env.message {
             InternalMessage::Request(InternalRequest::Auth { nonce, proof: tag }) => {
                 assert_eq!(nonce.len(), NONCE_LEN);

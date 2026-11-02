@@ -31,12 +31,32 @@ pub mod report;
 pub mod workload;
 pub mod workload_idle;
 
+use std::future::pending;
+use std::process::id;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use tokio_util::sync::CancellationToken;
 
 use ledger::Ledger;
+use tokio::pin;
+use tokio::select;
+use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::signal;
+use tokio::spawn;
+use tokio::sync::Mutex;
+use tokio::sync::watch::Receiver;
+use tokio::sync::watch::Sender;
+use tokio::sync::watch::channel;
+use tokio::time::Instant as TokioInstant;
+use tokio::time::interval;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
+use tracing::debug;
 
 // ---------------------------------------------------------------------
 // Configuration
@@ -219,13 +239,13 @@ impl Default for SoakConfig {
 /// joins/leaves/elections with live sessions watching.
 #[derive(Clone)]
 pub struct LoadGate {
-    rx: Arc<tokio::sync::watch::Receiver<bool>>,
-    tx: Arc<tokio::sync::watch::Sender<bool>>,
+    rx: Arc<Receiver<bool>>,
+    tx: Arc<Sender<bool>>,
 }
 
 impl Default for LoadGate {
     fn default() -> Self {
-        let (tx, rx) = tokio::sync::watch::channel(true);
+        let (tx, rx) = channel(true);
         LoadGate {
             rx: Arc::new(rx),
             tx: Arc::new(tx),
@@ -240,9 +260,9 @@ impl LoadGate {
 
     pub async fn wait_open(&self, token: &CancellationToken) -> bool {
         while !self.open() {
-            tokio::select! {
+            select! {
                 _ = token.cancelled() => return false,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                _ = sleep(Duration::from_millis(200)) => {}
             }
         }
         true
@@ -267,8 +287,8 @@ pub struct Ctx {
     pub halt: CancellationToken,
     pub gate: LoadGate,
     pub endpoints: Arc<k8s::EndpointSet>,
-    pub started: std::time::Instant,
-    reconcilers: Arc<tokio::sync::Mutex<Vec<workload::Reconciler>>>,
+    pub started: Instant,
+    reconcilers: Arc<Mutex<Vec<workload::Reconciler>>>,
 }
 
 impl Ctx {
@@ -279,14 +299,14 @@ impl Ctx {
     /// Short per-process suffix for throwaway namespaces (topo churn,
     /// exclusive queues): unique across overlapping driver generations.
     pub fn run_suffix(&self) -> String {
-        static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static SUFFIX: OnceLock<String> = OnceLock::new();
         SUFFIX
             .get_or_init(|| {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                format!("{}{}", std::process::id(), nanos % 100_000)
+                format!("{}{}", id(), nanos % 100_000)
             })
             .clone()
     }
@@ -318,7 +338,7 @@ impl Ctx {
         if self.cfg.chaos {
             self.ledger.transition();
             self.ledger.metrics.add("bounce.transitions", 1);
-            tracing::debug!(workload, host, "{detail}");
+            debug!(workload, host, "{detail}");
         } else {
             self.error(workload, "connection", host, detail);
         }
@@ -350,7 +370,7 @@ pub struct SoakReport {
 /// Run the soak. Only returns at deadline, signal, or fatal setup
 /// failure — always with a report.
 pub async fn run(cfg: SoakConfig) -> SoakReport {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let token = CancellationToken::new();
     let gate = LoadGate::default();
     let mut notes = Vec::new();
@@ -363,8 +383,8 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
         halt: CancellationToken::new(),
         gate,
         endpoints: endpoints.clone(),
-        started: std::time::Instant::now(),
-        reconcilers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        started: Instant::now(),
+        reconcilers: Arc::new(Mutex::new(Vec::new())),
     });
 
     // ---- wait for the cluster to exist and converge ----
@@ -407,55 +427,54 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     let mut scaler_handle = None;
     if let ScaleMode::K8s { .. } = &cfg.scale {
         let scaler = k8s::Scaler::new(ctx.clone());
-        scaler_handle = Some(tokio::spawn(async move { scaler.run().await }));
+        scaler_handle = Some(spawn(async move { scaler.run().await }));
     }
 
     // ---- workloads + monitors ----
     let tasks = workload::spawn_all(&ctx);
     let proto_tasks = proto::spawn_all(&ctx);
     let monitor_task = if cfg.monitor {
-        Some(tokio::spawn(monitor::run(ctx.clone(), endpoints.clone())))
+        Some(spawn(monitor::run(ctx.clone(), endpoints.clone())))
     } else {
         None
     };
 
     // ---- run until deadline or signal ----
-    let deadline = tokio::time::Instant::now() + cfg.duration;
-    let report_every = tokio::time::interval(cfg.report_every);
-    tokio::pin!(report_every);
+    let deadline = TokioInstant::now() + cfg.duration;
+    let report_every = interval(cfg.report_every);
+    pin!(report_every);
     // Stop signals: SIGTERM/SIGINT where they are catchable (unix).
     // Windows cannot catch external termination, so there the deadline
     // (or an injected stop) ends the run.
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigterm = signal(SignalKind::terminate()).ok();
     #[cfg(unix)]
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    let mut sigint = signal(SignalKind::interrupt()).ok();
     let stop = async {
         #[cfg(unix)]
         {
-            tokio::select! {
+            select! {
                 _ = async {
                     match sigterm.as_mut() {
                         Some(s) => { s.recv().await; }
-                        None => std::future::pending::<()>().await,
+                        None => pending::<()>().await,
                     }
                 } => "SIGTERM",
                 _ = async {
                     match sigint.as_mut() {
                         Some(s) => { s.recv().await; }
-                        None => std::future::pending::<()>().await,
+                        None => pending::<()>().await,
                     }
                 } => "SIGINT",
             }
         }
         #[cfg(not(unix))]
-        std::future::pending::<&'static str>().await
+        pending::<&'static str>().await
     };
-    tokio::pin!(stop);
+    pin!(stop);
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
+        select! {
+            _ = sleep_until(deadline) => break,
             _ = report_every.tick() => report::status_line(&ctx).await,
             reason = &mut stop => { notes.push(reason.to_string()); break }
         }
@@ -491,7 +510,7 @@ pub async fn run(cfg: SoakConfig) -> SoakReport {
     finish(ctx, started, rep).await
 }
 
-async fn finish(ctx: Arc<Ctx>, started: std::time::Instant, mut rep: SoakReport) -> SoakReport {
+async fn finish(ctx: Arc<Ctx>, started: Instant, mut rep: SoakReport) -> SoakReport {
     rep.elapsed = started.elapsed();
     rep.errors = ctx.ledger.errors();
     rep.error_total = ctx.ledger.error_count();
@@ -508,7 +527,7 @@ async fn finish(ctx: Arc<Ctx>, started: std::time::Instant, mut rep: SoakReport)
 /// and a confirmed canary round-trip works. New pods appearing later
 /// are the scaler's problem.
 async fn wait_cluster_ready(ctx: &Arc<Ctx>) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let deadline = TokioInstant::now() + Duration::from_secs(180);
     loop {
         let hosts = ctx.endpoints.snapshot().await;
         if !hosts.is_empty() {
@@ -522,15 +541,15 @@ async fn wait_cluster_ready(ctx: &Arc<Ctx>) -> Result<(), String> {
                 return Ok(());
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if TokioInstant::now() >= deadline {
             return Err(format!(
                 "cluster did not converge within 180s ({} endpoint(s) seen)",
                 hosts.len()
             ));
         }
-        tokio::select! {
+        select! {
             _ = ctx.token.cancelled() => return Err("cancelled".into()),
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = sleep(Duration::from_millis(500)) => {}
         }
     }
 }

@@ -32,7 +32,13 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use switchboard_core::tempo::scale;
 use switchboard_core::topology::GroupId;
+use tokio::select;
+use tokio::spawn;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::Instant;
+use tokio::time::interval;
 
 use crate::node::ClusterNode;
 use crate::node::META_GROUP;
@@ -61,7 +67,7 @@ impl Default for DiscoveryConfig {
             dns_srv_domains: Vec::new(),
             mdns: false,
             mdns_instance: None,
-            interval: switchboard_core::tempo::scale(Duration::from_secs(30)),
+            interval: scale(Duration::from_secs(30)),
         }
     }
 }
@@ -91,7 +97,7 @@ pub async fn run(
     );
 
     // mDNS: advertise self and browse.
-    let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::unbounded_channel::<DiscoveredPeer>();
+    let (mdns_tx, mut mdns_rx) = unbounded_channel::<DiscoveredPeer>();
     let _mdns_daemon = if cfg.mdns {
         match mdns::spawn(&node, &cfg, mdns_tx.clone()) {
             Ok(daemon) => Some(daemon),
@@ -106,22 +112,22 @@ pub async fn run(
     drop(mdns_tx);
 
     // addr → last attempt instant, for per-address backoff.
-    let mut tried: HashMap<String, tokio::time::Instant> = HashMap::new();
-    let mut tick = tokio::time::interval(if cfg.interval.is_zero() {
-        switchboard_core::tempo::scale(Duration::from_secs(30))
+    let mut tried: HashMap<String, Instant> = HashMap::new();
+    let mut tick = interval(if cfg.interval.is_zero() {
+        scale(Duration::from_secs(30))
     } else {
         cfg.interval
     });
 
     loop {
-        tokio::select! {
+        select! {
             _ = shutdown.changed() => break,
             Some(peer) = mdns_rx.recv() => {
                 consider(
                     &node,
                     &mut tried,
                     peer,
-                    switchboard_core::tempo::scale((cfg.interval / 3).max(Duration::from_secs(1))),
+                    scale((cfg.interval / 3).max(Duration::from_secs(1))),
                 );
             }
             _ = tick.tick() => {}
@@ -139,7 +145,7 @@ pub async fn run(
                                 internal_addr: addr,
                                 node_id: None,
                             },
-                            switchboard_core::tempo::scale(Duration::from_secs(30)),
+                            scale(Duration::from_secs(30)),
                         );
                     }
                 }
@@ -158,7 +164,7 @@ pub async fn run(
                                 internal_addr: addr,
                                 node_id: None,
                             },
-                            switchboard_core::tempo::scale(Duration::from_secs(30)),
+                            scale(Duration::from_secs(30)),
                         );
                     }
                 }
@@ -172,7 +178,7 @@ pub async fn run(
 /// still inside its per-address backoff window.
 fn consider(
     node: &Arc<ClusterNode>,
-    tried: &mut HashMap<String, tokio::time::Instant>,
+    tried: &mut HashMap<String, Instant>,
     peer: DiscoveredPeer,
     backoff: Duration,
 ) {
@@ -206,7 +212,7 @@ fn consider(
     {
         return;
     }
-    let now = tokio::time::Instant::now();
+    let now = Instant::now();
     if let Some(last) = tried.get(&addr) {
         if now - *last < backoff {
             return;
@@ -214,7 +220,7 @@ fn consider(
     }
     tried.insert(addr.clone(), now);
     let node = node.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         match node.introduce(&addr).await {
             Ok(()) => info!(addr = %addr, "introduced to discovered peer"),
             Err(e) => debug!(addr = %addr, err = ?e, "introduction deferred"),
@@ -253,30 +259,35 @@ mod tests {
 #[cfg(test)]
 mod unit {
     use super::*;
+    use crate::ClusterNode;
+    use crate::META_GROUP;
+    use crate::NodeConfig;
+    use crate::net::Directory;
     use std::collections::HashMap;
+    use std::env::temp_dir;
+    use std::net::TcpListener;
+    use std::process::id;
+    use std::thread::sleep;
+    use std::time::Instant;
+    use switchboard_wire::constants::DEFAULT_PASSWORD;
+    use switchboard_wire::constants::DEFAULT_USER;
+    use tokio::runtime::Builder;
 
     #[test]
     fn hosted_groups_excludes_the_meta_group() {
         // A real single-node cluster: meta (0) hosted plus shard groups.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = Builder::new_multi_thread().enable_all().build().unwrap();
         let node = rt.block_on(async {
             let port = || {
-                std::net::TcpListener::bind("127.0.0.1:0")
+                TcpListener::bind("127.0.0.1:0")
                     .unwrap()
                     .local_addr()
                     .unwrap()
                     .port()
             };
-            let cfg = crate::NodeConfig {
+            let cfg = NodeConfig {
                 id: 1,
-                data_dir: std::env::temp_dir().join(format!(
-                    "sb-disc-u-{}-{}",
-                    std::process::id(),
-                    port()
-                )),
+                data_dir: temp_dir().join(format!("sb-disc-u-{}-{}", id(), port())),
                 client_addr: format!("127.0.0.1:{}", port()),
                 internal_addr: format!("127.0.0.1:{}", port()),
                 seeds: vec![],
@@ -284,11 +295,11 @@ mod unit {
                 expected_nodes: 1,
                 peers: vec![],
                 timeouts: Default::default(),
-                bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-                bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+                bootstrap_user: DEFAULT_USER.into(),
+                bootstrap_password: DEFAULT_PASSWORD.into(),
                 internal_auth_secret: None,
             };
-            crate::ClusterNode::start(cfg).await.unwrap()
+            ClusterNode::start(cfg).await.unwrap()
         });
         // The controller installs the shard layout on a background tick.
         let mut groups = Vec::new();
@@ -297,9 +308,9 @@ mod unit {
             if !groups.is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            sleep(Duration::from_millis(200));
         }
-        assert!(!groups.contains(&crate::META_GROUP));
+        assert!(!groups.contains(&META_GROUP));
         assert!(!groups.is_empty(), "shard groups must be listed");
     }
 
@@ -308,10 +319,10 @@ mod unit {
         // The `consider` gate is address-driven: a peer whose address
         // normalizes to ours is skipped, as is one already under
         // backoff. Direct calls keep the map in the test.
-        let dir = crate::net::Directory::new();
+        let dir = Directory::new();
         let _ = dir; // directory-independent logic
-        let mut tried: HashMap<String, std::time::Instant> = HashMap::new();
-        let now = std::time::Instant::now();
+        let mut tried: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
         tried.insert("127.0.0.1:9".to_string(), now);
 
         // Backoff honored: nothing in this test can observe the skip

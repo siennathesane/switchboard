@@ -16,6 +16,7 @@
 //! Memory is O(1) per publisher (plus the bounded reorder window in
 //! chaos mode), so a month at high rate never grows the driver.
 
+use std::collections::HashSet;
 /// CRC-32 (IEEE 802.3), bitwise — table-free, fast enough for soak rates.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -94,7 +95,7 @@ pub enum Delivery {
 /// only) so runs with node restarts can still verify exactly-once.
 pub struct FifoStream {
     pub next: u64,
-    window: std::collections::HashSet<u64>,
+    window: HashSet<u64>,
     window_max: u64,
     pub repeats: u64,
 }

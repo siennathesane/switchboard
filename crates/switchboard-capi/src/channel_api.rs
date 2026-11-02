@@ -3,6 +3,8 @@
 
 use std::ffi::c_char;
 use std::ffi::c_int;
+use std::mem::zeroed;
+use std::sync::Mutex;
 
 use switchboard_embedded::ConsumeOptions;
 use switchboard_embedded::ExchangeDeleteOptions;
@@ -12,6 +14,7 @@ use switchboard_embedded::MessageProperties;
 use switchboard_embedded::QueueDeleteOptions;
 use switchboard_embedded::QueueOptions;
 
+use crate::consumer_api::SbConsumer;
 use crate::handles::SbChannel;
 use crate::handles::as_channel;
 use crate::map::op_status;
@@ -485,7 +488,7 @@ pub extern "C" fn sb_channel_get(
         }
         // Zero the out-struct FIRST: on any failure below the caller may
         // still sb_message_free it (a documented no-op on a zeroed struct).
-        unsafe { *out = std::mem::zeroed() };
+        unsafe { *out = zeroed() };
         unsafe { *out_has_message = 0 };
         let ch = as_channel(channel)?;
         let queue = unsafe { cstr("queue", queue)? };
@@ -499,7 +502,7 @@ pub extern "C" fn sb_channel_get(
                 unsafe { *out_has_message = 1 };
             }
             None => {
-                unsafe { *out = std::mem::zeroed() };
+                unsafe { *out = zeroed() };
                 unsafe { *out_has_message = 0 };
             }
         }
@@ -622,7 +625,7 @@ pub extern "C" fn sb_channel_consume(
     consumer_tag: *const c_char,
     no_ack: c_int,
     exclusive: c_int,
-    out: *mut *mut crate::consumer_api::SbConsumer,
+    out: *mut *mut SbConsumer,
 ) -> SbStatus {
     entry_status(|| {
         if out.is_null() {
@@ -639,10 +642,10 @@ pub extern "C" fn sb_channel_consume(
             .rt
             .block_on(ch.channel.consume(&queue, &opts))
             .map_err(op_status)?;
-        let boxed = Box::new(crate::consumer_api::SbConsumer {
+        let boxed = Box::new(SbConsumer {
             rt: ch.rt.clone(),
             tag: consumer.tag.clone(),
-            consumer: std::sync::Mutex::new(Some(consumer)),
+            consumer: Mutex::new(Some(consumer)),
         });
         let ptr = Box::into_raw(boxed);
         let broker_addr = table::owner_of(channel as usize).unwrap_or(channel as usize);

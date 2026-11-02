@@ -2,6 +2,7 @@
 //! verdict (human summary + machine JSON after `=== SOAK RESULTS ===`).
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
@@ -34,9 +35,9 @@ impl Check {
 
 /// Per-counter previous values for rate computation between status
 /// lines.
-fn prev() -> &'static std::sync::Mutex<HashMap<String, (u64, Instant)>> {
-    static P: OnceLock<std::sync::Mutex<HashMap<String, (u64, Instant)>>> = OnceLock::new();
-    P.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn prev() -> &'static Mutex<HashMap<String, (u64, Instant)>> {
+    static P: OnceLock<Mutex<HashMap<String, (u64, Instant)>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn rate_of(snapshot: &[(String, u64)], name: &str) -> Option<f64> {

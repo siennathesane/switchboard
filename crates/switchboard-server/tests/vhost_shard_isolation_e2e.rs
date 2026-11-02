@@ -4,16 +4,19 @@
 
 mod support;
 
+use std::sync::Arc;
 use support::TestClient;
 use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::META_GROUP;
 use switchboard_core::topology::MetaCmd;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::BasicProperties;
 
 /// Create a vhost through the meta write path (what the admin API does).
-async fn create_vhost(node: &std::sync::Arc<switchboard_cluster::ClusterNode>, name: &str) {
+async fn create_vhost(node: &Arc<ClusterNode>, name: &str) {
     node.write(
-        switchboard_cluster::META_GROUP,
+        META_GROUP,
         BrokerCommand::Meta(MetaCmd::DeclareVhost {
             name: name.to_string(),
         }),

@@ -9,12 +9,21 @@
 //! removed channel number is a connection-level 504,
 //! session/mod.rs:670-671).
 
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::io::Error;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use switchboard_wire::method::Method;
 
+use crate::consumer::Consumer;
 use crate::driver::ChannelShared;
+use crate::driver::PublishOutcomeReply;
 use crate::driver::call;
+use crate::driver::frame_bytes;
 use crate::driver::publish_bytes;
 use crate::driver::send_bytes;
 use crate::error::OpError;
@@ -234,6 +243,10 @@ impl ConsumeOptions {
 /// Headers. The AMQP content format is the durable contract, so this wire
 /// data type is safe to expose (embedded design §3 stability rules).
 pub use switchboard_core::model::ExchangeKind;
+use switchboard_core::tempo::scale;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot::channel;
+use tokio::time::timeout;
 
 /// Cloneable per-channel handle. All ops are async and typed.
 ///
@@ -467,11 +480,7 @@ impl EmbeddedChannel {
         // advances the server's per-channel confirm sequence
         // (methods/mod.rs:143-153), so the client's counter must advance
         // too or confirmed publishes would mis-correlate.
-        if self
-            .shared
-            .confirm_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.shared.confirm_active.load(Ordering::SeqCst) {
             *self.shared.confirm_next.lock().unwrap() += 1;
         }
         let bytes = publish_bytes(&self.shared, exchange, routing_key, false, props, &body);
@@ -495,7 +504,7 @@ impl EmbeddedChannel {
     ) -> Result<PublishOutcome, OpError> {
         let _guard = self.shared.publish_lock.lock().await;
         self.shared.ensure_usable()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = channel();
         self.shared
             .conn
             .mandatory_returns
@@ -519,13 +528,8 @@ impl EmbeddedChannel {
             }
             return Err(e);
         }
-        match tokio::time::timeout(
-            switchboard_core::tempo::scale(std::time::Duration::from_secs(2)),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(Ok(crate::driver::PublishOutcomeReply::Returned { code, text }))) => {
+        match timeout(scale(Duration::from_secs(2)), rx).await {
+            Ok(Ok(Ok(PublishOutcomeReply::Returned { code, text }))) => {
                 Ok(PublishOutcome::Returned { code, text })
             }
             _ => Ok(PublishOutcome::Routed),
@@ -554,16 +558,10 @@ impl EmbeddedChannel {
         body: Vec<u8>,
     ) -> Result<ConfirmOutcome, OpError> {
         let _guard = self.shared.publish_lock.lock().await;
-        if !self
-            .shared
-            .confirm_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !self.shared.confirm_active.load(Ordering::SeqCst) {
             self.expect_ok(Method::ConfirmSelect { nowait: false })
                 .await?;
-            self.shared
-                .confirm_active
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.shared.confirm_active.store(true, Ordering::SeqCst);
             *self.shared.confirm_next.lock().unwrap() = 0;
         }
         let seq = {
@@ -571,7 +569,7 @@ impl EmbeddedChannel {
             *next += 1;
             *next
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = channel();
         self.shared.confirm_waiters.lock().unwrap().insert(seq, tx);
         let bytes = publish_bytes(&self.shared, exchange, routing_key, true, props, &body);
         if let Err(e) = send_bytes(&self.shared, bytes) {
@@ -580,9 +578,7 @@ impl EmbeddedChannel {
         }
         match rx.await {
             Ok(reply) => reply,
-            Err(_) => Err(OpError::Io(std::io::Error::other(
-                "connection driver is gone",
-            ))),
+            Err(_) => Err(OpError::Io(Error::other("connection driver is gone"))),
         }
     }
 
@@ -592,14 +588,8 @@ impl EmbeddedChannel {
         let _guard = self.shared.publish_lock.lock().await;
         self.expect_ok(Method::ConfirmSelect { nowait: false })
             .await?;
-        if !self
-            .shared
-            .confirm_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.shared
-                .confirm_active
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.shared.confirm_active.load(Ordering::SeqCst) {
+            self.shared.confirm_active.store(true, Ordering::SeqCst);
             *self.shared.confirm_next.lock().unwrap() = 0;
         }
         Ok(())
@@ -642,9 +632,9 @@ impl EmbeddedChannel {
                 properties,
                 body,
             })),
-            (Method::BasicGetOk { .. }, None) => Err(OpError::Io(std::io::Error::other(
-                "Get-Ok arrived without content",
-            ))),
+            (Method::BasicGetOk { .. }, None) => {
+                Err(OpError::Io(Error::other("Get-Ok arrived without content")))
+            }
             (Method::BasicGetEmpty { .. }, _) => Ok(None),
             (other, _) => Err(unexpected_reply(&other)),
         }
@@ -675,7 +665,7 @@ impl EmbeddedChannel {
     fn send_ack(&self, delivery_tag: u64, multiple: bool) -> Result<(), OpError> {
         send_bytes(
             &self.shared,
-            crate::driver::frame_bytes(
+            frame_bytes(
                 self.shared.id,
                 &Method::BasicAck {
                     delivery_tag,
@@ -688,7 +678,7 @@ impl EmbeddedChannel {
     fn send_nack(&self, delivery_tag: u64, multiple: bool, requeue: bool) -> Result<(), OpError> {
         send_bytes(
             &self.shared,
-            crate::driver::frame_bytes(
+            frame_bytes(
                 self.shared.id,
                 &Method::BasicNack {
                     delivery_tag,
@@ -720,12 +710,8 @@ impl EmbeddedChannel {
     /// [`Consumer`]. Server-side cancellation (queue deletion) surfaces as
     /// [`Consumer::next`] returning `None`
     /// (methods/consume.rs:257-269).
-    pub async fn consume(
-        &self,
-        queue: &str,
-        opts: &ConsumeOptions,
-    ) -> Result<crate::consumer::Consumer, OpError> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    pub async fn consume(&self, queue: &str, opts: &ConsumeOptions) -> Result<Consumer, OpError> {
+        let (tx, rx) = unbounded_channel();
         let requested = opts.consumer_tag.clone();
         // Pre-register a client-chosen tag; a server-generated tag is
         // registered when the Consume-Ok names it (deliveries can never
@@ -770,7 +756,7 @@ impl EmbeddedChannel {
                 for d in buffered {
                     let _ = tx.send(d);
                 }
-                Ok(crate::consumer::Consumer::new(tag, rx, self.shared.clone()))
+                Ok(Consumer::new(tag, rx, self.shared.clone()))
             }
             Ok((other, _)) => Err(unexpected_reply(&other)),
             Err(e) => Err(e),
@@ -863,20 +849,17 @@ impl EmbeddedChannel {
 }
 
 fn unexpected_reply(m: &Method) -> OpError {
-    OpError::Io(std::io::Error::other(format!(
+    OpError::Io(Error::other(format!(
         "unexpected reply {} to a client call",
         m.name()
     )))
 }
 
-impl std::fmt::Debug for EmbeddedChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for EmbeddedChannel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("EmbeddedChannel")
             .field("id", &self.shared.id)
-            .field(
-                "open",
-                &self.shared.valid.load(std::sync::atomic::Ordering::Relaxed),
-            )
+            .field("open", &self.shared.valid.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }

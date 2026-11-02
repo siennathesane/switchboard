@@ -9,10 +9,14 @@ use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
 
+use std::time::Duration;
 use support::TestClient;
 use support::connect_and_open;
 use support::publish;
 use support::start_broker;
+use switchboard_wire::field::FieldValue;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 async fn declare(c: &mut TestClient, queue: &str, durable: bool, passive: bool) -> Method {
     c.send_method(
@@ -358,12 +362,9 @@ async fn nack_with_requeue_redelivers() {
     .unwrap();
 
     // The message comes back as redelivered.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "nacked message never returned"
-        );
+        assert!(Instant::now() < deadline, "nacked message never returned");
         c.send_method(
             1,
             &Method::BasicGet {
@@ -380,7 +381,7 @@ async fn nack_with_requeue_redelivers() {
                 return;
             }
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -420,10 +421,10 @@ async fn recover_requeues_unacked_messages() {
         Method::BasicRecoverOk { .. }
     ));
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "recovered message never returned"
         );
         c.send_method(
@@ -442,7 +443,7 @@ async fn recover_requeues_unacked_messages() {
                 return;
             }
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -564,13 +565,10 @@ async fn message_ttl_expires_and_dlq_routes() {
 
     // Main queue with a 200ms message TTL routed to the DLX.
     let mut args = FieldTable::new();
-    args.insert(
-        "x-message-ttl",
-        switchboard_wire::field::FieldValue::SignedLongLong(200),
-    );
+    args.insert("x-message-ttl", FieldValue::SignedLongLong(200));
     args.insert(
         "x-dead-letter-exchange",
-        switchboard_wire::field::FieldValue::LongString(b"dlx".to_vec()),
+        FieldValue::LongString(b"dlx".to_vec()),
     );
     declare_with_args(&mut c, "ttlq", args).await;
 
@@ -603,13 +601,13 @@ async fn message_ttl_expires_and_dlq_routes() {
     ));
 
     // Expired: the janitor sweep (1 s period) dead-letters it to the DLQ.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "expired message never reached the DLQ"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
         c.send_method(
             1,
             &Method::BasicGet {
@@ -669,7 +667,7 @@ async fn nack_without_requeue_dead_letters() {
     let mut args = FieldTable::new();
     args.insert(
         "x-dead-letter-exchange",
-        switchboard_wire::field::FieldValue::LongString(b"dlx".to_vec()),
+        FieldValue::LongString(b"dlx".to_vec()),
     );
     declare_with_args(&mut c, "work", args).await;
 
@@ -710,12 +708,9 @@ async fn nack_without_requeue_dead_letters() {
     .await
     .unwrap();
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "message never reached the DLQ"
-        );
+        assert!(Instant::now() < deadline, "message never reached the DLQ");
         c.send_method(
             1,
             &Method::BasicGet {
@@ -729,7 +724,7 @@ async fn nack_without_requeue_dead_letters() {
         match c.expect(1).await.unwrap() {
             Method::BasicGetOk { .. } => return,
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }

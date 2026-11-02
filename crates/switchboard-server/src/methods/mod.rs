@@ -12,11 +12,15 @@
 //! trouble becomes a 506.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::ClusterError;
 use switchboard_cluster::ClusterNode;
+use switchboard_cluster::META_GROUP;
 use switchboard_core::error::BrokerError;
 use switchboard_core::model::ExchangeKind;
+use switchboard_core::model::generate_queue_name;
 use switchboard_core::shard::ShardCmd;
 use switchboard_core::shard::ShardReply;
 use switchboard_core::topology::GroupId;
@@ -24,9 +28,13 @@ use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
 use switchboard_core::topology::Perm;
 use switchboard_wire::method::Method;
+use tokio::time::sleep;
+use tracing::debug;
 
 use crate::channel::Channel;
 use crate::channel::ChannelResult;
+use crate::channel::ConfirmState;
+use crate::channel::TxState;
 use crate::outbound::OutboundFrame;
 
 /// Convert a cluster error into the closest broker exception: broker-level
@@ -36,9 +44,9 @@ mod publish;
 mod queue;
 mod tx;
 
-fn ce(e: switchboard_cluster::ClusterError) -> BrokerError {
+fn ce(e: ClusterError) -> BrokerError {
     match e {
-        switchboard_cluster::ClusterError::Broker(b) => b,
+        ClusterError::Broker(b) => b,
         other => BrokerError::resource_error(other.to_string()).channel_level(),
     }
 }
@@ -53,7 +61,7 @@ async fn shard_call(
         .write(shard, BrokerCommand::Shard(cmd))
         .await
         .map_err(ce)?;
-    tracing::debug!(node = node.id, shard, reply = ?reply, "shard_call");
+    debug!(node = node.id, shard, reply = ?reply, "shard_call");
     Channel::shard_reply(reply)
 }
 
@@ -64,7 +72,7 @@ async fn shard_call(
 pub(crate) fn authorize_ch(
     ch: &Channel,
     node: &Arc<ClusterNode>,
-    perm: switchboard_core::topology::Perm,
+    perm: Perm,
     resource: &str,
 ) -> ChannelResult<()> {
     let inner = ch.inner.lock().unwrap();
@@ -98,7 +106,7 @@ async fn shard_call_lenient(
     for attempt in 0..TRIES {
         match shard_call(node, shard, cmd.clone()).await {
             Err(e) if e.code == 404 && e.text.contains("on this shard") && attempt + 1 < TRIES => {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(25)).await;
             }
             other => return other,
         }
@@ -112,7 +120,7 @@ async fn shard_call_lenient(
 /// reconciliation tick.
 async fn meta_call(node: &Arc<ClusterNode>, cmd: MetaCmd) -> ChannelResult<MetaReply> {
     let reply = node
-        .write(switchboard_cluster::META_GROUP, BrokerCommand::Meta(cmd))
+        .write(META_GROUP, BrokerCommand::Meta(cmd))
         .await
         .map_err(ce)?;
     let out = Channel::meta_reply(reply)?;
@@ -361,7 +369,7 @@ impl Channel {
                 ..
             } => {
                 let name = if queue.is_empty() {
-                    switchboard_core::model::generate_queue_name()
+                    generate_queue_name()
                 } else {
                     queue
                 };
@@ -495,7 +503,7 @@ impl Channel {
                 {
                     let mut inner = self.inner.lock().unwrap();
                     if inner.tx.is_none() {
-                        inner.tx = Some(crate::channel::TxState::default());
+                        inner.tx = Some(TxState::default());
                     }
                 }
                 self.reply(Method::TxSelectOk {});
@@ -532,7 +540,7 @@ impl Channel {
                     .for_method(85, 10));
                 }
                 if inner.confirm.is_none() {
-                    inner.confirm = Some(crate::channel::ConfirmState::default());
+                    inner.confirm = Some(ConfirmState::default());
                 }
                 reply_method(self, Method::ConfirmSelectOk {});
                 Ok(())

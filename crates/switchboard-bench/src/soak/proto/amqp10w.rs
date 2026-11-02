@@ -19,6 +19,15 @@ use tokio::net::TcpStream;
 
 use switchboard_server::protocols::amqp10::frames;
 use switchboard_server::protocols::amqp10::types::Value;
+use switchboard_server::protocols::amqp10::types::encode;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 use crate::soak::Ctx;
 use crate::soak::check;
@@ -28,8 +37,8 @@ use crate::soak::pacer::Pacer;
 const HEADER: &[u8; 8] = b"AMQP\0\x01\0\0";
 
 struct A10Conn {
-    r: tokio::net::tcp::OwnedReadHalf,
-    w: tokio::net::tcp::OwnedWriteHalf,
+    r: OwnedReadHalf,
+    w: OwnedWriteHalf,
     host: String,
 }
 
@@ -66,19 +75,19 @@ fn data_section(body: &[u8]) -> Vec<u8> {
         Box::new(Value::Binary(body.to_vec())),
     );
     let mut out = Vec::new();
-    switchboard_server::protocols::amqp10::types::encode(&v, &mut out);
+    encode(&v, &mut out);
     out
 }
 
 async fn read_frame(
     r: &mut (impl AsyncReadExt + Unpin),
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 ) -> Result<(u8, u16, Option<u64>, Vec<u8>), String> {
     // (frame_type, channel, code, payload)
     let mut hdr = [0u8; 8];
-    tokio::select! {
+    select! {
         x = r.read_exact(&mut hdr) => { x.map_err(|e| e.to_string())?; }
-        _ = tokio::time::sleep_until(deadline) => return Err("amqp10 read deadline".into()),
+        _ = sleep_until(deadline) => return Err("amqp10 read deadline".into()),
     }
     let size = u32::from_be_bytes(hdr[0..4].try_into().unwrap()) as usize;
     if size < 8 || size > 4 * 1024 * 1024 {
@@ -92,9 +101,9 @@ async fn read_frame(
     let channel = u16::from_be_bytes(hdr[6..8].try_into().unwrap());
     let mut payload = vec![0u8; size - doff];
     if !payload.is_empty() {
-        tokio::select! {
+        select! {
             x = r.read_exact(&mut payload) => { x.map_err(|e| e.to_string())?; }
-            _ = tokio::time::sleep_until(deadline) => return Err("amqp10 read deadline (body)".into()),
+            _ = sleep_until(deadline) => return Err("amqp10 read deadline (body)".into()),
         }
     }
     // payload begins with the performative; decode its code (first
@@ -119,14 +128,14 @@ async fn dial(ctx: &Arc<Ctx>, workload: &str) -> Option<A10Conn> {
         }
         let Some(host) = ctx.endpoints.random().await else {
             ctx.infra_bounce(workload, "-", "no endpoints for amqp10".into());
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             continue;
         };
         match raw_dial(&host).await {
             Ok(c) => return Some(c),
             Err(e) => {
                 ctx.infra_bounce(workload, &host, format!("amqp10 connect failed: {e}"));
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -137,7 +146,7 @@ async fn raw_dial(host: &str) -> Result<A10Conn, String> {
     s.set_nodelay(true).ok();
     let (mut r, mut w) = s.into_split();
     w.write_all(HEADER).await.map_err(|e| e.to_string())?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     // Server offers SASL mechanisms; we proceed without SASL (guest).
     let (ft, _ch, code, _) = read_frame(&mut r, deadline).await?;
     if ft != frames::FRAME_TYPE_SASL || code != Some(frames::codes::SASL_MECHANISMS) {
@@ -188,7 +197,7 @@ pub async fn run(ctx: Arc<Ctx>) {
         let Some(mut c) = dial(&ctx, "amqp10").await else {
             return;
         };
-        let deadline0 = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline0 = Instant::now() + Duration::from_secs(10);
         // Receiver link (unsettled) with credit, and sender link
         // (settled), both onto the same queue.
         if c.send(&attach_receiver_unsettled(
@@ -243,7 +252,7 @@ pub async fn run(ctx: Arc<Ctx>) {
         }
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.halt.cancelled() => {
                         let _ = c.send(&frames::close()).await;
                         return;
@@ -253,7 +262,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                 if !client::consuming(&ctx) {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(200)).await;
                 continue;
             }
             pacer.wait().await;
@@ -268,7 +277,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                 continue 'conn;
             }
             // Read until our delivery comes back on handle 0.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut got = false;
             // Link credit decays per delivered transfer; top it up or
             // the broker silently stops delivering after the initial
@@ -356,7 +365,7 @@ fn payload_marker(body: &[u8]) -> Vec<u8> {
         Box::new(Value::ULong(frames::codes::SECTION_DATA)),
         Box::new(Value::Binary(body.to_vec())),
     );
-    switchboard_server::protocols::amqp10::types::encode(&v, &mut out);
+    encode(&v, &mut out);
     out
 }
 
@@ -364,10 +373,10 @@ fn contains_slice(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len().max(1)).any(|w| w == needle)
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     if ctx.cfg.rates.amqp10 > 0.0 {
-        v.push(tokio::spawn(run(ctx.clone())));
+        v.push(spawn(run(ctx.clone())));
     }
     v
 }

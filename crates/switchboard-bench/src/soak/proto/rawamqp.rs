@@ -6,12 +6,14 @@
 //! a return; a mandatory publish that does NOT route must come back as
 //! `basic.return` carrying the exact body, *and still be confirmed*.
 
+use std::mem::take;
 use std::sync::Arc;
 use std::time::Duration;
 
 use switchboard_wire::BasicProperties;
 use switchboard_wire::Frame;
 use switchboard_wire::FrameReader;
+use switchboard_wire::FrameType;
 use switchboard_wire::PROTOCOL_HEADER;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
@@ -19,14 +21,22 @@ use switchboard_wire::properties::ContentHeader;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
 
 struct RawConn {
-    r: tokio::net::tcp::OwnedReadHalf,
-    w: tokio::net::tcp::OwnedWriteHalf,
+    r: OwnedReadHalf,
+    w: OwnedWriteHalf,
     host: String,
     reader: FrameReader,
 }
@@ -38,14 +48,14 @@ async fn dial(ctx: &Arc<Ctx>, workload: &str) -> Option<RawConn> {
         }
         let Some(host) = ctx.endpoints.random().await else {
             ctx.infra_bounce(workload, "-", "no endpoints for mandatory".into());
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             continue;
         };
         match raw_dial(&host).await {
             Ok(c) => return Some(c),
             Err(e) => {
                 ctx.infra_bounce(workload, &host, format!("raw connect failed: {e}"));
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -146,17 +156,16 @@ impl RawConn {
         let mut pending: Option<ContentHeader> = None;
         let mut body = Vec::new();
         let mut content_for: Option<Method> = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match self.reader.next_frame(0) {
                 Ok(Some(frame)) => match frame.frame_type {
-                    switchboard_wire::FrameType::Method => {
+                    FrameType::Method => {
                         let m = frame
                             .decode_method()
                             .map_err(|e| format!("bad method: {e}"))?;
                         if let Some(m) = content_for.take() {
-                            let content =
-                                pending.map(|h| (h.properties, std::mem::take(&mut body)));
+                            let content = pending.map(|h| (h.properties, take(&mut body)));
                             return Ok((m, content));
                         }
                         if m.carries_content() {
@@ -165,7 +174,7 @@ impl RawConn {
                         }
                         return Ok((m, None));
                     }
-                    switchboard_wire::FrameType::Header => {
+                    FrameType::Header => {
                         let h = frame
                             .content_header(60)
                             .map_err(|e| format!("bad header: {e}"))?;
@@ -175,23 +184,23 @@ impl RawConn {
                         }
                         pending = Some(h);
                     }
-                    switchboard_wire::FrameType::Body => {
+                    FrameType::Body => {
                         body.extend_from_slice(&frame.payload);
                         if let Some(h) = &pending {
                             if body.len() as u64 >= h.body_size {
                                 let m = content_for.take().ok_or("body without method")?;
                                 let props = h.properties.clone();
-                                return Ok((m, Some((props, std::mem::take(&mut body)))));
+                                return Ok((m, Some((props, take(&mut body)))));
                             }
                         }
                     }
-                    switchboard_wire::FrameType::Heartbeat => continue,
+                    FrameType::Heartbeat => continue,
                 },
                 Ok(None) => {
                     let mut buf = [0u8; 8192];
-                    let n = tokio::select! {
+                    let n = select! {
                         x = self.r.read(&mut buf) => x.map_err(|e| e.to_string())?,
-                        _ = tokio::time::sleep_until(deadline) => return Err("raw read deadline".into()),
+                        _ = sleep_until(deadline) => return Err("raw read deadline".into()),
                     };
                     if n == 0 {
                         return Err("connection closed".into());
@@ -255,7 +264,7 @@ pub async fn run(ctx: Arc<Ctx>) {
         };
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
@@ -264,9 +273,9 @@ pub async fn run(ctx: Arc<Ctx>) {
                 }
                 continue;
             }
-            tokio::select! {
+            select! {
                 _ = ctx.token.cancelled() => return,
-                _ = tokio::time::sleep(period) => {}
+                _ = sleep(period) => {}
             }
             n += 1;
             // 1. Routable mandatory publish: confirm only, no return.
@@ -277,7 +286,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                 }
                 continue 'conn;
             }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut acked = false;
             loop {
                 match c.expect().await {
@@ -317,7 +326,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                         break;
                     }
                 }
-                if tokio::time::Instant::now() > deadline {
+                if Instant::now() > deadline {
                     break;
                 }
             }
@@ -380,7 +389,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                         break;
                     }
                 }
-                if tokio::time::Instant::now() > deadline {
+                if Instant::now() > deadline {
                     break;
                 }
             }
@@ -400,10 +409,10 @@ pub async fn run(ctx: Arc<Ctx>) {
     }
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     if ctx.cfg.rates.mandatory > 0.0 {
-        v.push(tokio::spawn(run(ctx.clone())));
+        v.push(spawn(run(ctx.clone())));
     }
     v
 }

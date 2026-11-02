@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -34,9 +35,15 @@ use crate::soak::check::encode_body;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
 use crate::soak::report::Check;
+use crate::soak::workload_idle::spawn_all as idle_spawn_all;
 
 use lapin::ExchangeKind;
 use lapin::options::ExchangeDeclareOptions;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 pub const FANOUT_QUEUES: usize = 3;
 pub const PIPELINE_QUEUES: usize = 3;
@@ -129,7 +136,7 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
         (0..FANOUT_QUEUES).map(|i| format!("soak.f.{i}")).collect(),
     ]
     .concat();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let hosts = ctx.endpoints.snapshot().await;
         let mut missing = Vec::new();
@@ -187,13 +194,13 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
             }
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(format!(
                 "topology never propagated to: {}",
                 missing.join(", ")
             ));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -204,7 +211,7 @@ pub async fn declare_topology(ctx: &Arc<Ctx>) -> Result<(), String> {
 /// Per-tag confirmed counts, shared publisher → reconciler.
 #[derive(Default)]
 pub struct TagCounts {
-    inner: std::sync::Mutex<BTreeMap<String, u64>>,
+    inner: Mutex<BTreeMap<String, u64>>,
 }
 
 impl TagCounts {
@@ -227,7 +234,7 @@ impl TagCounts {
 /// A consumer-side ledger of FIFO streams keyed by publisher tag.
 #[derive(Default)]
 pub struct TagStreams {
-    inner: std::sync::Mutex<BTreeMap<String, FifoStream>>,
+    inner: Mutex<BTreeMap<String, FifoStream>>,
 }
 
 impl TagStreams {
@@ -373,8 +380,8 @@ pub async fn run_pipeline(ctx: Arc<Ctx>) {
         let confirmed = confirmed.clone();
         let tag = format!("pub{i}");
         let rate = ctx.cfg.rates.pipeline;
-        let h = tokio::spawn(pipeline_publisher(ctx, queue, tag, rate, confirmed));
-        handles.push(tokio::spawn(async move {
+        let h = spawn(pipeline_publisher(ctx, queue, tag, rate, confirmed));
+        handles.push(spawn(async move {
             if let Err(e) = h.await {
                 eprintln!("DEBUG pipeline publisher task ended: {e:?}");
             }
@@ -384,7 +391,7 @@ pub async fn run_pipeline(ctx: Arc<Ctx>) {
         let queue = format!("soak.p.{i}");
         let ctx = ctx.clone();
         let streams = streams.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             acked_consumer(ctx, queue, streams, "pipeline").await;
         }));
     }
@@ -425,7 +432,7 @@ async fn pipeline_publisher(
         let tag = format!("{base_tag}g{generation}");
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
@@ -477,11 +484,11 @@ async fn acked_consumer(ctx: Arc<Ctx>, queue: String, streams: Arc<TagStreams>, 
         };
         let Some(mut consumer) = client::consume_acked(&ctx, &ch, &host, name, &queue, 256).await
         else {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            sleep(Duration::from_millis(250)).await;
             continue;
         };
         loop {
-            let delivery = tokio::select! {
+            let delivery = select! {
                 _ = ctx.halt.cancelled() => return,
                 d = StreamExt::next(&mut consumer) => match d {
                     Some(Ok(d)) => d,
@@ -555,7 +562,7 @@ pub async fn run_fanout(ctx: Arc<Ctx>) {
         let rate = ctx.cfg.rates.fanout;
         let ctx = ctx.clone();
         let confirmed = confirmed.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             fanout_publisher(ctx, rate, confirmed).await;
         }));
     }
@@ -574,7 +581,7 @@ pub async fn run_fanout(ctx: Arc<Ctx>) {
         ))
         .await;
         let ctx = ctx.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             acked_consumer(ctx, queue, streams, "fanout").await;
         }));
     }
@@ -603,7 +610,7 @@ async fn fanout_publisher(ctx: Arc<Ctx>, rate: f64, confirmed: Arc<TagCounts>) {
         let tag = format!("fxg{generation}");
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
@@ -648,7 +655,7 @@ async fn fanout_publisher(ctx: Arc<Ctx>, rate: f64, confirmed: Arc<TagCounts>) {
 /// committed" is conclusive by the time the window has moved N further.
 #[derive(Default)]
 struct TxWindow {
-    seqs: std::sync::Mutex<(VecDeque<u64>, HashSet<u64>)>,
+    seqs: Mutex<(VecDeque<u64>, HashSet<u64>)>,
     committed: AtomicU64,
     aborted: AtomicU64,
     too_old: AtomicU64,
@@ -726,14 +733,14 @@ pub async fn run_tx(ctx: Arc<Ctx>) {
         let rate = ctx.cfg.rates.tx;
         let ctx = ctx.clone();
         let window = window.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             tx_publisher(ctx, rate, msgs_per_tx, window).await;
         }));
     }
     {
         let ctx = ctx.clone();
         let window = window.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             tx_consumer(ctx, window).await;
         }));
     }
@@ -761,7 +768,7 @@ async fn tx_publisher(ctx: Arc<Ctx>, rate: f64, msgs_per_tx: usize, window: Arc<
         }
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => return,
                     _ = ctx.gate.wait_open(&ctx.token) => {}
                 }
@@ -854,11 +861,11 @@ async fn tx_consumer(ctx: Arc<Ctx>, window: Arc<TxWindow>) {
         let Some(mut consumer) =
             client::consume_acked(&ctx, &ch, &host, "tx", "soak.tx", 128).await
         else {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            sleep(Duration::from_millis(250)).await;
             continue;
         };
         loop {
-            let delivery = tokio::select! {
+            let delivery = select! {
                 _ = ctx.halt.cancelled() => return,
                 d = StreamExt::next(&mut consumer) => match d {
                     Some(Ok(d)) => d,
@@ -912,16 +919,14 @@ pub async fn run_get(ctx: Arc<Ctx>) {
     {
         let ctx = ctx.clone();
         let confirmed = confirmed.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             pipeline_publisher(ctx, "soak.get".into(), "getg".into(), rate, confirmed).await;
         }));
     }
     {
         let ctx = ctx.clone();
         let streams = streams.clone();
-        handles.push(tokio::spawn(
-            async move { get_consumer(ctx, streams).await },
-        ));
+        handles.push(spawn(async move { get_consumer(ctx, streams).await }));
     }
     for h in handles {
         let _ = h.await;
@@ -940,9 +945,9 @@ async fn get_consumer(ctx: Arc<Ctx>, streams: Arc<TagStreams>) {
             continue;
         };
         loop {
-            tokio::select! {
+            select! {
                 _ = ctx.halt.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                _ = sleep(Duration::from_millis(25)) => {}
             }
             use lapin::options::BasicGetOptions;
             let got = ch
@@ -1172,9 +1177,9 @@ pub async fn run_connchurn(ctx: Arc<Ctx>) {
         if !client::alive(&ctx) {
             return;
         }
-        tokio::select! {
+        select! {
             _ = ctx.token.cancelled() => return,
-            _ = tokio::time::sleep(period) => {}
+            _ = sleep(period) => {}
         }
         let Some((conn, host)) = client::connect(&ctx, "connchurn").await else {
             return;
@@ -1219,28 +1224,28 @@ pub async fn run_connchurn(ctx: Arc<Ctx>) {
 // ---------------------------------------------------------------------
 
 /// Spawn every AMQP workload whose rate is non-zero.
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     let r = ctx.cfg.rates;
     if r.pipeline > 0.0 {
-        v.push(tokio::spawn(run_pipeline(ctx.clone())));
+        v.push(spawn(run_pipeline(ctx.clone())));
     }
     if r.fanout > 0.0 {
-        v.push(tokio::spawn(run_fanout(ctx.clone())));
+        v.push(spawn(run_fanout(ctx.clone())));
     }
     if r.tx > 0.0 {
-        v.push(tokio::spawn(run_tx(ctx.clone())));
+        v.push(spawn(run_tx(ctx.clone())));
     }
     if r.get > 0.0 {
-        v.push(tokio::spawn(run_get(ctx.clone())));
+        v.push(spawn(run_get(ctx.clone())));
     }
     if r.topo > 0.0 {
-        v.push(tokio::spawn(run_topo(ctx.clone())));
+        v.push(spawn(run_topo(ctx.clone())));
     }
     if r.connchurn > 0.0 {
-        v.push(tokio::spawn(run_connchurn(ctx.clone())));
+        v.push(spawn(run_connchurn(ctx.clone())));
     }
-    v.extend(crate::soak::workload_idle::spawn_all(ctx));
+    v.extend(idle_spawn_all(ctx));
     v
 }
 
@@ -1259,7 +1264,7 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
         "soak.get",
         "soak.mand",
     ];
-    let deadline = tokio::time::Instant::now() + ctx.cfg.drain_timeout;
+    let deadline = Instant::now() + ctx.cfg.drain_timeout;
     let mut drained: Vec<(String, u32)> = Vec::new();
     let mut saw_endpoints = false;
     loop {
@@ -1285,7 +1290,7 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
         if drained.is_empty() && saw_endpoints {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             if !saw_endpoints {
                 ctx.error(
                     "drain",
@@ -1303,19 +1308,19 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
             }
             break;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
     }
 
     // Reconcilers may need a beat for the last acks to land; poll until
     // everything passes or the drain timeout expires.
-    let deadline = tokio::time::Instant::now() + ctx.cfg.drain_timeout;
+    let deadline = Instant::now() + ctx.cfg.drain_timeout;
     let mut last;
     loop {
         last = ctx.run_reconcilers().await;
         if last.iter().all(|c| c.ok) {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             for c in &last {
                 if !c.ok {
                     ctx.error(
@@ -1331,7 +1336,7 @@ pub async fn drain_and_reconcile(ctx: &Arc<Ctx>) -> Vec<Check> {
             }
             break;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
     }
     last
 }

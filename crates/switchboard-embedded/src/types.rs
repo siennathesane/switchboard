@@ -6,6 +6,7 @@
 //! cluster/src/lib.rs:25), which is not part of this surface.
 
 use switchboard_wire::BasicProperties;
+use switchboard_wire::field::FieldTable;
 
 /// A message delivered to this client (by [`get`](crate::EmbeddedChannel::get)
 /// or a [`Consumer`](crate::Consumer)).
@@ -95,4 +96,4 @@ pub type MessageProperties = BasicProperties;
 
 /// Stable alias for the AMQP field table used in declare/bind/consume
 /// arguments (`switchboard_wire::field::FieldTable`).
-pub type Arguments = switchboard_wire::field::FieldTable;
+pub type Arguments = FieldTable;

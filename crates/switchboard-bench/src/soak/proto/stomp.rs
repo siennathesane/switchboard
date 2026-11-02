@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -19,11 +20,20 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::select;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 use crate::soak::Ctx;
 use crate::soak::check;
 use crate::soak::client;
 use crate::soak::pacer::Pacer;
+use crate::soak::report::Check;
 
 // ---------------------------------------------------------------------
 // Frame codec
@@ -75,19 +85,19 @@ impl SFrame {
 /// Read one frame (heartbeats collapse into empty frames).
 async fn read_frame(
     r: &mut (impl AsyncReadExt + Unpin),
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 ) -> Result<SFrame, String> {
     let mut line = Vec::new();
     loop {
         let mut b = [0u8; 1];
-        tokio::select! {
+        select! {
             x = r.read(&mut b) => {
                 let n = x.map_err(|e| e.to_string())?;
                 if n == 0 {
                     return Err("closed".into());
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => return Err("stomp read deadline".into()),
+            _ = sleep_until(deadline) => return Err("stomp read deadline".into()),
         }
         if b[0] == b'\n' {
             break;
@@ -110,14 +120,14 @@ async fn read_frame(
         let mut hl = Vec::new();
         loop {
             let mut b = [0u8; 1];
-            tokio::select! {
+            select! {
                 x = r.read(&mut b) => {
                     let n = x.map_err(|e| e.to_string())?;
                     if n == 0 {
                         return Err("closed mid-headers".into());
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => return Err("stomp read deadline".into()),
+                _ = sleep_until(deadline) => return Err("stomp read deadline".into()),
             }
             if b[0] == b'\n' {
                 break;
@@ -143,21 +153,21 @@ async fn read_frame(
         .unwrap_or(0);
     let mut body = vec![0u8; len];
     if len > 0 {
-        tokio::select! {
+        select! {
             x = r.read_exact(&mut body) => { x.map_err(|e| e.to_string())?; }
-            _ = tokio::time::sleep_until(deadline) => return Err("stomp read deadline (body)".into()),
+            _ = sleep_until(deadline) => return Err("stomp read deadline (body)".into()),
         }
     }
     // Trailing NUL
     let mut nul = [0u8; 1];
-    tokio::select! {
+    select! {
         x = r.read(&mut nul) => {
             let n = x.map_err(|e| e.to_string())?;
             if n == 0 || nul[0] != 0 {
                 return Err("stomp frame not NUL-terminated".into());
             }
         }
-        _ = tokio::time::sleep_until(deadline) => return Err("stomp read deadline (nul)".into()),
+        _ = sleep_until(deadline) => return Err("stomp read deadline (nul)".into()),
     }
     Ok(SFrame {
         command,
@@ -171,8 +181,8 @@ async fn read_frame(
 // ---------------------------------------------------------------------
 
 struct StompConn {
-    r: tokio::net::tcp::OwnedReadHalf,
-    w: tokio::net::tcp::OwnedWriteHalf,
+    r: OwnedReadHalf,
+    w: OwnedWriteHalf,
     host: String,
     /// Negotiated: server heartbeats every this many ms (0 = none).
     server_hb_ms: u64,
@@ -185,14 +195,14 @@ async fn dial(ctx: &Arc<Ctx>, workload: &str) -> Option<StompConn> {
         }
         let Some(host) = ctx.endpoints.random().await else {
             ctx.infra_bounce(workload, "-", "no endpoints for stomp".into());
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             continue;
         };
         match raw_dial(&host).await {
             Ok(c) => return Some(c),
             Err(e) => {
                 ctx.infra_bounce(workload, &host, format!("stomp connect failed: {e}"));
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -214,11 +224,7 @@ async fn raw_dial(host: &str) -> Result<StompConn, String> {
     );
     w.write_all(&connect).await.map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
-    let c = read_frame(
-        &mut r,
-        tokio::time::Instant::now() + Duration::from_secs(10),
-    )
-    .await?;
+    let c = read_frame(&mut r, Instant::now() + Duration::from_secs(10)).await?;
     match c.command.as_str() {
         "CONNECTED" => {
             // Reply sx,sy: sx = how often the SERVER will send; expect
@@ -264,7 +270,7 @@ const WIN: usize = 20_000;
 
 #[derive(Default)]
 struct Window {
-    q: std::sync::Mutex<(VecDeque<u64>, HashSet<u64>)>,
+    q: Mutex<(VecDeque<u64>, HashSet<u64>)>,
     committed: AtomicU64,
 }
 
@@ -296,7 +302,7 @@ pub async fn run(ctx: Arc<Ctx>) {
     let window = Arc::new(Window::default());
     let rec = window.clone();
     ctx.add_reconciler(Arc::new(move || {
-        vec![crate::soak::report::Check {
+        vec![Check {
             name: "stomp".into(),
             expected: rec.committed.load(Ordering::Relaxed),
             delivered: rec.committed.load(Ordering::Relaxed),
@@ -321,8 +327,8 @@ pub async fn run(ctx: Arc<Ctx>) {
         // heartbeating must surface here.
         if c.server_hb_ms > 0 {
             let wait = Duration::from_millis(c.server_hb_ms * 2 + 1000);
-            let got = tokio::select! {
-                f = read_frame(&mut c.r, tokio::time::Instant::now() + wait) => matches!(f, Ok(ref f) if f.is_heartbeat()),
+            let got = select! {
+                f = read_frame(&mut c.r, Instant::now() + wait) => matches!(f, Ok(ref f) if f.is_heartbeat()),
                 _ = ctx.token.cancelled() => return,
             };
             if !got {
@@ -352,7 +358,7 @@ pub async fn run(ctx: Arc<Ctx>) {
         }
         loop {
             if !ctx.gate.open() {
-                tokio::select! {
+                select! {
                     _ = ctx.token.cancelled() => {
                         let _ = c.send(&frame("DISCONNECT", &[], b"")).await;
                         return;
@@ -421,7 +427,7 @@ pub async fn run(ctx: Arc<Ctx>) {
                 window.commit(&batch.iter().map(|(s, _)| *s).collect::<Vec<_>>());
             }
             // Collect the delivered messages for committed batches.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut delivered: Vec<Vec<u8>> = Vec::new();
             while delivered.len() < if commit { batch.len() } else { 0 } {
                 match read_frame(&mut c.r, deadline).await {
@@ -508,10 +514,10 @@ pub async fn run(ctx: Arc<Ctx>) {
     }
 }
 
-pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn spawn_all(ctx: &Arc<Ctx>) -> Vec<JoinHandle<()>> {
     let mut v = Vec::new();
     if ctx.cfg.rates.stomp > 0.0 {
-        v.push(tokio::spawn(run(ctx.clone())));
+        v.push(spawn(run(ctx.clone())));
     }
     v
 }

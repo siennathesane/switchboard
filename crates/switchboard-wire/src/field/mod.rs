@@ -19,6 +19,7 @@
 //! `$`, `#`, digits or underscores, and be at most 128 characters (§4.2.5.5).
 //! [`FieldTable::validate`] enforces this so the server can raise 503.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
@@ -51,7 +52,7 @@ use crate::wireio::Encoder;
 const MAX_FIELD_NESTING: u32 = 64;
 
 thread_local! {
-    static FIELD_NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FIELD_NESTING_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// RAII guard that increments [`FIELD_NESTING_DEPTH`] on entry and

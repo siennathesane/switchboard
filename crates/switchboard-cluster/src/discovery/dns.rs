@@ -2,11 +2,12 @@
 //! `_switchboard._tcp.<domain>` SRV records via hickory-resolver.
 
 use super::DiscoveredPeer;
+use tokio::net::lookup_host;
 
 /// Resolve a `host[:port]` seed to internal addresses (A/AAAA).
 pub async fn resolve_seed(seed: &str) -> Result<Vec<String>, String> {
     let (host, port) = split_seed(seed)?;
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
+    let addrs = lookup_host((host.as_str(), port))
         .await
         .map_err(|e| format!("lookup {host}: {e}"))?;
     Ok(addrs.map(|sa| sa.to_string()).collect())
@@ -79,6 +80,9 @@ pub fn split_seed(seed: &str) -> Result<(String, u16), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::runtime::Builder;
+    use tokio::time::timeout;
 
     #[test]
     fn seed_splitting() {
@@ -118,13 +122,10 @@ mod tests {
     fn srv_errors_are_strings_not_panics() {
         // A nonexistent domain must return an error, not hang or panic.
         // (Not async-tested to keep unit time bounded; run via tokio.)
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let result = rt.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+            timeout(
+                Duration::from_secs(10),
                 resolve_srv("does-not-exist.invalid"),
             )
             .await

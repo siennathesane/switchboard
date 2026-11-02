@@ -9,7 +9,11 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
+use std::ffi::c_char;
 use std::fmt::Display;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::ptr::null;
 
 /// The status code every `sb_*` entry point returns. The numeric values
 /// are part of the ABI (frozen for 1.0): C callers may switch on them.
@@ -116,13 +120,8 @@ thread_local! {
 /// Pointer to the thread-local last-error message, or NULL when this
 /// thread has never seen a failure. The pointer stays valid until the
 /// next error is recorded on this thread.
-pub(crate) fn last_error_ptr() -> *const std::ffi::c_char {
-    LAST_ERROR.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|c| c.as_ptr())
-            .unwrap_or(std::ptr::null())
-    })
+pub(crate) fn last_error_ptr() -> *const c_char {
+    LAST_ERROR.with(|slot| slot.borrow().as_ref().map(|c| c.as_ptr()).unwrap_or(null()))
 }
 
 /// Record the thread-local last-error message (already NUL-free — it is a
@@ -148,7 +147,7 @@ pub(crate) fn fail(status: SbStatus, msg: impl Display) -> SbStatus {
 /// applied by EVERY entry point (panic containment is a documented ABI
 /// guarantee).
 pub(crate) fn entry<T>(f: impl FnOnce() -> Result<T, SbStatus>) -> Result<T, SbStatus> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+    match catch_unwind(AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&str>() {

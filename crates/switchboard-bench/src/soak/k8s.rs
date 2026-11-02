@@ -19,26 +19,43 @@
 //! (pod count, readiness, canary round-trip), and reopens the gate.
 //! Protocol sessions stay connected the whole time.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env::var;
+use std::fs::File;
+use std::fs::read_to_string;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::select;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::sleep_until;
+use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
 
 use super::Ctx;
+use super::ScaleMode;
+use super::SoakConfig;
 use super::check::encode_body;
 use super::client::channel;
 use super::client::confirm_mode;
 use super::client::connect_setup;
 use super::client::declare_durable_expect;
 use super::client::publish_confirmed;
+use super::monitor::fetch_stats;
 
 // ---------------------------------------------------------------------
 // In-cluster REST client
@@ -54,18 +71,17 @@ pub struct K8s {
 impl K8s {
     /// Build from the in-cluster service-account files.
     pub fn in_cluster() -> Result<Self, String> {
-        let host = std::env::var("KUBERNETES_SERVICE_HOST")
+        let host = var("KUBERNETES_SERVICE_HOST")
             .map_err(|_| "KUBERNETES_SERVICE_HOST not set (not running in-cluster?)")?;
-        let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".into());
-        let token = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        let port = var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".into());
+        let token = read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
             .map_err(|e| format!("sa token: {e}"))?;
-        let namespace =
-            std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-                .map_err(|e| format!("sa namespace: {e}"))?;
+        let namespace = read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+            .map_err(|e| format!("sa namespace: {e}"))?;
         let mut roots = RootCertStore::empty();
-        let ca_file = std::fs::File::open("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+        let ca_file = File::open("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
             .map_err(|e| format!("sa ca: {e}"))?;
-        let mut ca_reader = std::io::BufReader::new(ca_file);
+        let mut ca_reader = BufReader::new(ca_file);
         for cert in rustls_pemfile::certs(&mut ca_reader) {
             let cert = cert.map_err(|e| format!("sa ca der: {e}"))?;
             roots.add(cert).map_err(|e| format!("sa ca add: {e}"))?;
@@ -100,7 +116,7 @@ impl K8s {
             .map_err(|e| format!("dial apiserver: {e}"))?;
         tcp.set_nodelay(true).ok();
         let server = tokio_rustls::rustls::pki_types::ServerName::try_from(
-            std::env::var("KUBERNETES_SERVICE_HOST").unwrap_or_default(),
+            var("KUBERNETES_SERVICE_HOST").unwrap_or_default(),
         )
         .map_err(|e| format!("sni: {e}"))?;
         let mut tls = self
@@ -129,11 +145,11 @@ impl K8s {
 
         let mut raw = Vec::with_capacity(16 * 1024);
         let mut buf = [0u8; 16 * 1024];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let n = tokio::select! {
+            let n = select! {
                 r = tls.read(&mut buf) => r.map_err(|e| format!("read: {e}"))?,
-                _ = tokio::time::sleep_until(deadline) => return Err("apiserver read timeout".into()),
+                _ = sleep_until(deadline) => return Err("apiserver read timeout".into()),
             };
             if n == 0 {
                 break;
@@ -371,20 +387,19 @@ impl Pod {
 /// Live endpoint provider. Static mode serves the configured hosts;
 /// k8s mode lists ready broker pods with a short TTL cache.
 pub struct EndpointSet {
-    cfg: Arc<super::SoakConfig>,
+    cfg: Arc<SoakConfig>,
     k8s: Option<Arc<K8s>>,
     label: String,
-    cache: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<String>)>>,
+    cache: Mutex<Option<(Instant, Vec<String>)>>,
     rr: AtomicUsize,
 }
 
 impl EndpointSet {
-    pub fn new(cfg: Arc<super::SoakConfig>) -> Self {
+    pub fn new(cfg: Arc<SoakConfig>) -> Self {
         let (k8s, label) = match &cfg.scale {
-            super::ScaleMode::K8s { .. } => {
+            ScaleMode::K8s { .. } => {
                 let k = K8s::in_cluster().ok();
-                let label =
-                    std::env::var("SOAK_BROKER_LABEL").unwrap_or_else(|_| "app=switchboard".into());
+                let label = var("SOAK_BROKER_LABEL").unwrap_or_else(|_| "app=switchboard".into());
                 (k, label)
             }
             _ => (None, String::new()),
@@ -393,7 +408,7 @@ impl EndpointSet {
             cfg,
             k8s: k8s.map(Arc::new),
             label,
-            cache: tokio::sync::Mutex::new(None),
+            cache: Mutex::new(None),
             rr: AtomicUsize::new(0),
         }
     }
@@ -459,7 +474,7 @@ impl Scaler {
             .k8s()
             .expect("k8s scaler needs in-cluster config");
         let (deployment, min, max, every, kill_every) = match &ctx.cfg.scale {
-            super::ScaleMode::K8s {
+            ScaleMode::K8s {
                 deployment,
                 min,
                 max,
@@ -483,7 +498,7 @@ impl Scaler {
     pub async fn run(self) {
         let token = self.ctx.token.clone();
         let ctx = self.ctx.clone();
-        let r = tokio::select! {
+        let r = select! {
             _ = token.cancelled() => Ok(()),
             r = Scaler::run_inner(self) => r,
         };
@@ -503,17 +518,17 @@ impl Scaler {
             (live as u32).clamp(self.min, self.max)
         };
         ctx.ledger.metrics.add("scale.moves", 0);
-        let mut next_scale = tokio::time::Instant::now() + self.every;
+        let mut next_scale = Instant::now() + self.every;
         let mut next_kill = if self.kill_every.is_zero() {
-            tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2)
+            Instant::now() + Duration::from_secs(u64::MAX / 2)
         } else {
-            tokio::time::Instant::now() + self.kill_every
+            Instant::now() + self.kill_every
         };
         loop {
             if ctx.token.is_cancelled() {
                 return Ok(());
             }
-            let now = tokio::time::Instant::now();
+            let now = Instant::now();
             if now >= next_scale {
                 let target = pick_target(current, self.min, self.max);
                 if target != current {
@@ -545,18 +560,18 @@ impl Scaler {
                         }
                     }
                 }
-                next_scale = tokio::time::Instant::now() + self.every;
+                next_scale = Instant::now() + self.every;
             }
             if now >= next_kill {
                 if current >= 3 {
                     self.unclean_kill().await?;
                     ctx.ledger.metrics.add("scale.unclean_kills", 1);
                 }
-                next_kill = tokio::time::Instant::now() + self.kill_every;
+                next_kill = Instant::now() + self.kill_every;
             }
-            tokio::select! {
+            select! {
                 _ = ctx.token.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = sleep(Duration::from_millis(500)) => {}
             }
         }
     }
@@ -592,7 +607,7 @@ impl Scaler {
     /// Wait until `target` pods are Ready and a canary round-trip works.
     async fn wait_convergence(&self, target: u32) -> Result<(), String> {
         let ctx = &self.ctx;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        let deadline = Instant::now() + Duration::from_secs(240);
         loop {
             if ctx.token.is_cancelled() {
                 return Ok(());
@@ -615,13 +630,13 @@ impl Scaler {
                     return Ok(());
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 *ctx.endpoints.cache.lock().await = None;
                 return Err(format!(
                     "scale to {target} did not converge in 240s ({ready} ready)"
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -635,7 +650,7 @@ impl Scaler {
         let mut out = Vec::new();
         for p in pods {
             if let Some(ep) = p.client_endpoint() {
-                if let Some(body) = super::monitor::fetch_stats(&ep).await {
+                if let Some(body) = fetch_stats(&ep).await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(id) = v["node"].as_u64() {
                             out.push((p.name.clone(), id));
@@ -649,14 +664,14 @@ impl Scaler {
 
     /// Mark meta-voter pods with a high deletion cost so ReplicaSet
     /// scale-down never picks them, and return the voter node ids.
-    async fn protect_voters(&self) -> std::collections::HashSet<u64> {
+    async fn protect_voters(&self) -> HashSet<u64> {
         let ctx = &self.ctx;
-        let mut voters = std::collections::HashSet::new();
+        let mut voters = HashSet::new();
         for (pod, node_id) in self.pod_node_ids().await {
             // Ask any single broker for the voter set once.
             if voters.is_empty() {
                 if let Some(ep) = ctx.endpoints.random().await {
-                    if let Some(body) = super::monitor::fetch_stats(&ep).await {
+                    if let Some(body) = fetch_stats(&ep).await {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                             for id in v["voters"].as_array().cloned().unwrap_or_default() {
                                 if let Some(id) = id.as_u64() {
@@ -681,8 +696,7 @@ impl Scaler {
         let ctx = &self.ctx;
         let voters = self.protect_voters().await;
         let pods = self.k8s.pods(&ctx.endpoints.label()).await?;
-        let node_ids: std::collections::HashMap<String, u64> =
-            self.pod_node_ids().await.into_iter().collect();
+        let node_ids: HashMap<String, u64> = self.pod_node_ids().await.into_iter().collect();
         let candidates: Vec<&Pod> = pods
             .iter()
             .filter(|p| {
@@ -714,12 +728,12 @@ fn pick_target(current: u32, min: u32, max: u32) -> u32 {
 }
 
 fn now_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos() as u64
-        ^ std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        ^ SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
 }
@@ -737,7 +751,7 @@ pub async fn drain_all(ctx: &Arc<Ctx>) -> bool {
         "soak.get",
         "soak.mand",
     ];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let hosts = ctx.endpoints.snapshot().await;
         let mut backlog = 0i64;
@@ -751,10 +765,10 @@ pub async fn drain_all(ctx: &Arc<Ctx>) -> bool {
         if backlog <= 0 {
             return true;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -778,7 +792,7 @@ async fn canary(ctx: &Arc<Ctx>) -> Result<(), String> {
         .filter(|ok| *ok)
         .ok_or_else(|| "canary confirm failed".to_string())?;
     use lapin::options::BasicGetOptions;
-    let got = tokio::time::timeout(
+    let got = timeout(
         Duration::from_secs(10),
         ch.basic_get("soak.control", BasicGetOptions { no_ack: true }),
     )

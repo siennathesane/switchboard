@@ -11,15 +11,30 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use switchboard_cluster::ClusterNode;
+use switchboard_cluster::NodeConfig;
+use switchboard_server::session::serve;
 use switchboard_wire::BasicProperties;
+use switchboard_wire::Frame;
 use switchboard_wire::FrameReader;
+use switchboard_wire::FrameType;
+use switchboard_wire::PROTOCOL_HEADER;
+use switchboard_wire::constants::DEFAULT_PASSWORD;
+use switchboard_wire::constants::DEFAULT_USER;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::spawn;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -29,27 +44,27 @@ pub fn test_tag() -> u64 {
 
 /// Install a tracing subscriber once (tests observe node internals).
 pub fn init_tracing() {
-    static LOG: std::sync::Once = std::sync::Once::new();
+    static LOG: Once = Once::new();
     LOG.call_once(|| {
         // Test tempo: shrink fixed delays (raft elections, ticks, join
         // deadlines) 50x. Uniform time-warp — ordering unchanged. A preset
         // SB_TIME_SCALE wins: CI exports a softer warp (10x) on macOS/Windows
         // runners, whose 4 cores cannot reliably meet a 0.8 ms raft
         // heartbeat once a second cluster test runs alongside.
-        if std::env::var("SB_TIME_SCALE").is_err() {
+        if var("SB_TIME_SCALE").is_err() {
             unsafe {
-                std::env::set_var("SB_TIME_SCALE", "50");
+                set_var("SB_TIME_SCALE", "50");
             }
         }
         // Test-grade password hashing: parallel test processes bootstrap and
         // authenticate dozens of clusters; the production-default 19 MiB
         // memory-hard verify per handshake starved whole formation rounds.
-        if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+        if var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+                set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
             }
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+                set_var("SWITCHBOARD_ARGON2_T", "1");
             }
         }
 
@@ -65,7 +80,7 @@ pub fn init_tracing() {
 
 /// Grab a free TCP port (tiny race window; fine for tests).
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    StdTcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -85,12 +100,12 @@ pub struct TestClient {
 }
 
 impl TestClient {
-    pub async fn connect(addr: &str) -> std::io::Result<Self> {
-        Self::connect_raw(addr, Some(&switchboard_wire::PROTOCOL_HEADER)).await
+    pub async fn connect(addr: &str) -> IoResult<Self> {
+        Self::connect_raw(addr, Some(&PROTOCOL_HEADER)).await
     }
 
     /// Connect, optionally emitting `first` as the very first octets.
-    pub async fn connect_raw(addr: &str, first: Option<&[u8]>) -> std::io::Result<Self> {
+    pub async fn connect_raw(addr: &str, first: Option<&[u8]>) -> IoResult<Self> {
         let socket = TcpStream::connect(addr).await?;
         socket.set_nodelay(true).ok();
         let (r, mut w) = socket.into_split();
@@ -108,8 +123,8 @@ impl TestClient {
         })
     }
 
-    pub async fn send_method(&mut self, channel: u16, m: &Method) -> std::io::Result<()> {
-        let bytes = switchboard_wire::Frame::method(channel, m).to_bytes();
+    pub async fn send_method(&mut self, channel: u16, m: &Method) -> IoResult<()> {
+        let bytes = Frame::method(channel, m).to_bytes();
         self.writer.write_all(&bytes).await?;
         self.writer.flush().await
     }
@@ -119,15 +134,15 @@ impl TestClient {
         channel: u16,
         props: &BasicProperties,
         body: &[u8],
-    ) -> std::io::Result<()> {
-        let h = switchboard_wire::Frame::header(
+    ) -> IoResult<()> {
+        let h = Frame::header(
             channel,
             &ContentHeader::new(body.len() as u64, props.clone()),
         )
         .to_bytes();
         self.writer.write_all(&h).await?;
         if !body.is_empty() {
-            let b = switchboard_wire::Frame::body(channel, body).to_bytes();
+            let b = Frame::body(channel, body).to_bytes();
             self.writer.write_all(&b).await?;
         }
         self.writer.flush().await
@@ -152,14 +167,13 @@ impl TestClient {
         loop {
             match self.reader.next_frame(0) {
                 Ok(Some(frame)) => match frame.frame_type {
-                    switchboard_wire::FrameType::Method => {
+                    FrameType::Method => {
                         let m = frame
                             .decode_method()
                             .map_err(|e| format!("bad method: {e}"))?;
                         self.last_method = Some(format!("{m:?}"));
                         if let Some(m) = content_for.take() {
-                            let content =
-                                pending.map(|h| (h.properties, std::mem::take(&mut body)));
+                            let content = pending.map(|h| (h.properties, take(&mut body)));
                             return Ok((m, content));
                         }
                         if m.carries_content() {
@@ -172,7 +186,7 @@ impl TestClient {
                         }
                         return Ok((m, None));
                     }
-                    switchboard_wire::FrameType::Header => {
+                    FrameType::Header => {
                         let h = frame
                             .content_header(60)
                             .map_err(|e| format!("bad header: {e}"))?;
@@ -183,7 +197,7 @@ impl TestClient {
                         }
                         pending = Some(h);
                     }
-                    switchboard_wire::FrameType::Body => {
+                    FrameType::Body => {
                         body.extend_from_slice(&frame.payload);
                         // Content completes when the announced body size is
                         // reached (§4.2.6.1) — do not wait for more frames.
@@ -191,15 +205,15 @@ impl TestClient {
                             if body.len() as u64 >= h.body_size {
                                 let m = content_for.take().expect("body without method");
                                 let props = h.properties.clone();
-                                return Ok((m, Some((props, std::mem::take(&mut body)))));
+                                return Ok((m, Some((props, take(&mut body)))));
                             }
                         }
                     }
-                    switchboard_wire::FrameType::Heartbeat => continue,
+                    FrameType::Heartbeat => continue,
                 },
                 Ok(None) => {
                     let mut buf = [0u8; 8192];
-                    let n = tokio::io::AsyncReadExt::read(&mut self.read_half, &mut buf)
+                    let n = AsyncReadExt::read(&mut self.read_half, &mut buf)
                         .await
                         .map_err(|e| format!("read: {e}"))?;
                     if n == 0 {
@@ -226,7 +240,7 @@ pub async fn connect_and_open(addr: &str, vhost: &str) -> Result<TestClient, Str
             Ok(c) => return Ok(c),
             Err(e) => {
                 last = e;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(200)).await;
             }
         }
     }
@@ -379,8 +393,8 @@ pub async fn basic_get(
 }
 
 /// Spin up a single-node broker and return the client-listener address.
-pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>, String) {
-    static LOG: std::sync::Once = std::sync::Once::new();
+pub async fn start_broker(name: &str) -> (Arc<ClusterNode>, String) {
+    static LOG: Once = Once::new();
     LOG.call_once(|| {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -395,14 +409,14 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
     let unique = format!(
         "{}-{}-{}",
         name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        process_id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     );
-    let dir = std::env::temp_dir().join(format!("switchboard-e2e-{unique}"));
-    let cfg = switchboard_cluster::NodeConfig {
+    let dir = temp_dir().join(format!("switchboard-e2e-{unique}"));
+    let cfg = NodeConfig {
         id: 1,
         data_dir: dir,
         client_addr: client.clone(),
@@ -412,22 +426,22 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         expected_nodes: 1,
         peers: vec![],
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
-    let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
+    let node = ClusterNode::start(cfg).await.unwrap();
 
-    let listener = tokio::net::TcpListener::bind(&client).await.unwrap();
+    let listener = TcpListener::bind(&client).await.unwrap();
     let node2 = node.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
                 continue;
             };
             let node3 = node2.clone();
-            tokio::spawn(async move {
-                let _ = switchboard_server::session::serve(sock, node3, Default::default()).await;
+            spawn(async move {
+                let _ = serve(sock, node3, Default::default()).await;
             });
         }
     });
@@ -437,15 +451,26 @@ pub async fn start_broker(name: &str) -> (Arc<switchboard_cluster::ClusterNode>,
         if !topo.vhosts.is_empty() && !topo.groups.is_empty() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
     // Give the reconciliation loop a couple of ticks to open the shard
     // group raft handles after the layout lands.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
     (node, client)
 }
 
+use std::env::set_var;
+use std::env::temp_dir;
+use std::env::var;
+use std::future::Future;
+use std::io::Result as IoResult;
+use std::mem::take;
+use std::net::TcpListener as StdTcpListener;
+use std::process::id as process_id;
 use std::sync::Arc;
+use std::sync::Once;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 /// Start one node of a cluster with explicit addresses.
 #[allow(clippy::too_many_arguments)]
@@ -458,16 +483,13 @@ pub async fn start_broker_node(
     bootstrap: bool,
     expected_nodes: u64,
     peers: Vec<(u64, String)>,
-) -> (
-    Arc<switchboard_cluster::ClusterNode>,
-    tokio::net::TcpListener,
-) {
-    let dir = std::env::temp_dir().join(format!(
+) -> (Arc<ClusterNode>, TcpListener) {
+    let dir = temp_dir().join(format!(
         "switchboard-node-{name}-{}-{}",
-        std::process::id(),
+        process_id(),
         test_tag()
     ));
-    let cfg = switchboard_cluster::NodeConfig {
+    let cfg = NodeConfig {
         id,
         data_dir: dir,
         client_addr: client_addr.clone(),
@@ -477,30 +499,27 @@ pub async fn start_broker_node(
         expected_nodes,
         peers,
         timeouts: Default::default(),
-        bootstrap_user: switchboard_wire::constants::DEFAULT_USER.into(),
-        bootstrap_password: switchboard_wire::constants::DEFAULT_PASSWORD.into(),
+        bootstrap_user: DEFAULT_USER.into(),
+        bootstrap_password: DEFAULT_PASSWORD.into(),
         internal_auth_secret: None,
     };
     init_tracing();
-    let node = switchboard_cluster::ClusterNode::start(cfg).await.unwrap();
+    let node = ClusterNode::start(cfg).await.unwrap();
     // Serve clients.
-    let listener = tokio::net::TcpListener::bind(&client_addr).await.unwrap();
+    let listener = TcpListener::bind(&client_addr).await.unwrap();
     (node, listener)
 }
 
 /// Spawn the client-accept loop for a bound listener.
-pub fn spawn_client_accepts(
-    listener: tokio::net::TcpListener,
-    node: Arc<switchboard_cluster::ClusterNode>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+pub fn spawn_client_accepts(listener: TcpListener, node: Arc<ClusterNode>) -> JoinHandle<()> {
+    spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
                 continue;
             };
             let node = node.clone();
-            tokio::spawn(async move {
-                let _ = switchboard_server::session::serve(sock, node, Default::default()).await;
+            spawn(async move {
+                let _ = serve(sock, node, Default::default()).await;
             });
         }
     })
@@ -512,12 +531,12 @@ pub fn spawn_client_accepts(
 
 /// Wait (up to `secs`) until `check` holds; false on timeout.
 pub async fn wait_until(mut check: impl FnMut() -> bool, secs: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
         if check() {
             return true;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
     false
 }
@@ -528,11 +547,7 @@ pub async fn wait_until(mut check: impl FnMut() -> bool, secs: u64) -> bool {
 pub async fn start_cluster(
     tag: &str,
     n: u64,
-) -> (
-    Vec<Arc<switchboard_cluster::ClusterNode>>,
-    Vec<tokio::task::JoinHandle<()>>,
-    Vec<String>,
-) {
+) -> (Vec<Arc<ClusterNode>>, Vec<JoinHandle<()>>, Vec<String>) {
     let internal: Vec<String> = (0..n as usize)
         .map(|_| format!("127.0.0.1:{}", free_port()))
         .collect();
@@ -584,31 +599,28 @@ pub async fn start_cluster(
         "cluster {tag}: shard layout never became visible"
     );
     // A beat for shard-group elections.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    sleep(Duration::from_millis(700)).await;
 
     (nodes, listeners, clients)
 }
 
 /// Tear a cluster down: stop every node's raft cores and abort the
 /// client-accept loops so nothing leaks into the next test.
-pub async fn teardown_cluster(
-    nodes: &[Arc<switchboard_cluster::ClusterNode>],
-    listeners: Vec<tokio::task::JoinHandle<()>>,
-) {
+pub async fn teardown_cluster(nodes: &[Arc<ClusterNode>], listeners: Vec<JoinHandle<()>>) {
     for node in nodes {
         node.shutdown().await;
     }
     for l in listeners {
         l.abort();
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(300)).await;
 }
 
 /// Declare a durable queue through `client` and wait for it to be visible
 /// on every node (routing propagation).
 pub async fn declare_queue_everywhere(
     client: &mut TestClient,
-    nodes: &[Arc<switchboard_cluster::ClusterNode>],
+    nodes: &[Arc<ClusterNode>],
     queue: &str,
 ) {
     client
@@ -650,8 +662,8 @@ pub async fn declare_queue_everywhere(
 }
 
 /// Run `fut` with a hard timeout (panics on expiry).
-pub async fn with_timeout<F: std::future::Future>(fut: F, secs: u64) -> F::Output {
-    tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
+pub async fn with_timeout<F: Future>(fut: F, secs: u64) -> F::Output {
+    timeout(Duration::from_secs(secs), fut)
         .await
         .expect("test timed out")
 }

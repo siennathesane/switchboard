@@ -27,11 +27,13 @@
 //! so after leader failover the new leader continues from identical state
 //! and no acknowledged message is lost — at-least-once delivery.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use switchboard_wire::field::FieldTable;
 
 use crate::error::BrokerError;
 use crate::model::ConnectionId;
@@ -99,7 +101,7 @@ pub struct QueueData {
     /// Ready (not held) messages, best-first: priority descending, seq
     /// ascending. Derived from `msgs`; never serialized.
     #[serde(skip)]
-    ready: BTreeSet<(std::cmp::Reverse<u8>, u64)>,
+    ready: BTreeSet<(Reverse<u8>, u64)>,
     /// Ready messages' expiry deadlines, earliest first. Only messages
     /// with a TTL appear. Derived from `msgs`; never serialized.
     #[serde(skip)]
@@ -145,7 +147,7 @@ impl QueueData {
     /// separately so callers never hold a borrow of `msgs` across the
     /// index update.
     fn index_insert(&mut self, seq: u64, prio: u8, expires: Option<u64>) {
-        self.ready.insert((std::cmp::Reverse(prio), seq));
+        self.ready.insert((Reverse(prio), seq));
         if let Some(t) = expires {
             self.expiry.entry(t).or_default().insert(seq);
         }
@@ -154,7 +156,7 @@ impl QueueData {
     /// Remove a ready message from the derived indexes (before mutating
     /// or removing it from `msgs`).
     fn index_remove(&mut self, seq: u64, prio: u8, expires: Option<u64>) {
-        self.ready.remove(&(std::cmp::Reverse(prio), seq));
+        self.ready.remove(&(Reverse(prio), seq));
         if let Some(t) = expires {
             let drained = match self.expiry.get_mut(&t) {
                 Some(set) => {
@@ -245,7 +247,7 @@ pub struct QueuePolicy {
 impl QueuePolicy {
     /// Parse the policy out of declare-time arguments. Unknown arguments
     /// are ignored (they may belong to other server extensions).
-    pub fn from_arguments(arguments: &switchboard_wire::field::FieldTable) -> Self {
+    pub fn from_arguments(arguments: &FieldTable) -> Self {
         use switchboard_wire::field::FieldValue;
         let mut policy = QueuePolicy::default();
         for (name, value) in arguments.iter() {
@@ -1201,7 +1203,7 @@ pub enum ShardCmd {
     /// Release held messages whose consumer's node is no longer in
     /// `live_nodes` (crashed channel host): at-least-once redelivery.
     RequeueOrphaned {
-        live_nodes: std::collections::BTreeSet<u64>,
+        live_nodes: BTreeSet<u64>,
     },
     /// Synchronous single-message take (Basic.Get). `get_id` is the
     /// channel's local identifier for the resulting hold.

@@ -5,15 +5,23 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use super::Ctx;
 use super::k8s::EndpointSet;
 use super::k8s::parse_response;
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::time::Instant as TokioInstant;
+use tokio::time::interval;
+use tokio::time::sleep_until;
 
 #[derive(Debug, Clone)]
 pub struct Sample {
-    pub at: std::time::Instant,
+    pub at: Instant,
     pub rss_kb: u64,
     pub fds: u64,
     pub disk_kb: u64,
@@ -45,19 +53,18 @@ struct History {
 
 /// Shared history so the final report can read trends after the task
 /// is stopped.
-fn histories() -> &'static std::sync::Mutex<HashMap<String, History>> {
-    static H: std::sync::OnceLock<std::sync::Mutex<HashMap<String, History>>> =
-        std::sync::OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn histories() -> &'static Mutex<HashMap<String, History>> {
+    static H: OnceLock<Mutex<HashMap<String, History>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub async fn run(ctx: Arc<Ctx>, endpoints: Arc<EndpointSet>) {
-    let mut tick = tokio::time::interval(ctx.cfg.monitor_every);
-    let mut log_tick = tokio::time::interval(Duration::from_secs(60));
+    let mut tick = interval(ctx.cfg.monitor_every);
+    let mut log_tick = interval(Duration::from_secs(60));
     log_tick.reset(); // don't fire immediately
     let mut monitor_no = 0u64;
     loop {
-        tokio::select! {
+        select! {
             _ = ctx.token.cancelled() => return,
             _ = tick.tick() => {
                 monitor_no += 1;
@@ -150,7 +157,7 @@ async fn get_stats(host: &str) -> Option<(Sample, Option<serde_json::Value>)> {
     let body = http_get(host, "/stats").await?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     let sample = Sample {
-        at: std::time::Instant::now(),
+        at: Instant::now(),
         rss_kb: v["rss_kb"].as_u64()?,
         fds: v["fds"].as_u64()?,
         disk_kb: v["data_dir_kb"].as_u64()?,
@@ -167,17 +174,17 @@ pub(crate) async fn fetch_stats(host: &str) -> Option<String> {
 async fn http_get(host: &str, path: &str) -> Option<String> {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
-    let mut s = tokio::net::TcpStream::connect(host).await.ok()?;
+    let mut s = TcpStream::connect(host).await.ok()?;
     s.set_nodelay(true).ok();
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.ok()?;
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = TokioInstant::now() + Duration::from_secs(5);
     loop {
-        let n = tokio::select! {
+        let n = select! {
             r = s.read(&mut buf) => r.ok()?,
-            _ = tokio::time::sleep_until(deadline) => break,
+            _ = sleep_until(deadline) => break,
         };
         if n == 0 {
             break;

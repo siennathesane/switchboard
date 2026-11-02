@@ -8,11 +8,14 @@ use switchboard_wire::BasicProperties;
 use switchboard_wire::field::FieldTable;
 use switchboard_wire::method::Method;
 
+use std::time::Duration;
 use support::TestClient;
 use support::connect_and_open;
 use support::publish;
 use support::start_broker;
 use support::with_timeout;
+use tokio::time::Instant;
+use tokio::time::sleep;
 
 async fn declare(c: &mut TestClient, queue: &str) {
     c.send_method(
@@ -283,19 +286,16 @@ async fn channel_flow_pauses_and_resumes_delivery() {
     // While paused, an ack-mode consumer would have held them; with no_ack
     // they stay ready. Prove the pause held by reading nothing for a beat.
     // (Deliver frames would appear here if flow were broken.)
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
 
     // Resume and read the two deliveries straight off the socket.
     c.send_method(1, &Method::ChannelFlow { active: true })
         .await
         .unwrap();
     let mut bodies: Vec<Vec<u8>> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while bodies.len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "paused messages never flowed"
-        );
+        assert!(Instant::now() < deadline, "paused messages never flowed");
         let (m, content) = with_timeout(c.expect_method(1), 30).await.unwrap();
         match m {
             Method::BasicDeliver { .. } => {
@@ -492,12 +492,9 @@ async fn recover_async_requeues() {
         .unwrap();
     c.expect(1).await.unwrap(); // Recover-Ok (implementation replies to both variants)
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "message never returned"
-        );
+        assert!(Instant::now() < deadline, "message never returned");
         c.send_method(
             1,
             &Method::BasicGet {
@@ -514,7 +511,7 @@ async fn recover_async_requeues() {
                 return;
             }
             Method::BasicGetEmpty { .. } => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
             other => panic!("unexpected {other:?}"),
         }

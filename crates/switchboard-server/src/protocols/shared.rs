@@ -4,6 +4,8 @@
 //! expressed once, at the [`ClusterNode`] level, so each protocol module
 //! stays pure protocol.
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -12,20 +14,30 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::BrokerReply;
+use switchboard_cluster::ClusterError;
 use switchboard_cluster::ClusterNode;
 use switchboard_cluster::ConsumerSink;
 use switchboard_cluster::Delivery;
+use switchboard_cluster::META_GROUP;
+use switchboard_cluster::now_ms;
 use switchboard_core::error::BrokerError;
 use switchboard_core::model::ConnectionId;
+use switchboard_core::model::ExchangeKind;
 use switchboard_core::model::QueueOptions;
 use switchboard_core::model::StoredMessage;
+use switchboard_core::model::SubscriptionId;
 use switchboard_core::routing::route;
+use switchboard_core::shard::QueuePolicy;
 use switchboard_core::shard::ShardCmd;
 use switchboard_core::shard::ShardReply;
+use switchboard_core::shard::shard_key;
 use switchboard_core::topology::GroupId;
 use switchboard_core::topology::MetaCmd;
 use switchboard_core::topology::MetaReply;
+use switchboard_core::topology::Perm;
 use switchboard_core::topology::VhostView;
+use switchboard_wire::constants::DEFAULT_USER;
 use switchboard_wire::field::FieldTable;
 
 /// Which client protocols the gateway accepts. AMQP 0-9-1 is always on
@@ -94,9 +106,9 @@ impl ProtocolConfig {
 /// representations (CONNACK refusal, STOMP ERROR, amqp1.0 close…).
 pub type BridgeResult<T> = Result<T, BrokerError>;
 
-fn berr(e: switchboard_cluster::ClusterError) -> BrokerError {
+fn berr(e: ClusterError) -> BrokerError {
     match e {
-        switchboard_cluster::ClusterError::Broker(b) => b,
+        ClusterError::Broker(b) => b,
         other => BrokerError::resource_error(other.to_string()).channel_level(),
     }
 }
@@ -109,7 +121,7 @@ pub async fn authorize(
     node: &Arc<ClusterNode>,
     user: &str,
     password: &str,
-    peer_ip: Option<std::net::IpAddr>,
+    peer_ip: Option<IpAddr>,
     allow_remote_guest: bool,
 ) -> BridgeResult<()> {
     if user == "guest" && !allow_remote_guest && peer_ip.map_or(false, |ip| !ip.is_loopback()) {
@@ -158,12 +170,7 @@ impl BridgeContext {
     /// [`BridgeContext::create_as`] with the credentials they just
     /// authenticated.
     pub async fn create(node: Arc<ClusterNode>, vhost: String) -> Self {
-        Self::create_as(
-            node,
-            vhost,
-            switchboard_wire::constants::DEFAULT_USER.to_string(),
-        )
-        .await
+        Self::create_as(node, vhost, DEFAULT_USER.to_string()).await
     }
 
     /// Create a context acting as `user` (the name that passed
@@ -185,11 +192,7 @@ impl BridgeContext {
 
     /// Authorization gate mirroring the direct AMQP path's `authorize_ch`:
     /// a pure read on the local topology view for the authenticated user.
-    fn authorize(
-        &self,
-        perm: switchboard_core::topology::Perm,
-        resource: &str,
-    ) -> BridgeResult<()> {
+    fn authorize(&self, perm: Perm, resource: &str) -> BridgeResult<()> {
         if self
             .node
             .topology()
@@ -220,11 +223,11 @@ pub async fn declare_queue(
 ) -> BridgeResult<GroupId> {
     // Configure permission on the queue name, like the direct path's
     // QueueDeclare arm (code-scanning alert #8).
-    ctx.authorize(switchboard_core::topology::Perm::Configure, name)?;
+    ctx.authorize(Perm::Configure, name)?;
     let reply = ctx
         .node
         .write(
-            switchboard_cluster::META_GROUP,
+            META_GROUP,
             BrokerCommand::Meta(MetaCmd::DeclareQueue {
                 vhost: ctx.vhost.clone(),
                 name: name.to_string(),
@@ -241,19 +244,15 @@ pub async fn declare_queue(
         .await
         .map_err(berr)?;
     let shard = match reply {
-        switchboard_cluster::BrokerReply::Meta(MetaReply::QueueDeclared {
-            shard, created, ..
-        }) => {
+        BrokerReply::Meta(MetaReply::QueueDeclared { shard, created, .. }) => {
             if created {
-                let policy = switchboard_core::shard::QueuePolicy::from_arguments(
-                    &switchboard_wire::field::FieldTable::new(),
-                );
+                let policy = QueuePolicy::from_arguments(&FieldTable::new());
                 shard_call(
                     &ctx.node,
                     shard,
                     ShardCmd::CreateQueueData {
                         // Vhost-qualified shard-data key (alert #14).
-                        queue: switchboard_core::shard::shard_key(&ctx.vhost, name),
+                        queue: shard_key(&ctx.vhost, name),
                         policy,
                     },
                 )
@@ -280,10 +279,10 @@ pub async fn declare_queue(
 pub async fn bind(ctx: &BridgeContext, exchange: &str, queue: &str, rk: &str) -> BridgeResult<()> {
     // Configure permission on the queue, like the direct path's
     // QueueBind arm (code-scanning alert #8).
-    ctx.authorize(switchboard_core::topology::Perm::Configure, queue)?;
+    ctx.authorize(Perm::Configure, queue)?;
     ctx.node
         .write(
-            switchboard_cluster::META_GROUP,
+            META_GROUP,
             BrokerCommand::Meta(MetaCmd::Bind {
                 vhost: ctx.vhost.clone(),
                 exchange: exchange.to_string(),
@@ -316,14 +315,14 @@ pub async fn delete_queue(ctx: &BridgeContext, name: &str) {
         shard,
         ShardCmd::DeleteQueueData {
             // Vhost-qualified shard-data key (alert #14).
-            queue: switchboard_core::shard::shard_key(&ctx.vhost, name),
+            queue: shard_key(&ctx.vhost, name),
         },
     )
     .await;
     let _ = ctx
         .node
         .write(
-            switchboard_cluster::META_GROUP,
+            META_GROUP,
             BrokerCommand::Meta(MetaCmd::DeleteQueue {
                 vhost: ctx.vhost.clone(),
                 name: name.to_string(),
@@ -369,17 +368,17 @@ pub async fn publish(
     // exchanges — the same two-step gate the direct AMQP publish path
     // applies, checked before any routing work so a refused publish
     // enqueues nowhere (code-scanning alert #8).
-    ctx.authorize(switchboard_core::topology::Perm::Write, exchange)?;
+    ctx.authorize(Perm::Write, exchange)?;
     let topic_exchange = {
         let topo = ctx.node.topology();
         topo.vhosts
             .get(&ctx.vhost)
             .and_then(|v| v.exchanges.get(exchange))
-            .map(|e| e.kind == switchboard_core::model::ExchangeKind::Topic)
+            .map(|e| e.kind == ExchangeKind::Topic)
             .unwrap_or(false)
     };
     if topic_exchange {
-        ctx.authorize(switchboard_core::topology::Perm::Write, routing_key)?;
+        ctx.authorize(Perm::Write, routing_key)?;
     }
     let node = &ctx.node;
     let topo = node.topology();
@@ -409,9 +408,9 @@ pub async fn publish(
             ShardCmd::Enqueue {
                 // Vhost-qualified shard-data key (alert #14): the same
                 // queue name in another vhost must never receive this.
-                queue: switchboard_core::shard::shard_key(&ctx.vhost, &q),
+                queue: shard_key(&ctx.vhost, &q),
                 message: message.clone(),
-                at_ms: switchboard_cluster::now_ms(),
+                at_ms: now_ms(),
             },
         )
         .await?;
@@ -432,7 +431,7 @@ pub struct BridgeConsumer {
     /// came from.
     pub shard_data_key: String,
     pub shard: GroupId,
-    pub sub: switchboard_core::model::SubscriptionId,
+    pub sub: SubscriptionId,
 }
 
 impl BridgeConsumer {
@@ -449,7 +448,7 @@ impl BridgeConsumer {
     ) -> BridgeResult<(Arc<BridgeConsumer>, mpsc::UnboundedReceiver<Delivery>)> {
         // Read permission on the queue, like the direct path's
         // BasicConsume/BasicGet arms (code-scanning alert #8).
-        ctx.authorize(switchboard_core::topology::Perm::Read, queue)?;
+        ctx.authorize(Perm::Read, queue)?;
         let node = &ctx.node;
         let sub = node.next_subscription_id();
         let (dtx, drx) = mpsc::unbounded_channel::<Delivery>();
@@ -462,7 +461,7 @@ impl BridgeConsumer {
         // Vhost-qualified shard-data key (alert #14): the consumer
         // attaches to its own vhost's entry, and acks/releases address
         // the same key the deliveries came from.
-        let shard_data_key = switchboard_core::shard::shard_key(&ctx.vhost, queue);
+        let shard_data_key = shard_key(&ctx.vhost, queue);
         shard_call(
             node,
             shard,
@@ -498,7 +497,7 @@ impl BridgeConsumer {
 
     /// Acknowledge a delivered message (removes it from the queue).
     pub async fn ack(&self, node: &Arc<ClusterNode>, seq: u64) -> BridgeResult<()> {
-        let mut seqs = std::collections::BTreeSet::new();
+        let mut seqs = BTreeSet::new();
         seqs.insert(seq);
         shard_call(
             node,
@@ -547,10 +546,7 @@ impl BridgeConsumer {
 /// exchange are refused instead of being silently unroutable. Meta writes
 /// cannot be relied on for this because state-machine apply errors are
 /// not propagated through the write reply.
-pub async fn ensure_exchange(
-    ctx: &BridgeContext,
-    exchange: &str,
-) -> Result<(), switchboard_core::error::BrokerError> {
+pub async fn ensure_exchange(ctx: &BridgeContext, exchange: &str) -> Result<(), BrokerError> {
     let topo = ctx.node.topology();
     if topo
         .vhosts
@@ -559,7 +555,7 @@ pub async fn ensure_exchange(
     {
         return Ok(());
     }
-    Err(switchboard_core::error::BrokerError::not_found(format!(
+    Err(BrokerError::not_found(format!(
         "no exchange {exchange:?} in vhost {:?}",
         ctx.vhost
     )))
@@ -577,8 +573,8 @@ async fn shard_call(
         .await
         .map_err(berr)?;
     match reply {
-        switchboard_cluster::BrokerReply::Shard(r) => Ok(r),
-        switchboard_cluster::BrokerReply::Error(e) => Err(e),
+        BrokerReply::Shard(r) => Ok(r),
+        BrokerReply::Error(e) => Err(e),
         other => {
             debug!(?other, "unexpected shard reply");
             Err(BrokerError::resource_error("unexpected shard reply").channel_level())

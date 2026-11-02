@@ -8,6 +8,7 @@
 //! bounds client memory and measures the sustainable pipeline.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -39,6 +40,10 @@ use switchboard_bench::stats::Counter;
 use switchboard_bench::stats::RateSampler;
 use switchboard_bench::stats::mean;
 use switchboard_bench::stats::percentile;
+use tokio::select;
+use tokio::spawn;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 static FAILED: AtomicU64 = AtomicU64::new(0);
 
@@ -138,7 +143,7 @@ async fn publisher_task(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("bench: publisher connect failed ({e}); retrying");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -193,8 +198,8 @@ async fn publisher_task(
                     }
                     if wait_for_ack {
                         let counters = counters.clone();
-                        tokio::spawn(async move {
-                            match tokio::time::timeout(Duration::from_secs(5), pc).await {
+                        spawn(async move {
+                            match timeout(Duration::from_secs(5), pc).await {
                                 Ok(Ok(Confirmation::Ack(_))) => {
                                     if let Some(c) = &counters.acks {
                                         c.add(1, size);
@@ -216,7 +221,7 @@ async fn publisher_task(
                         return;
                     }
                     eprintln!("bench: publish failed ({e}); reconnecting");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    sleep(Duration::from_millis(200)).await;
                     break; // fresh connection + channel
                 }
             }
@@ -241,7 +246,7 @@ async fn consumer_task(
             Ok(c) => break c,
             Err(e) => {
                 eprintln!("bench: consumer connect failed ({e}); retrying");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     };
@@ -252,7 +257,7 @@ async fn consumer_task(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("bench: consumer channel to {queue} failed ({e}); retrying");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(300)).await;
                 continue;
             }
         };
@@ -271,12 +276,12 @@ async fn consumer_task(
             Ok(c) => break c,
             Err(e) => {
                 eprintln!("bench: consumer subscribe to {queue} failed ({e}); retrying");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(300)).await;
             }
         }
     };
     loop {
-        let delivery: Delivery = tokio::select! {
+        let delivery: Delivery = select! {
             _ = token.cancelled() => return,
             d = futures_lite::StreamExt::next(&mut consumer) => match d {
                 Some(Ok(d)) => d,
@@ -310,7 +315,7 @@ impl Window {
     }
 
     async fn warmup(&self, secs: u64) {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
+        sleep(Duration::from_secs(secs)).await;
     }
 
     async fn begin(&mut self) {
@@ -320,7 +325,7 @@ impl Window {
     }
 
     async fn await_duration(&self, secs: u64) {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
+        sleep(Duration::from_secs(secs)).await;
     }
 
     async fn end(mut self) -> (u64, Vec<u64>, Vec<u64>, u64) {
@@ -362,7 +367,7 @@ pub async fn publish(b: &Bench) -> Result<Value> {
     let mut tasks = Vec::new();
 
     for c in 0..2 {
-        tasks.push(tokio::spawn(consumer_task(
+        tasks.push(spawn(consumer_task(
             window.token.clone(),
             b.uri(&b.host(c)),
             "bench.pub".into(),
@@ -372,7 +377,7 @@ pub async fn publish(b: &Bench) -> Result<Value> {
         )));
     }
     for p in 0..b.publishers {
-        tasks.push(tokio::spawn(publisher_task(
+        tasks.push(spawn(publisher_task(
             window.token.clone(),
             b.uri(&b.host(p)),
             None,
@@ -438,7 +443,7 @@ async fn sharded_with_queues(b: &Bench, k: usize, prefix: &str) -> Result<Value>
     let mut tasks = Vec::new();
 
     for (i, q) in queues.iter().enumerate() {
-        tasks.push(tokio::spawn(consumer_task(
+        tasks.push(spawn(consumer_task(
             window.token.clone(),
             b.uri(&b.host(i)),
             q.clone(),
@@ -448,7 +453,7 @@ async fn sharded_with_queues(b: &Bench, k: usize, prefix: &str) -> Result<Value>
         )));
     }
     for p in 0..b.publishers {
-        tasks.push(tokio::spawn(publisher_task(
+        tasks.push(spawn(publisher_task(
             window.token.clone(),
             b.uri(&b.host(p)),
             None,
@@ -527,7 +532,7 @@ pub async fn fanout(b: &Bench) -> Result<Value> {
     let mut tasks = Vec::new();
 
     for (i, q) in queues.iter().enumerate() {
-        tasks.push(tokio::spawn(consumer_task(
+        tasks.push(spawn(consumer_task(
             window.token.clone(),
             b.uri(&b.host(i)),
             q.clone(),
@@ -538,7 +543,7 @@ pub async fn fanout(b: &Bench) -> Result<Value> {
     }
     // One publisher: multi-destination publishes are serialized by design
     // (the meta-log fanout order).
-    tasks.push(tokio::spawn(publisher_task(
+    tasks.push(spawn(publisher_task(
         window.token.clone(),
         b.uri(&b.host(0)),
         Some("bench.fx".into()),
@@ -608,7 +613,7 @@ pub async fn drain(b: &Bench) -> Result<Value> {
     let sem = Arc::new(Semaphore::new(4096));
     {
         let t = preload_token.clone();
-        tokio::spawn(publisher_task(
+        spawn(publisher_task(
             t,
             b.uri(&b.host(0)),
             None,
@@ -629,7 +634,7 @@ pub async fn drain(b: &Bench) -> Result<Value> {
         if depth >= target || Instant::now() > deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
     }
     preload_token.cancel();
     let preloaded = queue_depth(b, "bench.drain").await?;
@@ -642,7 +647,7 @@ pub async fn drain(b: &Bench) -> Result<Value> {
     let token = CancellationToken::new();
     let mut tasks = Vec::new();
     for c in 0..3 {
-        tasks.push(tokio::spawn(consumer_task(
+        tasks.push(spawn(consumer_task(
             token.clone(),
             b.uri(&b.host(c)),
             "bench.drain".into(),
@@ -657,7 +662,7 @@ pub async fn drain(b: &Bench) -> Result<Value> {
         if got >= preloaded || start.elapsed() > Duration::from_secs(180) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
     token.cancel();
     for t in tasks {
@@ -692,7 +697,7 @@ pub async fn latency(b: &Bench) -> Result<Value> {
         let t = token.clone();
         let uri = b.uri(&b.host(0));
         let payload = payload.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             let conn = match connect_uri(&uri).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -727,7 +732,7 @@ pub async fn latency(b: &Bench) -> Result<Value> {
                 .await
             {
                 Ok(mut consumer) => loop {
-                    let d: Delivery = tokio::select! {
+                    let d: Delivery = select! {
                         _ = t.cancelled() => return,
                         d = futures_lite::StreamExt::next(&mut consumer) => match d {
                             Some(Ok(d)) => d,
@@ -758,7 +763,7 @@ pub async fn latency(b: &Bench) -> Result<Value> {
         });
     }
 
-    let rtts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rtts = Arc::new(Mutex::new(Vec::new()));
     let conn = connect_uri(&b.uri(&b.host(0))).await?;
     let pub_ch = conn.create_channel().await?;
     let sub_ch = conn.create_channel().await?;
@@ -793,7 +798,7 @@ pub async fn latency(b: &Bench) -> Result<Value> {
                 persistent_props(),
             )
             .await?;
-        let got = tokio::time::timeout(
+        let got = timeout(
             Duration::from_secs(5),
             futures_lite::StreamExt::next(&mut replies),
         )

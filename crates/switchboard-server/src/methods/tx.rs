@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::mem::take;
 use std::sync::Arc;
 
 use switchboard_cluster::ClusterNode;
@@ -16,6 +17,7 @@ use crate::channel::LocalConsumer;
 use crate::channel::TxOp as ChannelTxOp;
 use crate::channel::Unacked;
 use switchboard_cluster::BrokerCommand;
+use switchboard_cluster::now_ms;
 use switchboard_core::model::SubscriptionId;
 use switchboard_core::shard::TxOp;
 
@@ -30,7 +32,7 @@ impl Channel {
                         .for_method(90, 20),
                 );
             };
-            let ops = std::mem::take(&mut tx.ops);
+            let ops = take(&mut tx.ops);
             tx.counter += 1;
             // Unique per (node, connection, commit): prepared state on the
             // shards is keyed by this id.
@@ -72,7 +74,7 @@ impl Channel {
         // the proposing node's wall-clock stamp: the janitor's expiry
         // sweep grants TX_GRACE_MS from this instant, so a sweep landing
         // before phase 2 can never eat the commit.
-        let prepared_at_ms = switchboard_cluster::now_ms();
+        let prepared_at_ms = now_ms();
         for (shard, shard_ops) in &per_shard {
             shard_call(
                 node,

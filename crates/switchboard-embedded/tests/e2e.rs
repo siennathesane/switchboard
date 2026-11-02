@@ -6,6 +6,12 @@
 
 mod support;
 
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::panic::set_hook;
+use std::panic::take_hook;
+use std::task::Context;
+use std::task::Waker;
 use std::time::Duration;
 
 use switchboard_embedded::Broker;
@@ -21,6 +27,11 @@ use switchboard_embedded::StartError;
 use switchboard_wire::field::FieldTable;
 
 use support::init;
+use switchboard_embedded::AdminError;
+use switchboard_embedded::Permissions;
+use tokio::join;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 fn persistent_props() -> MessageProperties {
     let mut p = MessageProperties::default();
@@ -160,7 +171,7 @@ async fn get_ack_nack_requeue() {
             got_redelivery = Some(d);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     let d = got_redelivery.expect("redelivered message");
     ch.ack(d.delivery_tag).await.expect("ack");
@@ -179,7 +190,7 @@ async fn get_ack_nack_requeue() {
             empty = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     assert!(empty, "nack(requeue=false) drops the message");
 
@@ -290,7 +301,7 @@ async fn publisher_confirms() {
     assert_eq!(depth.message_count, 5);
 
     // A pipelined pair still correlates per sequence.
-    let (r1, r2) = tokio::join!(
+    let (r1, r2) = join!(
         ch.publish_confirmed("amq.direct", "cf-key", persistent_props(), b"p1".to_vec()),
         ch.publish_confirmed("amq.direct", "cf-key", persistent_props(), b"p2".to_vec()),
     );
@@ -379,7 +390,7 @@ async fn authz_errors_and_gates() {
         .set_permissions(
             "restricted",
             "/",
-            switchboard_embedded::Permissions {
+            Permissions {
                 configure: "^allowed-.*".into(),
                 write: "^allowed-.*".into(),
                 read: "^allowed-.*".into(),
@@ -521,14 +532,10 @@ async fn authz_errors_and_gates() {
     // (topology/mod.rs:214-219) → AdminError::Refused (there is no
     // NoSuchUser variant: create/delete reply Ok unconditionally).
     let err = broker
-        .set_permissions(
-            "nobody-here",
-            "/",
-            switchboard_embedded::Permissions::default(),
-        )
+        .set_permissions("nobody-here", "/", Permissions::default())
         .await
         .expect_err("no such user");
-    assert!(matches!(err, switchboard_embedded::AdminError::Refused(_)));
+    assert!(matches!(err, AdminError::Refused(_)));
 
     gconn.close().await;
     rconn.close().await;
@@ -631,7 +638,7 @@ async fn channel_lifecycle() {
         .expect("delete");
     let mut cancelled_flag = false;
     for _ in 0..60 {
-        match tokio::time::timeout(Duration::from_millis(200), consumer.next()).await {
+        match timeout(Duration::from_millis(200), consumer.next()).await {
             Ok(None) => {
                 cancelled_flag = true;
                 break;
@@ -662,7 +669,7 @@ async fn channel_lifecycle() {
             redelivered = Some(d);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     assert!(redelivered.is_some(), "close requeued the unacked delivery");
 
@@ -759,7 +766,7 @@ async fn fanout_publish() {
                 got = Some(d);
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(50)).await;
         }
         assert!(got.is_some(), "{q} received the fanout message");
     }
@@ -810,14 +817,13 @@ fn start_outside_a_runtime_panics_at_first_poll() {
 
     // Poll once with a no-op waker: no runtime exists, so the internal
     // tokio machinery (net/timer/spawn) panics.
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
 
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)));
-    std::panic::set_hook(hook);
+    let hook = take_hook();
+    set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)));
+    set_hook(hook);
 
     assert!(
         result.is_err(),

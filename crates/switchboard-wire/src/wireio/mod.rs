@@ -7,6 +7,7 @@
 use bytes::BufMut;
 use bytes::BytesMut;
 
+use crate::constants::FRAME_END;
 use crate::error::CodecError;
 
 /// Cursor-based decoder over a method/content payload.
@@ -109,7 +110,7 @@ impl<'a> Decoder<'a> {
     /// Consume and validate the frame-end octet.
     pub fn frame_end(&mut self) -> Result<(), CodecError> {
         let b = self.u8()?;
-        if b == crate::constants::FRAME_END {
+        if b == FRAME_END {
             Ok(())
         } else {
             Err(CodecError::FrameEnd { actual: b })
@@ -210,7 +211,7 @@ impl Encoder {
 
     pub fn frame_end(&mut self) {
         self.flush_bits();
-        self.buf.put_u8(crate::constants::FRAME_END);
+        self.buf.put_u8(FRAME_END);
     }
 
     pub fn bit(&mut self, v: bool) {

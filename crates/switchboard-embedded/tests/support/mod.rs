@@ -8,10 +8,27 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
+use std::env::current_exe;
+use std::env::set_var;
+use std::env::temp_dir as std_temp_dir;
+use std::env::var;
+use std::fs::remove_dir_all;
+use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::id;
+use std::sync::Once;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use switchboard_cluster::node::Timeouts;
+use tokio::runtime::Builder;
+use tokio::runtime::Runtime;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// Env var marking a self-exec restart child and its phase (embedded
 /// design §7). An argv marker would not work: the child is a libtest /
@@ -25,19 +42,19 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Install test tempo / hashing env once per process.
 pub fn init() {
-    static LOG: std::sync::Once = std::sync::Once::new();
+    static LOG: Once = Once::new();
     LOG.call_once(|| {
-        if std::env::var("SB_TIME_SCALE").is_err() {
+        if var("SB_TIME_SCALE").is_err() {
             unsafe {
-                std::env::set_var("SB_TIME_SCALE", "50");
+                set_var("SB_TIME_SCALE", "50");
             }
         }
-        if std::env::var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
+        if var("SWITCHBOARD_ARGON2_M_KIB").is_err() {
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
+                set_var("SWITCHBOARD_ARGON2_M_KIB", "2048");
             }
             unsafe {
-                std::env::set_var("SWITCHBOARD_ARGON2_T", "1");
+                set_var("SWITCHBOARD_ARGON2_T", "1");
             }
         }
         tracing_subscriber::fmt()
@@ -55,11 +72,11 @@ pub fn temp_dir(name: &str) -> PathBuf {
     let unique = format!(
         "{}-{}-{}",
         name,
-        std::process::id(),
+        id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let dir = std::env::temp_dir().join(format!("switchboard-embedded-{unique}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = std_temp_dir().join(format!("switchboard-embedded-{unique}"));
+    let _ = remove_dir_all(&dir);
     dir
 }
 
@@ -83,8 +100,8 @@ pub fn temp_dir(name: &str) -> PathBuf {
 ///     see `janitor_sweep_between_prepare_and_commit_never_drops_the_commit`
 ///     in shard/tests.rs). Widening the janitor interval here is now
 ///     purely load hygiene — the race it used to paper over is fixed.
-pub fn test_timeouts() -> switchboard_cluster::node::Timeouts {
-    let mut t = switchboard_cluster::node::Timeouts::default();
+pub fn test_timeouts() -> Timeouts {
+    let mut t = Timeouts::default();
     t.write_budget = Duration::from_secs(30);
     t.fanout_budget = Duration::from_secs(30);
     t.rpc_reply_budget = Duration::from_secs(30);
@@ -94,33 +111,33 @@ pub fn test_timeouts() -> switchboard_cluster::node::Timeouts {
 }
 
 /// Run `fut` with a hard timeout (panics on expiry).
-pub async fn with_timeout<F: std::future::Future>(fut: F, secs: u64) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(secs), fut)
+pub async fn with_timeout<F: Future>(fut: F, secs: u64) -> F::Output {
+    timeout(Duration::from_secs(secs), fut)
         .await
         .expect("test timed out")
 }
 
 /// Poll `check` every 100 ms for up to `secs`; false on timeout.
 pub async fn wait_until(mut check: impl FnMut() -> bool, secs: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
         if check() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
     }
     check()
 }
 
 /// True when this process is a restart-suite CHILD for `phase`.
 pub fn is_child(phase: &str) -> bool {
-    std::env::var(RESTART_PHASE_ENV).as_deref() == Ok(phase)
+    var(RESTART_PHASE_ENV).as_deref() == Ok(phase)
 }
 
 /// The data_dir the parent chose for a restart suite (children only).
 pub fn restart_dir() -> PathBuf {
     PathBuf::from(
-        std::env::var(RESTART_DIR_ENV)
+        var(RESTART_DIR_ENV)
             .unwrap_or_else(|_| panic!("{RESTART_DIR_ENV} must be set in a restart child")),
     )
 }
@@ -128,13 +145,9 @@ pub fn restart_dir() -> PathBuf {
 /// Run `phase` as a child process re-exec of THIS test binary running only
 /// `test_name`, with the phase + dir env vars set. Returns the exit status.
 #[allow(dead_code)]
-pub fn spawn_phase(
-    test_name: &str,
-    phase: &str,
-    dir: &std::path::Path,
-) -> std::process::ExitStatus {
-    let exe = std::env::current_exe().expect("current_exe");
-    let mut cmd = std::process::Command::new(exe);
+pub fn spawn_phase(test_name: &str, phase: &str, dir: &Path) -> ExitStatus {
+    let exe = current_exe().expect("current_exe");
+    let mut cmd = Command::new(exe);
     // libtest filters: run ONLY this test. (--exact positional filters are
     // accepted by both plain libtest and nextest-built binaries.)
     cmd.arg("--exact").arg(test_name).arg("--nocapture");
@@ -146,8 +159,8 @@ pub fn spawn_phase(
 }
 
 /// Build a fresh single-threaded tokio runtime for a restart phase child.
-pub fn child_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
+pub fn child_runtime() -> Runtime {
+    Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("child runtime")
