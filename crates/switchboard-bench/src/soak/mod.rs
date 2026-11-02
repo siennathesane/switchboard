@@ -45,7 +45,9 @@ use tokio_util::sync::CancellationToken;
 use ledger::Ledger;
 use tokio::pin;
 use tokio::select;
+#[cfg(unix)]
 use tokio::signal::unix::SignalKind;
+#[cfg(unix)]
 use tokio::signal::unix::signal;
 use tokio::spawn;
 use tokio::sync::Mutex;

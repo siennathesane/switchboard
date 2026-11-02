@@ -252,19 +252,20 @@ jobs:
         run: |
           set -euo pipefail
           failed=0
+          # x64 shared runners contend harder than the arm ones: give the
+          # drain more headroom and slow the publish so the backlog the
+          # drain must clear stays small (:unknown verdicts across runs
+          # were always starvation, never a detected anomaly; arm64 has
+          # been stable at the tighter budget).
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            drain_limit=300; publish_rate=3
+          else
+            drain_limit=180; publish_rate=5
+          fi
           for test in fifo fanout topo; do
             for nemesis in parts kill chaos; do
               echo "::group::jepsen: $test x $nemesis"
-              # --drain-limit: the 45s default assumes a quiet developer
-              # box; on shared CI runners a 60s window under nemesis needs
-              # more drain headroom or the checker reports :unknown.
-              # --publish-rate 5 keeps the backlog small enough that the
-              # drain always completes (a starved drain reports :unknown
-              # or caveated losses no matter how long it is given).
-              # One fresh-lab retry per combo: on contended x64 runners
-              # the drain/analysis layer occasionally reports :unknown
-              # (never a real anomaly — zero lost or reordered messages
-              # across every failing combo so far). A protocol bug is
+              # One fresh-lab retry per combo: a protocol bug is
               # deterministic and reproduces across both attempts; the
               # second attempt's artifacts are uploaded either way.
               ok=0
@@ -274,7 +275,7 @@ jobs:
                 fi
                 if ./jepsen/docker/up.sh 5 >/dev/null \
                    && ./jepsen/docker/run.sh --test "$test" --nemesis "$nemesis" \
-                        --time-limit 60 --drain-limit 180 --publish-rate 5; then
+                        --time-limit 60 --drain-limit "$drain_limit" --publish-rate "$publish_rate"; then
                   ok=1
                   break
                 fi
