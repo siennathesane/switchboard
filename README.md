@@ -13,13 +13,15 @@ normative method registry — not derived from any existing broker.
 
 Dear User,
 
-This technology was designed by me, but built entirely from scratch by AI using only the AMQP 0-9-1 specification documentation and an architecture requirement I pulled from my own previous work with Raft. While this is production-ready, and I will be using it for my own production projects, this project is an exploration and experimentation of internet-grade technology not built by humans. I have code-reviewed all of this, and I think the architecture meets my personal requirements, but some people feel certain ways about AI-generated code.
+This technology was designed by me, but built entirely from scratch by an AI/LLM using only the AMQP 0-9-1 specification documentation and an architecture requirement I pulled from my own previous work with Raft. While this is production-ready, and I will be using it for my own production projects, this project is an exploration and experimentation of internet-grade technology not built by humans. I have code-reviewed all of this, and I think the architecture meets my personal requirements, but some people feel certain ways about AI-/LLM-generated code.
 
 In the init.jsonl.parts folder is the entire initial session history, including my original prompt & some steering prompts, up to the point where I maxed out long-horizon capabilities - run `cat init.jsonl.parts/part-* > init.jsonl` to reconstruct. When properly managed, AI is a tool for usefulness, not a replacement for human expertise. This codebase is a testament to the power and potential of AI in building reliable, scalable, and internet-grade technology when properly managed by a human expert.
 
+This is considered an exploration and experiment due to the inherent complexity of message broker design patterns. Distributed state, realtime updates, message routing, proxying, and transforming, multiple network procotols, and multiple access methods. The complexity of this system, despite the age of the AMQP 0.9.1 protocol, is a direct reflection of an AI'/LLM's ability to constructively and concretely manage systemic complexity at this scale. A single human engineer can design, build, operate, and maintain this kind of system; however it is not inherently clear across the industry whether or not an AI/LLM can. Yes it has the inherent knowledge, and it has strong capabilities, yet more complex distributed systems are difficult as it requires contextual knowledge larger than a single context window.
+
 I will be maintaining this project and adding features as I see fit, but I am not planning to make any major changes to the architecture. Any fixes moving forward will be small, incremental improvements, bug fixes, and performance improvements. I will not be providing distribution-ready packages of any format as my needs of this project will be different than yours. You best know your needs, and whether that's Docker, Kuberentes, Nomad, Systemd, SysV, or a custom build, implementing your own needs is the best way to maintain human expertise in your own projects. This is a single-binary, single-library project, with a C ABI; integration into any part of your stack is easy.
 
-And in finality, this is a love letter to @rabbitmq 🐇 RabbitMQ was the message broker that taught me distributed systems design, and this project is a tribute to its legacy.
+And in finality, this is a love letter to @rabbitmq. RabbitMQ was the message broker that taught me distributed systems design, and this project is a tribute to its legacy.
 
 With love, Sienna
 
