@@ -1328,3 +1328,79 @@ fn same_queue_name_in_two_vhosts_does_not_share_data() {
     assert_eq!(depth_at(&mut s, &ka), 2);
     assert_eq!(depth_at(&mut s, &kb), 0);
 }
+
+#[test]
+fn ack_after_cancel_requeue_keeps_indexes_consistent() {
+    // The cancel barrier's follow-on race: a client receives deliveries
+    // before its cancel-ok and acks them right after — by then the
+    // unregister has already released the holds back to ready. Acking a
+    // requeued message must remove its derived-index entry too, or the
+    // next pump pass panics on "ready seq from live map".
+    let mut s = state_with_queue();
+    s.apply(&ShardCmd::RegisterSubscription {
+        sub: sub(1),
+        queue: "q".into(),
+        node: 1,
+        consumer_tag: "ct".into(),
+        no_ack: false,
+        exclusive: false,
+        conn: conn(),
+        byte_limit: 0,
+    })
+    .unwrap();
+    let seq = enqueue(&mut s, b"raced");
+    let effects = effects_of(&s.apply(&ShardCmd::Credit {
+        sub: sub(1),
+        count: 1,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [ShardEffect::MessageReady { seq: s_, .. }] if *s_ == seq
+    ));
+
+    // Cancel: the unacked hold goes back to ready.
+    s.apply(&ShardCmd::UnregisterSubscription { sub: sub(1) })
+        .unwrap();
+
+    // The late ack of the now-requeued message must not corrupt the
+    // ready index.
+    s.apply(&ShardCmd::Ack {
+        queue: "q".into(),
+        seqs: [seq].into_iter().collect(),
+    })
+    .unwrap();
+    assert!(
+        s.queues["q"].indexes_consistent(),
+        "derived indexes must stay in step after acking a requeued message"
+    );
+    assert_eq!(stats_of(&mut s, "q"), 0);
+
+    // The pump must survive a subsequent dispatch pass: pre-fix, the
+    // stale ready entry for the acked seq surfaced in `best_ready` and
+    // panicked the shard worker ("ready seq from live map"), hanging
+    // every later write on the group.
+    s.apply(&ShardCmd::RegisterSubscription {
+        sub: sub(2),
+        queue: "q".into(),
+        node: 1,
+        consumer_tag: "ct2".into(),
+        no_ack: true,
+        exclusive: false,
+        conn: conn(),
+        byte_limit: 0,
+    })
+    .unwrap();
+    let next = enqueue(&mut s, b"next");
+    let effects = effects_of(&s.apply(&ShardCmd::Credit {
+        sub: sub(2),
+        count: 1,
+    }));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [ShardEffect::MessageReady { seq, .. }] if *seq == next
+        ),
+        "the pump must hand out the next message, not the acked one"
+    );
+    assert_eq!(stats_of(&mut s, "q"), 0);
+}

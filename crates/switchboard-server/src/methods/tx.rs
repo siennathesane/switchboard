@@ -119,10 +119,15 @@ impl Channel {
     /// Cancel consumers and release holds. Called on channel close and
     /// connection teardown (§4.5: unacked messages are marked for
     pub async fn teardown(&self, node: &Arc<ClusterNode>) {
-        let consumers: Vec<LocalConsumer> = {
+        let (consumers, gates) = {
             let mut inner = self.inner.lock().unwrap();
             inner.open = false;
-            inner.consumers.values().cloned().collect()
+            let consumers: Vec<LocalConsumer> = inner.consumers.values().cloned().collect();
+            let gates = consumers
+                .iter()
+                .filter_map(|c| inner.pump_gates.get(&c.sub).cloned())
+                .collect::<Vec<_>>();
+            (consumers, gates)
         };
         for c in consumers {
             node.detach_consumer(c.sub).await;
@@ -132,6 +137,13 @@ impl Channel {
                     BrokerCommand::Shard(ShardCmd::UnregisterSubscription { sub: c.sub }),
                 )
                 .await;
+        }
+        // Same delivery barrier as `Basic.Cancel`: no Deliver from this
+        // channel's consumers may follow the Channel.Close-ok /
+        // connection close that the session queues after teardown
+        // returns. The pumps drain what was dispatched, then exit.
+        for g in gates {
+            g.wait().await;
         }
         // Release remaining holds (gets and everything not consumer-tied).
         let holds: Vec<(GroupId, String, Option<SubscriptionId>, Vec<u64>)> = {

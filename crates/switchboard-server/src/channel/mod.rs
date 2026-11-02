@@ -35,6 +35,7 @@ use switchboard_wire::BasicProperties;
 use switchboard_wire::constants::reply;
 use switchboard_wire::method::Method;
 use switchboard_wire::properties::ContentHeader;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::outbound::OutboundFrame;
@@ -83,6 +84,52 @@ pub struct LocalConsumer {
     /// Prefetch for this consumer (0 = unlimited).
     pub prefetch: u32,
     pub flow_active: bool,
+}
+
+/// Completion signal for one consumer's delivery pump — the Cancel-ok
+/// delivery barrier.
+///
+/// AMQP 0-9-1 ordering contract (and the behavior RabbitMQ's
+/// channel-process serialization gives clients like amqplib): once the
+/// broker has written `basic.cancel-ok` for a consumer tag, no further
+/// `basic.deliver` frames for that tag may appear on the wire — amqplib
+/// treats a Deliver for an unknown consumer tag as a fatal 541 and kills
+/// the connection. The delivery pump runs on its own task, so the cancel
+/// path races it: a delivery the shard already dispatched (buffered in
+/// the pump's inbound channel, or mid-write) can land in the outbound
+/// stream after the cancel completed and Cancel-ok was queued.
+///
+/// `Channel::cancel` (crate::methods::consume) therefore waits on this
+/// gate before returning — the pump calls [`PumpGate::finish`] only
+/// after it has drained every buffered delivery for the consumer and
+/// exited — so the Cancel-ok the handler queues next can never be
+/// followed by a Deliver for that tag. Deliveries dispatched before the
+/// cancel are all written before Cancel-ok, matching RabbitMQ: those
+/// are the client's to acknowledge (or have requeued by the unregister's
+/// hold release, at-least-once).
+#[derive(Debug, Default)]
+pub struct PumpGate {
+    done: std::sync::atomic::AtomicBool,
+    notified: Notify,
+}
+
+impl PumpGate {
+    /// Mark the pump as fully drained and exited. `Notify::notify_one`
+    /// stores its permit when nobody is waiting, so a `wait` that starts
+    /// after `finish` still returns immediately (no lost wakeup).
+    pub fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.notified.notify_one();
+    }
+
+    /// Return once `finish` has been called (immediately if it already
+    /// has been).
+    pub async fn wait(&self) {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.notified.notified().await;
+    }
 }
 
 /// An outstanding (unacked) delivery on this channel.
@@ -148,6 +195,10 @@ pub struct ChannelInner {
 
     /// Consumers started on this channel.
     pub consumers: BTreeMap<String, LocalConsumer>,
+    /// Delivery-pump completion gates per active consumer subscription
+    /// (the Cancel-ok delivery barrier; see [`PumpGate`]). The pump
+    /// removes its own entry when it exits.
+    pub pump_gates: BTreeMap<SubscriptionId, Arc<PumpGate>>,
     /// Sub id → shard for credit bookkeeping.
     pub sub_shards: BTreeMap<SubscriptionId, GroupId>,
     /// Flow control (channel.flow, §3.1.9).
@@ -212,6 +263,7 @@ impl ChannelInner {
             prefetch_count: 0,
             prefetch_global: false,
             consumers: BTreeMap::new(),
+            pump_gates: BTreeMap::new(),
             sub_shards: BTreeMap::new(),
             flow_active: true,
             tx: None,

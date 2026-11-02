@@ -169,6 +169,26 @@ impl QueueData {
         }
     }
 
+    /// Remove a message wherever it lives: the live map plus, when it was
+    /// requeued (not held), the derived ready/expiry indexes.
+    ///
+    /// An ack racing a hold release hits this: `UnregisterSubscription`
+    /// (consumer cancel/teardown) releases every hold of the sub back to
+    /// ready, and a client that received those deliveries before its
+    /// cancel-ok legitimately acks them afterwards — by the time the ack
+    /// applies, the message is indexed as ready again, so removing only
+    /// the map entry would leave a stale index entry and panic the
+    /// delivery pump when `best_ready` surfaced it ("ready seq from live
+    /// map"). `index_remove` is idempotent, so the held case is unchanged.
+    fn take_message(&mut self, seq: u64) -> Option<QueueMessage> {
+        let m = self.msgs.remove(&seq)?;
+        if m.held_by.is_none() {
+            let prio = m.message.properties.priority.unwrap_or(0);
+            self.index_remove(seq, prio, m.expires_at);
+        }
+        Some(m)
+    }
+
     /// Best ready message (priority desc, seq asc) without scanning the
     /// queue. Callers expire first, so no expiry check here.
     pub fn best_ready(&self) -> Option<u64> {
@@ -537,8 +557,9 @@ impl ShardState {
                     .ok_or_else(|| BrokerError::not_found(format!("no queue {queue:?}")))?;
                 let mut freed: Vec<(SubscriptionId, u64)> = Vec::new();
                 for seq in seqs {
-                    if let Some(m) = q.msgs.remove(seq) {
-                        // Held messages are not in the derived indexes.
+                    if let Some(m) = q.take_message(*seq) {
+                        // Held messages are not in the derived indexes;
+                        // requeued ones were (see `take_message`).
                         self.store.push(ShardStoreOp::Del {
                             queue: queue.clone(),
                             seq: *seq,
@@ -763,7 +784,7 @@ impl ShardState {
                         }
                         TxOp::Ack { queue, seq } => {
                             if let Some(q) = self.queues.get_mut(queue) {
-                                if q.msgs.remove(seq).is_some() {
+                                if q.take_message(*seq).is_some() {
                                     self.store.push(ShardStoreOp::Del {
                                         queue: queue.clone(),
                                         seq: *seq,
