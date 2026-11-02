@@ -2494,7 +2494,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "switchboard"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-bench"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-capi"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "switchboard-cluster",
  "switchboard-embedded",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-cluster"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "bincode",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-core"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "bytes",
@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-embedded"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "switchboard-cluster",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-server"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-store"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -2650,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "switchboard-wire"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "proptest",

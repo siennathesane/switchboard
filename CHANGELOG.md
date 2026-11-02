@@ -5,6 +5,82 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-02
+
+First stable release. Changes since `1.0.0-rc.1` — a full security
+and quality hardening pass over the release candidate, every item
+gated by the CI matrix:
+
+### Added
+
+- **Internal transport authentication.** Opt-in shared-secret auth
+  for node-to-node traffic (`--internal-auth-secret` /
+  `SWITCHBOARD_INTERNAL_AUTH_SECRET`): an HMAC-SHA256 proof over a
+  fresh nonce before any Raft or forwarding command is accepted; the
+  secret never crosses the wire and is never logged. Off by default
+  for compatibility.
+- **Administrator flag.** Admin API access requires an `is_admin` user
+  flag (bootstrap user is flagged; users with a `.*` configure pattern
+  are grandfathered); `SWITCHBOARD_ADMIN_STRICT` makes the flag the
+  only path.
+- **Message size limit.** `ConnectionLimits::max_message_size`
+  (default 128 MiB) enforced at content-header time (channel `311`).
+
+### Changed
+
+- **Pre-auth parsing limits.** A unified 8 MiB `PREAUTH_MAX_FRAME_BYTES`
+  cap on STOMP `content-length` (including frames without one), AMQP
+  1.0 wire frame sizes, and MQTT remaining lengths — enforced before
+  allocation, before authentication. Field-table and AMQP array
+  decoding carries a nesting bound (64) that turns deep recursion into
+  a decode error instead of a stack abort. The AMQP handshake enforces
+  a real `frame_max` at all times (1 MiB floor when unset).
+- **Authentication and authorization.** An AMQP 1.0 client that skips
+  SASL is now authenticated (previously it entered the session loop
+  unauthenticated); the guest loopback rule fires on production TCP
+  and TLS accepts (peer IPs are stamped at accept); `--user` /
+  `--password` are wired into cluster formation; the MQTT/STOMP/AMQP 1.0
+  bridge performs authorization as its authenticated user; exchange
+  bind/unbind is permission-gated; exclusive queues enforce per-owner
+  access (405 `RESOURCE_LOCKED`); permission regexes match fully
+  (`^(?:…)$`), not by substring. `/stats` and `/metrics` require admin
+  basic auth off loopback (`SWITCHBOARD_STATS_UNAUTHED` opts labs out).
+- **Credential storage.** The meta raft log carries argon2 PHC strings
+  only — hashing happens at propose time, apply refuses anything else,
+  and the legacy plaintext verification path is gone. Hash memoization
+  is keyed per user, so one user's hash can never satisfy another's
+  verification.
+- **Tenant isolation.** Shard-data keys are vhost-qualified: the same
+  queue name in two vhosts no longer shares message data. MQTT
+  client-id-to-session-queue encoding is injective (`a/b` and `a_b`
+  are distinct). STOMP unsubscribe and connection teardown no longer
+  delete shared `/queue/` destinations.
+- **Codebase hygiene.** Zero-warning policy (`cargo check --workspace
+  --all-targets` is clean, enforced in CI); item-granular last-mile
+  imports enforced via `rustfmt` (`imports_granularity = "Item"`);
+  no glob imports outside idiomatic test modules.
+- **Dependencies.** hickory 0.26.3, rustls-webpki 0.103.16, libz-sys,
+  zstd-sys, tokio, yoke-derive — resolving every known `cargo audit`
+  advisory at release time.
+
+### Fixed
+
+- An empty-body publish was silently never applied (the content
+  demux only completed in its body-frame arm; zero-length bodies
+  carry no body frame). Affects TCP and embedded paths alike.
+- A prepared transaction could be expired by the janitor between
+  prepare and commit — CommitTx then took its idempotent no-op path
+  and the message was silently dropped. Prepared transactions now
+  carry a wall-clock timestamp and are swept only after a 60 s grace.
+- A logical write's member scan could spend one full reply budget per
+  frozen (SIGSTOPped) peer, overshooting the write budget and wedging
+  clients past every deadline. Reply waits are now bounded by the
+  caller's remaining budget.
+- The jepsen/bench lab environment never actually reached lab brokers
+  (unexported sourced env; clap-illegal boolean values; a missing
+  bench guest opt-out) — latent and harmless only while the guest
+  loopback rule could not fire.
+
 ## [1.0.0-rc.1] - 2026-10-30
 
 First public release candidate: a multi-master AMQP 0-9-1 broker with

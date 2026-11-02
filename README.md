@@ -47,7 +47,7 @@ handshake/auth/semantics as wire clients:
 
 ```toml
 [dependencies]
-switchboard-embedded = "1.0.0-rc.1"
+switchboard-embedded = "1.0.0"
 ```
 
 ```rust
