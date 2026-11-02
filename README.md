@@ -168,11 +168,61 @@ switchboard           the broker binary
 
 ## Testing
 
-```bash
-cargo test --workspace
-```
+Every push runs a 13-job CI matrix (`.github/workflows/ci.yml`). Each
+layer exists to catch a different class of failure:
 
-includes end-to-end tests that speak raw AMQP over TCP against an
-in-process broker (handshake, routing, confirms, transactions, requeue),
-a byte-level conformance test of the whole method table against the
-normative registry, and unit suites for every state machine.
+**Unit & in-process integration** — 600+ tests
+(`cargo test --workspace`): byte-level conformance of the entire AMQP
+method table against the normative registry, state-machine suites for
+every subsystem, and end-to-end tests speaking raw AMQP over TCP to an
+in-process broker (handshake, routing, confirms, transactions, requeue,
+authz refusals). Fast and deterministic — the correctness floor.
+
+**Multi-language conformance** — *other people's clients* — pika,
+paho-mqtt, stomp.py (Python), amqp091-go (Go), amqplib (Node), and
+bunny (Ruby) — drive a real three-node TCP cluster, followed by a
+durability check (durable queue + persistent message survive a hard
+restart) and a scale test pushing load across a 3→6→3 cluster with
+hard-kill churn. Self-tests share the broker's own assumptions about
+the wire; somebody else's client library does not.
+
+**Jepsen** — five-node clusters in Docker, three consistency models
+(fifo, fanout, topology) × three nemeses (network partitions, hard
+kills, chaos — SIGSTOP mid-flight), 60-second windows with Knossos
+linearizability and timeline checking, a fresh lab per combo, on both
+x64 and arm64 Linux. The full matrix runs on every push and every
+pull request: linearizability violations are identified and resolved
+in development, not in production. It has done exactly that — the
+matrix found and drove the fixes for a real write-stranding liveness
+bug in the meta→shard queue-declare path and a write-budget overshoot
+against frozen peers, and no linearizability violation has ever been
+detected in any run.
+
+**Bench sweeps** — 1/3/5/7-node clusters through every scenario on
+both architectures: the throughput/latency regression surface.
+
+**Soak** — a k3s lab churns a cluster between 1 and 9 nodes for hours
+under load with a zero-error bar; a smoke variant runs in-suite on
+every push.
+
+**Cross-platform, both architectures** — the same suites run on:
+
+|              | amd64                                        | arm64                                        |
+| ------------ | -------------------------------------------- | -------------------------------------------- |
+| Linux        | rust tests · language harness · jepsen · bench | rust tests · language harness · jepsen · bench |
+| Windows      | rust tests · language harness                 | rust tests                                    |
+| macOS        | — (a)                                        | rust tests · language harness                 |
+
+(a) GitHub retired its last Intel macOS runners in 2025; macOS x86_64
+is not coverable in CI.
+
+The matrix is not ceremony: Windows' default timer resolution is
+15.6 ms — too coarse for the sub-15 ms raft heartbeats a 50× warp
+produces — so the Windows suite runs at identity time-scale; Linux
+and macOS run at 50×. Jepsen and bench require Linux containers with
+`NET_ADMIN`, so they run only there.
+
+**Supply-chain & hygiene gates** — every push is also held to
+`cargo audit` (0 known vulnerabilities), zero-warning
+`cargo check --workspace --all-targets`, enforced `rustfmt`, and the
+repository's code-scanning analyzers.
