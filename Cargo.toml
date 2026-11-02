@@ -17,7 +17,7 @@ version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/switchboard"
+repository = "https://github.com/siennathesane/switchboard"
 
 [workspace.dependencies]
 switchboard-wire = { path = "crates/switchboard-wire" }
@@ -29,7 +29,7 @@ switchboard-embedded = { path = "crates/switchboard-embedded" }
 switchboard-capi = { path = "crates/switchboard-capi" }
 switchboard-bench = { path = "crates/switchboard-bench" }
 
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
